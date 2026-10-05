@@ -1,0 +1,13 @@
+[package]
+name = "farsight-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+farsight-net = { version = "0.1.0", path = "../net" }
+farsight-proto = { version = "0.1.0", path = "../proto" }
