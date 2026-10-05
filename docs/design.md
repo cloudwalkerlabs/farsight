@@ -1,9 +1,10 @@
 # farsight — design
 
-Status: 2026-10-05. M0–M2 are done: option B holds
+Status: 2026-10-05. M0–M3 are done: option B holds
 ([m0-results.md](m0-results.md)), the Linux desktop client works end to end
-([m1-results.md](m1-results.md)), and resize, scale, negotiation, NVENC and
-tiles work ([m2-results.md](m2-results.md)). M3 is next.
+([m1-results.md](m1-results.md)), resize, scale, negotiation, NVENC and
+tiles work ([m2-results.md](m2-results.md)), and the server is a session
+with audio ([m3-results.md](m3-results.md)). M4 is next.
 
 farsight is a low-latency remote desktop for headless Linux servers. Its
 requirements:
@@ -247,10 +248,13 @@ off.
     (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), or on an interface named
     `tailscale*` or `wg*`.
 - **Authentication:** client keys (§6) still apply, so other users on the
-  same tailnet can't connect. Without TLS there is no channel to bind the
-  key to, so the client signs a server nonce in the null handshake instead.
-  That proves who connected but protects nothing after it: the network
-  must stop on-path attackers, which Tailscale and WireGuard do.
+  same tailnet can't connect. The null handshake exchanges a random value
+  from each side, and the client signs keying material derived from both,
+  as it signs the TLS exporter otherwise: a fresh server nonce. That
+  proves who connected but protects nothing after it: the network must
+  stop on-path attackers, which Tailscale and WireGuard do.
+- **Its own QUIC version** (`0x46535000`), so a TLS client and a
+  plaintext server fail at once with version negotiation (M3).
 - **What it saves is small.** AES-GCM with AES-NI, or the ARMv8 crypto
   extensions on phones, costs well under 1% of a core at 100 Mbit/s, and
   adds microseconds per packet. The main gain is one less layer to debug
@@ -472,6 +476,7 @@ port, with `User=` set). It doesn't need user systemd or lingering.
 farsight-server [--port 7740] [-- <desktop command>]    # default: labwc
 farsight-server --port 7741 -- labwc --session xfce4-session
 farsight-server --no-tls --listen 100.101.102.103    # tailnet only (§1)
+farsight-server --app -- firefox                     # kiosk mode
 ```
 
 **Startup** builds an isolated environment and starts the session at once,
@@ -503,9 +508,12 @@ so it is already running before the first client connects:
      clipboard, IME and output scale (§5).
    - **If the desktop exits or crashes,** the host and the client connection
      survive. The host restarts the desktop, or ends the session, depending
-     on its exit status and configuration.
-6. **Kiosk mode** (`--app <command>`): there is no nested compositor. The
-   app connects straight to the host, which shows it fullscreen.
+     on its exit status and configuration (`--restart`: after a crash by
+     default, backing off from 0.5 s; five crashes in a minute or a clean
+     exit end the session).
+6. **Kiosk mode** (`--app -- <command>`): there is no nested compositor.
+   The app connects straight to the host, which shows it fullscreen and
+   composites its popups. No clipboard or text input yet (M3).
 
 **Isolation:**
 - The environment comes from the steps above, not from whatever started
@@ -525,15 +533,19 @@ host restricts them, add the user to the `render` group.
 
 **Clients:**
 - **Authentication:** SSH-style Ed25519 client keys
-  (`~/.config/farsight/authorized_keys`). The client pins the server's
-  certificate on first use (TOFU).
+  (`~/.config/farsight/authorized_keys`, OpenSSH's `ssh-ed25519` lines).
+  The client proves its key by signing keying material exported from the
+  connection, so the proof is bound to it. The client pins the server's
+  certificate on first use (TOFU, `known_hosts`).
   In plaintext mode (§1) there is no certificate to pin; the client key
   is checked with a signed nonce instead, and the network provides the
   rest.
 - **Reconnection:** the session outlives disconnects. A reconnecting client
   negotiates codec and layout again, and its layout is applied (§5).
 - **More than one client:** a second client can either take over the
-  session or join it view-only.
+  session or join it view-only. The stream is encoded once, in a format
+  every client decodes; only the controlling client's input and layout
+  apply.
 
 **Window manager:** none of our own. Window management, decorations,
 panels and Xwayland belong to the nested desktop (see "Alternatives
@@ -640,9 +652,9 @@ sent directly, with relative pointer capture when the server asks for it.
     sequence number, `capture_us` and the newest frames. On the control
     stream: `AudioCaps` in `Hello`, plus `AudioConfig`, `MicDemand` and
     `SetAudio`.
-- **Clipboard:** MIME-typed and fetched lazily, over a stream. The server
-  side reads and sets the nested desktop's clipboard through
-  `ext-data-control`.
+- **Clipboard:** MIME-typed and fetched lazily, a QUIC stream per
+  transfer. The server side reads and sets the nested desktop's clipboard
+  through `ext-data-control`. (The desktop client handles text only.)
 - **Latency telemetry:** a clock-offset exchange plus capture timestamps.
   The client reports present time, giving a measured glass-to-glass latency
   per stage. Target: under 16 ms on a LAN at 60 Hz.
@@ -654,7 +666,7 @@ sent directly, with relative pointer capture when the server asks for it.
 | M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, datagram priority scheduler and video pacing (§1), VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured; input latency doesn't rise during keyframes. **Done over loopback** ([results](m1-results.md)): 10 ms from commit to the client's swap; a run between two machines is still to do. |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles. **Done over loopback** ([results](m2-results.md)): layout changes hold frames 6–57 ms; AV1 is untested for want of an encoder. |
-| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured |
+| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured. **Done over loopback** ([results](m3-results.md)): 13–20 ms from the session's sink to the client's speaker; checked as a user service, not as root or with a user in `audio`; the client's keymap is still labwc's. |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
