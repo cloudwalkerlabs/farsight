@@ -55,15 +55,18 @@ done
 user_nodes() { pw-cli ls Node 2>/dev/null | grep -c 'node.name' || true; }
 NODES_BEFORE=$(user_nodes)
 
+# The client's key, authorized on the server; a fresh pin each run.
+mkdir -p "$OUT/server"; rm -f "$OUT/client/known_hosts"
+"$BIN/farsight-desktop" --config-dir "$OUT/client" --print-key > "$OUT/server/authorized_keys"
 rm -f "$OUT/ctl"; mkfifo "$OUT/ctl"
 env -u DISPLAY RUST_LOG=info,smithay=warn setsid "$BIN/farsight-server" --port $PORT $SERVER_ARGS \
-	--identity "$OUT/identity" -- labwc -C "$OUT/cfg" -s "sh -c 'sleep 4; pw-play $OUT/tone.wav'" \
+	--config-dir "$OUT/server" -- labwc -C "$OUT/cfg" -s "sh -c 'sleep 4; pw-play $OUT/tone.wav'" \
 	> "$OUT/server.log" 2>&1 < "$OUT/ctl" &
 pids+=($!)
 exec 7>"$OUT/ctl"
 sleep 2
 env -u DISPLAY XDG_RUNTIME_DIR=$CA WAYLAND_DISPLAY=$XDG_RUNTIME_DIR/$OUTER \
-	setsid "$BIN/farsight-desktop" 127.0.0.1:$PORT --size 1280x720 $CLIENT_ARGS \
+	setsid "$BIN/farsight-desktop" --config-dir "$OUT/client" 127.0.0.1:$PORT --size 1280x720 $CLIENT_ARGS \
 	> "$OUT/client.log" 2>&1 < /dev/null &
 pids+=($!)
 XDG_RUNTIME_DIR=$CA timeout $((PLAY + 4)) pw-record -P '{ stream.capture.sink = true }' --target auto_null \

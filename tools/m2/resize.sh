@@ -56,15 +56,18 @@ done
 randr() { WAYLAND_DISPLAY=$OUTER wlr-randr --output HEADLESS-1 "$@"; }
 randr --custom-mode 2560x1600
 
+# The client's key, authorized on the server; a fresh pin each run.
+mkdir -p "$OUT/server"; rm -f "$OUT/client/known_hosts"
+"$BIN/farsight-desktop" --config-dir "$OUT/client" --print-key > "$OUT/server/authorized_keys"
 rm -f "$OUT/ctl"; mkfifo "$OUT/ctl"
 env -u DISPLAY RUST_LOG=info,smithay=warn setsid "$BIN/farsight-server" --port $PORT $SERVER_ARGS \
-	--identity "$OUT/identity" -- labwc -C "$OUT/inner" -s \
+	--config-dir "$OUT/server" -- labwc -C "$OUT/inner" -s \
 	"alacritty -o window.dimensions.columns=100 -o window.dimensions.lines=30 -e sh -c 'ls -l /usr/bin | head -40; sleep 1000'" \
 	> "$OUT/server.log" 2>&1 < "$OUT/ctl" &
 pids+=($!)
 exec 7>"$OUT/ctl"
 sleep 2
-env -u DISPLAY WAYLAND_DISPLAY=$OUTER setsid "$BIN/farsight-desktop" 127.0.0.1:$PORT --size 1280x800 $CLIENT_ARGS \
+env -u DISPLAY WAYLAND_DISPLAY=$OUTER setsid "$BIN/farsight-desktop" --config-dir "$OUT/client" 127.0.0.1:$PORT --size 1280x800 $CLIENT_ARGS \
 	> "$OUT/client.log" 2>&1 < /dev/null &
 pids+=($!)
 sleep 3

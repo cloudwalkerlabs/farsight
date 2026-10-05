@@ -1,6 +1,7 @@
 //! QUIC endpoints (`docs/design.md` §1). TLS 1.3 with a self-signed server
-//! certificate. Until pinning lands (M3), the client accepts any server
-//! certificate and reports its fingerprint.
+//! certificate. The client accepts any certificate in the handshake and
+//! then checks its fingerprint against the one pinned on first use
+//! ([`crate::auth::KnownHosts`]), before it sends anything.
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -54,14 +55,14 @@ impl Identity {
 }
 
 #[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?.write_all(data)
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
 }
 

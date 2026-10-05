@@ -15,7 +15,7 @@ use bytes::Bytes;
 use farsight_net::packetize::{EncodedFrame, Packetizer};
 use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
-use farsight_net::{endpoint, stream};
+use farsight_net::{auth, endpoint, stream};
 use farsight_proto::audio::AudioConfig;
 use farsight_proto::control::{ClientMessage, Hello, ServerMessage};
 use farsight_proto::datagram::{self, Datagram, Pong};
@@ -77,8 +77,13 @@ pub struct Audio {
     pub listening: AtomicBool,
 }
 
+/// The application close code for a client whose key isn't authorized.
+pub const CLOSE_UNAUTHORIZED: u32 = 3;
+
 pub struct Options {
     pub port: u16,
+    /// Client keys allowed in (§6), read on every connection.
+    pub authorized_keys: std::path::PathBuf,
     pub identity: endpoint::Identity,
     /// Video is paced at this rate until there is a congestion controller
     /// (M4).
@@ -121,37 +126,42 @@ pub fn spawn(opts: Options, host: HostSender<ToHost>) -> anyhow::Result<mpsc::Un
     Ok(tx)
 }
 
+/// What every connection's task shares.
+struct Shared {
+    opts: Options,
+    host: HostSender<ToHost>,
+    current: Mutex<Option<Current>>,
+}
+
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
-    let current: Arc<Mutex<Option<Current>>> = Arc::default();
-    tokio::spawn(dispatch(rx, current.clone()));
-    let audio = opts.audio.clone();
+    let shared = Arc::new(Shared { opts, host, current: Mutex::default() });
+    tokio::spawn(dispatch(rx, shared.clone()));
     let mut next_id: ConnId = 0;
     while let Some(incoming) = endpoint.accept().await {
         next_id += 1;
-        let (id, host, current, rate_bps, start) = (next_id, host.clone(), current.clone(), opts.rate_bps, opts.start);
-        let audio = audio.clone();
+        let (id, shared) = (next_id, shared.clone());
         tokio::spawn(async move {
             let addr = incoming.remote_address();
-            match serve(id, incoming, host.clone(), current.clone(), rate_bps, start, audio.clone()).await {
+            match serve(id, incoming, &shared).await {
                 Ok(()) => tracing::info!(id, %addr, "client gone"),
                 Err(err) => tracing::info!(id, %addr, "client gone: {err:#}"),
             }
-            let mut cur = current.lock().unwrap();
+            let mut cur = shared.current.lock().unwrap();
             if cur.as_ref().is_some_and(|c| c.id == id) {
                 *cur = None;
-                audio.listening.store(false, Ordering::Relaxed);
+                shared.opts.audio.listening.store(false, Ordering::Relaxed);
             }
-            let _ = host.send(ToHost::Disconnected(id));
+            let _ = shared.host.send(ToHost::Disconnected(id));
         });
     }
 }
 
 /// Routes the host's output to the current connection.
-async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Option<Current>>>) {
+async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
     let mut packetizer = Packetizer::new();
     let mut next_update: u32 = 0;
     while let Some(msg) = rx.recv().await {
-        let cur = current.lock().unwrap();
+        let cur = shared.current.lock().unwrap();
         let Some(c) = cur.as_ref() else { continue };
         match msg {
             ToNet::Shutdown(reason) => {
@@ -208,21 +218,37 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Opt
     }
 }
 
-async fn serve(
-    id: ConnId,
-    incoming: quinn::Incoming,
-    host: HostSender<ToHost>,
-    current: Arc<Mutex<Option<Current>>>,
-    rate_bps: u64,
-    start: Instant,
-    audio: Arc<Audio>,
-) -> anyhow::Result<()> {
+async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow::Result<()> {
+    let (host, current, audio) = (&shared.host, &shared.current, &shared.opts.audio);
+    let (authorized_keys, rate_bps, start) = (&shared.opts.authorized_keys, shared.opts.rate_bps, shared.opts.start);
     let conn = incoming.await.context("handshake")?;
     tracing::info!(id, addr = %conn.remote_address(), "client connected");
     let (mut send, mut recv) = conn.accept_bi().await.context("waiting for the control stream")?;
     let Some(ClientMessage::Hello(hello)) = stream::recv(&mut recv).await? else {
         anyhow::bail!("the client did not start with Hello");
     };
+    let key = hello.auth.key;
+    let refuse = |why: &str| {
+        conn.close(CLOSE_UNAUTHORIZED.into(), why.as_bytes());
+        anyhow::anyhow!("refused: {why}")
+    };
+    if !auth::verify(&conn, &key, &hello.auth.signature) {
+        return Err(refuse("the client's signature doesn't match its key"));
+    }
+    match auth::is_authorized(authorized_keys, &key) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                id, file = %authorized_keys.display(), line = auth::format_line(&key, ""),
+                "a client key that isn't authorized; add its line to the file to let it in"
+            );
+            return Err(refuse(&format!("this client's key is not in {} on the server", authorized_keys.display())));
+        }
+        Err(err) => {
+            tracing::error!("{err:#}");
+            return Err(refuse("the server can't read its authorized keys"));
+        }
+    }
     tracing::info!(id, layout = ?hello.layout, decoders = hello.decoders.len(), "hello");
 
     let sched = Scheduler::spawn(conn.clone(), rate_bps, endpoint::DATAGRAM_BUFFER);

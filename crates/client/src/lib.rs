@@ -31,7 +31,10 @@ use farsight_net::quinn::Connection;
 use farsight_net::{endpoint, quinn, stream};
 use farsight_proto::audio::{AudioCaps, AudioConfig};
 use farsight_proto::codec::{DecoderCaps, Format, Mode};
-use farsight_proto::control::{ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome};
+use farsight_net::auth::{ClientKey, KnownHosts, Pin};
+use farsight_proto::control::{
+    ClientAuth, ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome,
+};
 use farsight_proto::datagram::{Datagram, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
 use farsight_proto::layout::Layout;
@@ -62,6 +65,11 @@ pub fn version() -> &'static str {
 
 pub struct Config {
     pub addr: SocketAddr,
+    /// The server's name as the user gave it, `host:port`: its key in
+    /// `known_hosts`.
+    pub server_name: String,
+    pub key: Arc<ClientKey>,
+    pub known_hosts: KnownHosts,
     pub layout: Layout,
     pub decoders: Vec<DecoderCaps>,
     pub mode: Mode,
@@ -154,10 +162,24 @@ impl Client {
         let endpoint = endpoint::client()?;
         let (conn, fingerprint) = endpoint::connect(&endpoint, cfg.addr).await?;
         tracing::info!(addr = %cfg.addr, %fingerprint, "connected");
+        // Nothing goes to a server that isn't the one we know.
+        if let Err(err) = cfg.known_hosts.check(&cfg.server_name, &Pin::Tls(fingerprint.clone())) {
+            conn.close(0u32.into(), b"unknown server");
+            return Err(err);
+        }
         let (mut send, mut recv) = conn.open_bi().await.context("opening the control stream")?;
-        let hello = Hello { decoders: cfg.decoders, layout: cfg.layout, mode: cfg.mode, audio: cfg.audio };
+        let auth = ClientAuth { key: cfg.key.public(), signature: cfg.key.sign(&conn)? };
+        let hello = Hello { decoders: cfg.decoders, layout: cfg.layout, mode: cfg.mode, audio: cfg.audio, auth };
         stream::send(&mut send, &ClientMessage::Hello(hello)).await?;
-        let welcome = match stream::recv(&mut recv).await? {
+        let welcome = match stream::recv(&mut recv).await {
+            Ok(m) => m,
+            Err(_) if unauthorized(&conn) => anyhow::bail!(
+                "the server doesn't know this client's key. On the server, add this line to its authorized_keys:\n  {}",
+                cfg.key.authorized_line("")
+            ),
+            Err(err) => return Err(err),
+        };
+        let welcome = match welcome {
             Some(ServerMessage::Welcome(w)) => w,
             Some(other) => anyhow::bail!("expected Welcome, got {other:?}"),
             None => anyhow::bail!("the server closed the control stream"),
@@ -433,6 +455,13 @@ async fn run(
     tracing::info!(%reason, "disconnected");
     conn.close(0u32.into(), b"");
     on_event(Event::Closed(reason));
+}
+
+/// The server closed the connection for want of an authorized key.
+fn unauthorized(conn: &Connection) -> bool {
+    /// As the server's `CLOSE_UNAUTHORIZED`.
+    const CODE: u32 = 3;
+    matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == CODE.into())
 }
 
 /// Holds frames back until their epoch is announced, so the app always

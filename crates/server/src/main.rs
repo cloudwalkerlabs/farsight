@@ -60,10 +60,16 @@ struct Args {
     /// which comes in M4.
     #[arg(long, default_value_t = 100)]
     rate: u64,
-    /// Directory holding the server's TLS identity (`cert.der`, `key.der`);
-    /// created on first run. Default: `$XDG_CONFIG_HOME/farsight`.
+    /// Directory holding the server's TLS identity (`cert.der`, `key.der`,
+    /// created on first run) and the clients' keys (`authorized_keys`).
+    /// Default: `$XDG_CONFIG_HOME/farsight`.
+    #[arg(long, alias = "identity")]
+    config_dir: Option<PathBuf>,
+    /// The client keys allowed in, one `ssh-ed25519 …` line each, as the
+    /// desktop client prints them (`farsight-desktop --print-key`).
+    /// Default: `authorized_keys` in the config directory.
     #[arg(long)]
-    identity: Option<PathBuf>,
+    authorized_keys: Option<PathBuf>,
     /// Also write the encoded H.264 elementary stream here.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -116,15 +122,26 @@ fn main() -> anyhow::Result<()> {
     let dh = display.handle();
     let start = Instant::now();
 
-    let identity_dir = match args.identity.clone() {
+    let config = match args.config_dir.clone() {
         Some(dir) => dir,
-        None => config_dir().context("no $XDG_CONFIG_HOME or $HOME; pass --identity")?,
+        None => config_dir().context("no $XDG_CONFIG_HOME or $HOME; pass --config-dir")?,
     };
-    let identity = farsight_net::endpoint::Identity::load_or_generate(&identity_dir)?;
+    let identity = farsight_net::endpoint::Identity::load_or_generate(&config)?;
+    let authorized_keys = args.authorized_keys.clone().unwrap_or_else(|| config.join("authorized_keys"));
+    if !authorized_keys.exists() {
+        tracing::warn!(file = %authorized_keys.display(), "no authorized keys yet: no client can connect");
+    }
     let (to_host, from_net) = channel::channel();
     let audio = Arc::new(net::Audio::default());
     let net = net::spawn(
-        net::Options { port: args.port, identity, rate_bps: args.rate * 1_000_000, start, audio: audio.clone() },
+        net::Options {
+            port: args.port,
+            authorized_keys,
+            identity,
+            rate_bps: args.rate * 1_000_000,
+            start,
+            audio: audio.clone(),
+        },
         to_host,
     )?;
 

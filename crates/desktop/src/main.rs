@@ -54,7 +54,16 @@ use render::{Placement, Renderer};
 #[command(version, about = "farsight desktop client")]
 struct Args {
     /// Server address, `host[:port]`.
-    address: String,
+    #[arg(required_unless_present = "print_key")]
+    address: Option<String>,
+    /// Print this client's public key, as a line for the server's
+    /// `authorized_keys`, and exit.
+    #[arg(long)]
+    print_key: bool,
+    /// Directory holding this client's key (`client_key`) and the servers
+    /// it knows (`known_hosts`). Default: `$XDG_CONFIG_HOME/farsight`.
+    #[arg(long)]
+    config_dir: Option<std::path::PathBuf>,
     /// Initial window size in logical pixels, WIDTHxHEIGHT.
     #[arg(long, default_value = "1280x720", value_parser = parse_size)]
     size: (u32, u32),
@@ -92,19 +101,38 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
     Ok((w.parse().map_err(|e| format!("{e}"))?, h.parse().map_err(|e| format!("{e}"))?))
 }
 
-fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+fn default_config_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("farsight"))
+}
+
+/// `user@host`, to tell keys apart in `authorized_keys`.
+fn key_comment() -> String {
+    let user = std::env::var("USER").unwrap_or_default();
+    let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    format!("{user}@{}", host.trim())
+}
+
+/// The address with its port, as the server is known in `known_hosts`.
+fn server_name(address: &str) -> String {
     let port = farsight_proto::DEFAULT_PORT;
-    if let Ok(a) = address.parse::<SocketAddr>() {
-        return Ok(a);
+    if address.parse::<SocketAddr>().is_ok() {
+        return address.to_string();
     }
     if let Ok(ip) = address.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
-        return Ok((ip, port).into());
+        return SocketAddr::from((ip, port)).to_string();
     }
-    let target = match address.rsplit_once(':') {
+    match address.rsplit_once(':') {
         Some((_, p)) if p.parse::<u16>().is_ok() => address.to_string(),
         _ => format!("{address}:{port}"),
-    };
-    target.to_socket_addrs()?.next().with_context(|| format!("{address} has no address"))
+    }
+}
+
+fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+    server_name(address).to_socket_addrs()?.next().with_context(|| format!("{address} has no address"))
 }
 
 /// From the other threads to the window.
@@ -137,6 +165,10 @@ struct Gfx {
 struct App {
     args: Args,
     addr: SocketAddr,
+    /// `host:port`, as pinned in `known_hosts`.
+    server_name: String,
+    config_dir: std::path::PathBuf,
+    key: Arc<farsight_net::auth::ClientKey>,
     proxy: EventLoopProxy<UserEvent>,
     runtime: tokio::runtime::Runtime,
     gfx: Option<Gfx>,
@@ -169,7 +201,18 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
-    let addr = resolve(&args.address)?;
+    let config_dir = match &args.config_dir {
+        Some(d) => d.clone(),
+        None => default_config_dir().context("no $XDG_CONFIG_HOME or $HOME; pass --config-dir")?,
+    };
+    let key = Arc::new(farsight_net::auth::ClientKey::load_or_generate(&config_dir.join("client_key"))?);
+    if args.print_key {
+        println!("{}", key.authorized_line(&key_comment()));
+        return Ok(());
+    }
+    let address = args.address.clone().expect("required by clap");
+    let addr = resolve(&address)?;
+    let server_name = server_name(&address);
     tracing::info!(%addr, core = farsight_client::version(), "farsight desktop client");
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -177,6 +220,9 @@ fn main() -> anyhow::Result<()> {
     let mut app = App {
         args,
         addr,
+        server_name,
+        config_dir,
+        key,
         proxy: event_loop.create_proxy(),
         runtime,
         gfx: None,
@@ -195,9 +241,7 @@ fn main() -> anyhow::Result<()> {
         audio: None,
     };
     event_loop.run_app(&mut app)?;
-    let App { client, runtime, decode_thread, exit, gfx, audio, .. } = app;
-    drop(audio);
-    drop(gfx);
+    let App { client, runtime, decode_thread, exit, .. } = app;
     if let Some(client) = client {
         client.close();
     }
@@ -222,7 +266,7 @@ impl App {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let attrs = Window::default_attributes()
-            .with_title(format!("farsight — {}", self.args.address))
+            .with_title(format!("farsight — {}", self.server_name))
             .with_inner_size(winit::dpi::LogicalSize::new(self.args.size.0, self.args.size.1));
         let (window, config) = DisplayBuilder::new()
             .with_window_attributes(Some(attrs))
@@ -274,7 +318,16 @@ impl App {
             self.decode_thread = Some(thread);
         }
         let audio = (!self.args.no_audio).then_some(farsight_proto::audio::AudioCaps { max_channels: 2 });
-        let cfg = Config { addr: self.addr, layout, decoders, mode: self.args.mode, audio };
+        let cfg = Config {
+            addr: self.addr,
+            server_name: self.server_name.clone(),
+            key: self.key.clone(),
+            known_hosts: farsight_net::auth::KnownHosts::new(self.config_dir.join("known_hosts")),
+            layout,
+            decoders,
+            mode: self.args.mode,
+            audio,
+        };
         let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
         let events = self.proxy.clone();
         tracing::info!(?layout, "connecting");
@@ -458,6 +511,13 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    /// The GL surface must go while the Wayland connection is still up:
+    /// NVIDIA's EGL crashes destroying it afterwards.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.audio = None;
+        self.gfx = None;
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         match self.send_layout() {
             Some(at) => event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at)),

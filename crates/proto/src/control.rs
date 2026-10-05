@@ -41,6 +41,15 @@ pub struct Hello {
     pub mode: Mode,
     /// `None` if the client plays no audio.
     pub audio: Option<AudioCaps>,
+    pub auth: ClientAuth,
+}
+
+/// The client's key, and its proof (§6): an Ed25519 signature over a value
+/// exported from this connection's keys (`farsight_net::auth`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientAuth {
+    pub key: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +171,7 @@ use crate::codec::{Chroma, Codec};
             layout: Layout { width_px: 1920, height_px: 1080, scale_120: 120, refresh_mhz: 60_000 },
             mode: Mode::Text,
             audio: Some(AudioCaps { max_channels: 2 }),
+            auth: ClientAuth { key: [1; 32], signature: vec![2; 64] },
         });
         let bytes = encode_framed(&msg);
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

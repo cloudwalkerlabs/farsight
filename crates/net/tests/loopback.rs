@@ -45,7 +45,7 @@ async fn frame_and_control_over_loopback() {
     let (conn, fp) = endpoint::connect(&client, SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await.unwrap();
     assert_eq!(fp, fingerprint);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    stream::send(&mut send, &ClientMessage::Hello(Hello { decoders: vec![], layout: LAYOUT, mode: Mode::Text, audio: None })).await.unwrap();
+    stream::send(&mut send, &ClientMessage::Hello(Hello { decoders: vec![], layout: LAYOUT, mode: Mode::Text, audio: None, auth: farsight_proto::control::ClientAuth { key: [0; 32], signature: vec![] } })).await.unwrap();
     let Some(ServerMessage::Welcome(w)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
     assert_eq!(w.encodings, [Encoding::Video(H264)]);
 
