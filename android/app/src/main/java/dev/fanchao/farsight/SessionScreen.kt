@@ -13,12 +13,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -41,6 +43,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -193,6 +197,9 @@ private fun Toolbar(
             touched++
         }
     }
+    val density = LocalDensity.current
+    // In landscape it may not fit below where it was dragged: it scrolls.
+    val room = with(density) { (LocalConfiguration.current.screenHeightDp.dp.toPx() - offsetY).toDp() - 12.dp }
     Box(modifier.offset { IntOffset(0, offsetY.roundToInt()) }.then(drag)) {
         if (!shown) {
             Box(
@@ -203,7 +210,9 @@ private fun Toolbar(
             return@Box
         }
         Column(
-            Modifier.padding(6.dp).background(Color(0xCC202020), RoundedCornerShape(14.dp)).padding(4.dp),
+            Modifier.padding(6.dp).heightIn(max = room.coerceAtLeast(120.dp))
+                .background(Color(0xCC202020), RoundedCornerShape(14.dp)).verticalScroll(rememberScrollState())
+                .padding(4.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             fun act(f: () -> Unit) = { touched++; f() }

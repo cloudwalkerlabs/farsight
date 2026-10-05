@@ -61,6 +61,8 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun ServerListScreen(
     servers: List<Server>,
+    /** Changes when a thumbnail is saved. */
+    thumbnails: Int,
     thumbnail: (Server) -> Bitmap?,
     keyLine: () -> String,
     onConnect: (Server) -> Unit,
@@ -96,7 +98,7 @@ fun ServerListScreen(
         ) {
             items(servers.sortedByDescending { it.lastUsed }, key = { it.id }) { server ->
                 Card(Modifier.fillMaxWidth().combinedClickable(onClick = { onConnect(server) }, onLongClick = { editing = server })) {
-                    val thumb = remember(server.id, server.lastUsed) { thumbnail(server) }
+                    val thumb = remember(server.id, thumbnails) { thumbnail(server) }
                     if (thumb != null) {
                         Image(
                             thumb.asImageBitmap(), null,

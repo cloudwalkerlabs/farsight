@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
@@ -15,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.view.WindowCompat
@@ -48,14 +50,26 @@ class MainActivity : ComponentActivity() {
     private var layout: ScreenLayout? = null
     private var stopped = false
     private var pendingMic: ((Boolean) -> Unit)? = null
+    /** Bumped when a thumbnail is saved, so the list draws it. */
+    private var thumbnails by mutableIntStateOf(0)
+    private var backPressed = 0L
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         pendingMic?.invoke(granted)
         pendingMic = null
     }
 
+    /** Back twice to leave: once is too easy to do by accident. */
     private val back = object : OnBackPressedCallback(false) {
-        override fun handleOnBackPressed() = leave()
+        override fun handleOnBackPressed() {
+            val now = System.currentTimeMillis()
+            if (now - backPressed < 2000) {
+                leave()
+            } else {
+                backPressed = now
+                Toast.makeText(this@MainActivity, "Press back again to leave", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -86,6 +100,7 @@ class MainActivity : ComponentActivity() {
                 } else {
                     ServerListScreen(
                         list,
+                        thumbnails = thumbnails,
                         thumbnail = servers::thumbnail,
                         keyLine = { clientKeyLine(servers.configDir, "android@${Build.MODEL.replace(' ', '-')}") },
                         onConnect = ::connect,
@@ -173,12 +188,17 @@ class MainActivity : ComponentActivity() {
         }
         if (view != null && c.connection is Connection.Connected) {
             view.thumbnail { bitmap ->
-                bitmap?.let { servers.saveThumbnail(c.server, it) }
+                bitmap?.let { saveThumbnail(c.server, it) }
                 stop()
             }
         } else {
             stop()
         }
+    }
+
+    private fun saveThumbnail(server: Server, bitmap: android.graphics.Bitmap) {
+        servers.saveThumbnail(server, bitmap)
+        thumbnails++
     }
 
     private fun immersive(on: Boolean) {
@@ -206,7 +226,7 @@ class MainActivity : ComponentActivity() {
         super.onStop()
         val c = controller ?: return
         stopped = true
-        sessionView?.thumbnail { bitmap -> bitmap?.let { servers.saveThumbnail(c.server, it) } }
+        sessionView?.thumbnail { bitmap -> bitmap?.let { saveThumbnail(c.server, it) } }
         c.stop()
     }
 

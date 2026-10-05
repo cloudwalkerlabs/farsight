@@ -44,6 +44,7 @@ dependencies {
     implementation(libs.lifecycle.runtime.compose)
     // uniffi's Kotlin bindings call into Rust through JNA.
     implementation("${libs.jna.get()}@aar")
+    testImplementation(libs.junit)
 }
 
 // --- Rust: farsight-android built with cargo-ndk, plus its uniffi bindings ---
