@@ -10,12 +10,14 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }
 ffmpeg-sys-next = "9"
 libc = "0.2.190"
 smithay = { version = "0.7", default-features = false, features = ["backend_egl", "backend_gbm", "renderer_gl", "wayland_frontend", "desktop", "use_system_lib"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

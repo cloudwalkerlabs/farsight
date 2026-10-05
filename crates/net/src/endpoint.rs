@@ -17,9 +17,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-/// Room for a burst of datagrams, such as a large keyframe, in each
-/// direction.
-const DATAGRAM_BUFFER: usize = 8 << 20;
+/// quinn's datagram buffers. Outgoing video waits in the scheduler
+/// ([`crate::sched`]), not here; this is room for a burst of datagrams that
+/// arrive faster than the application reads them.
+pub const DATAGRAM_BUFFER: usize = 2 << 20;
 
 /// The server's certificate and key.
 pub struct Identity {

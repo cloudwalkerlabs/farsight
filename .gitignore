@@ -1,2 +1,4 @@
 /target
 /.claude
+/tools/m1/wltool/target
+/tools/m1/wltool/Cargo.lock

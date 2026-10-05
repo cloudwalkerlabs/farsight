@@ -11,6 +11,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_surface::WlSurface};
@@ -38,6 +39,8 @@ use smithay::{
     delegate_xdg_decoration, delegate_xdg_shell,
 };
 
+use crate::cursor::Cursor;
+use crate::net::{ConnId, ToNet};
 use crate::pipeline::Pipeline;
 
 /// Per-client data. The host has very few clients: the nested compositor,
@@ -55,10 +58,13 @@ pub struct Layout {
     pub width: i32,
     pub height: i32,
     pub scale: f64,
+    /// The client's refresh rate, which frame callbacks are paced to.
+    pub refresh_mhz: u32,
 }
 
 pub struct Host {
     pub display: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, Host>,
     pub start: Instant,
     pub compositor: CompositorState,
     pub xdg_shell: XdgShellState,
@@ -75,6 +81,11 @@ pub struct Host {
     pub renderer: GlesRenderer,
     pub pipeline: Pipeline,
     pub running: bool,
+    /// The connected client, if any.
+    pub client: Option<ConnId>,
+    pub input: farsight_proto::input::InputReceiver,
+    pub cursor: Cursor,
+    pub net: tokio::sync::mpsc::UnboundedSender<ToNet>,
     /// labwc drops the configure that arrives before its output is enabled;
     /// we repeat it once after the first frame (see `pipeline`).
     pub initial_configure_repeated: bool,
@@ -82,11 +93,15 @@ pub struct Host {
 }
 
 impl Host {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         display: DisplayHandle,
+        loop_handle: LoopHandle<'static, Host>,
+        start: Instant,
         renderer: GlesRenderer,
         feedback: DmabufFeedback,
         pipeline: Pipeline,
+        net: tokio::sync::mpsc::UnboundedSender<ToNet>,
         layout: Layout,
     ) -> Self {
         let dh = &display;
@@ -124,7 +139,8 @@ impl Host {
 
         let mut host = Self {
             display,
-            start: Instant::now(),
+            loop_handle,
+            start,
             compositor,
             xdg_shell,
             shm,
@@ -138,6 +154,10 @@ impl Host {
             renderer,
             pipeline,
             running: true,
+            client: None,
+            input: Default::default(),
+            cursor: Cursor::default(),
+            net,
             initial_configure_repeated: false,
             _globals: globals,
         };
@@ -148,7 +168,7 @@ impl Host {
     /// Set the output mode and scale, and reconfigure the nested window.
     pub fn apply_output(&mut self, layout: Layout) {
         self.layout = layout;
-        let mode = Mode { size: (layout.width, layout.height).into(), refresh: 60_000 };
+        let mode = Mode { size: (layout.width, layout.height).into(), refresh: layout.refresh_mhz as i32 };
         self.output.change_current_state(
             Some(mode),
             Some(Transform::Normal),
@@ -203,6 +223,10 @@ impl CompositorHandler for Host {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        if self.cursor.is_surface(surface) {
+            crate::cursor::surface_committed(self, surface);
+            return;
+        }
         let Some(toplevel) = self.toplevel.clone() else { return };
         if toplevel.wl_surface() != surface {
             if compositor::get_parent(surface).is_some() {
@@ -323,7 +347,7 @@ impl SeatHandler for Host {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        tracing::debug!(?image, "cursor image");
+        crate::cursor::status_changed(self, image);
     }
 }
 

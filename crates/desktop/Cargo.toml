@@ -12,5 +12,15 @@ workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 farsight-client = { version = "0.1.0", path = "../client" }
+farsight-net = { version = "0.1.0", path = "../net" }
+farsight-proto = { version = "0.1.0", path = "../proto" }
+ffmpeg-sys-next = "9"
+glow = "0.16"
+glutin = "0.32"
+glutin-winit = "0.5"
+libc = "0.2"
+raw-window-handle = "0.6"
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+winit = "0.30"

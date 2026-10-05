@@ -1,13 +1,118 @@
 //! The desktop client.
+//!
+//! Three threads: the window and GL on the main thread (winit), the
+//! connection on a tokio runtime (`farsight-client`), and the decoder on its
+//! own thread. Frames go straight from the connection to the decoder; only
+//! the newest decoded picture is drawn, and drawing doesn't wait for vsync.
+//! The remote cursor is the window's own cursor, so moving it has no
+//! latency (§4).
 
+mod decode;
+mod render;
+mod stats;
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::num::NonZeroU32;
+use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use anyhow::Context as _;
 use clap::Parser;
+use farsight_client::{Client, Config, Event, VideoFrame};
+use farsight_proto::codec::{Chroma, Codec, DecoderCaps};
+use farsight_proto::control::{CursorImage, CursorShape};
+use farsight_proto::input::InputEvent;
+use farsight_proto::layout::{Layout, SCALE_DENOMINATOR};
+use farsight_proto::video::FragmentHeader;
+use glutin::config::{ConfigTemplateBuilder, GlConfig};
+use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
+use glutin::display::{GetGlDisplay, GlDisplay};
+use glutin::prelude::{GlSurface, NotCurrentGlContext};
+use glutin::surface::{Surface, SwapInterval, WindowSurface};
+use glutin_winit::{DisplayBuilder, GlWindow};
+use raw_window_handle::HasWindowHandle;
 use tracing_subscriber::EnvFilter;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::platform::scancode::PhysicalKeyExtScancode;
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
+
+use decode::{Decoder, Picture};
+use render::{Placement, Renderer};
 
 #[derive(Parser)]
 #[command(version, about = "farsight desktop client")]
 struct Args {
     /// Server address, `host[:port]`.
     address: String,
+    /// Initial window size in logical pixels, WIDTHxHEIGHT.
+    #[arg(long, default_value = "1280x720", value_parser = parse_size)]
+    size: (u32, u32),
+    /// Decode in software even if VA-API is available.
+    #[arg(long)]
+    software: bool,
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    Ok((w.parse().map_err(|e| format!("{e}"))?, h.parse().map_err(|e| format!("{e}"))?))
+}
+
+fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+    let port = farsight_proto::DEFAULT_PORT;
+    if let Ok(a) = address.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = address.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return Ok((ip, port).into());
+    }
+    let target = match address.rsplit_once(':') {
+        Some((_, p)) if p.parse::<u16>().is_ok() => address.to_string(),
+        _ => format!("{address}:{port}"),
+    };
+    target.to_socket_addrs()?.next().with_context(|| format!("{address} has no address"))
+}
+
+/// From the other threads to the window.
+enum UserEvent {
+    Connected(Arc<Client>),
+    Failed(String),
+    Net(Event),
+    Decoded(Decoded),
+}
+
+struct Decoded {
+    picture: Picture,
+    header: FragmentHeader,
+    complete_us: u64,
+    decoded_us: u64,
+}
+
+struct Gfx {
+    window: Window,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
+    renderer: Renderer,
+}
+
+struct App {
+    args: Args,
+    addr: SocketAddr,
+    proxy: EventLoopProxy<UserEvent>,
+    runtime: tokio::runtime::Runtime,
+    gfx: Option<Gfx>,
+    client: Option<Arc<Client>>,
+    /// Set once connected, for the decode thread.
+    client_cell: Arc<OnceLock<Arc<Client>>>,
+    pending: Option<Decoded>,
+    placement: Option<Placement>,
+    cursors: HashMap<u64, CustomCursor>,
+    stats: stats::Latency,
+    decode_thread: Option<std::thread::JoinHandle<()>>,
+    exit: Option<anyhow::Error>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -15,6 +120,344 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
-    tracing::info!(address = %args.address, core = farsight_client::version(), "connecting");
-    anyhow::bail!("not implemented yet")
+    let addr = resolve(&args.address)?;
+    tracing::info!(%addr, core = farsight_client::version(), "farsight desktop client");
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let mut app = App {
+        args,
+        addr,
+        proxy: event_loop.create_proxy(),
+        runtime,
+        gfx: None,
+        client: None,
+        client_cell: Arc::default(),
+        pending: None,
+        placement: None,
+        cursors: HashMap::new(),
+        stats: stats::Latency::default(),
+        decode_thread: None,
+        exit: None,
+    };
+    event_loop.run_app(&mut app)?;
+    let App { client, runtime, decode_thread, exit, gfx, .. } = app;
+    drop(gfx);
+    if let Some(client) = client {
+        client.close();
+    }
+    // Ending the runtime drops the connection's callback, which ends the
+    // decode thread. Wait for it: the iHD driver's exit-time destructors
+    // crash while a VA context is still open.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    if let Some(t) = decode_thread {
+        let _ = t.join();
+    }
+    match exit {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+impl App {
+    fn fail(&mut self, event_loop: &ActiveEventLoop, err: anyhow::Error) {
+        self.exit = Some(err);
+        event_loop.exit();
+    }
+
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        let attrs = Window::default_attributes()
+            .with_title(format!("farsight — {}", self.args.address))
+            .with_inner_size(winit::dpi::LogicalSize::new(self.args.size.0, self.args.size.1));
+        let (window, config) = DisplayBuilder::new()
+            .with_window_attributes(Some(attrs))
+            .build(event_loop, ConfigTemplateBuilder::new(), |configs| {
+                configs.reduce(|a, b| if b.num_samples() < a.num_samples() { b } else { a }).unwrap()
+            })
+            .map_err(|e| anyhow::anyhow!("creating the window: {e}"))?;
+        let window = window.context("no window")?;
+        let display = config.display();
+        let raw = window.window_handle()?.as_raw();
+        let ctx_attrs =
+            ContextAttributesBuilder::new().with_context_api(ContextApi::Gles(Some(Version::new(3, 0)))).build(Some(raw));
+        // SAFETY: the window outlives the context and surface (both in Gfx,
+        // dropped before it).
+        let context = unsafe { display.create_context(&config, &ctx_attrs)? };
+        let surface_attrs = window.build_surface_attributes(Default::default())?;
+        // SAFETY: as above.
+        let surface = unsafe { display.create_window_surface(&config, &surface_attrs)? };
+        let context = context.make_current(&surface)?;
+        // Present at once; the compositor shows the newest at its next
+        // refresh, like a mailbox.
+        if let Err(err) = surface.set_swap_interval(&context, SwapInterval::DontWait) {
+            tracing::warn!(%err, "can't turn vsync off");
+        }
+        // SAFETY: the context is current on this thread.
+        let gl = unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) };
+        let renderer = Renderer::new(gl)?;
+        self.gfx = Some(Gfx { window, surface, context, renderer });
+        Ok(())
+    }
+
+    fn connect(&mut self) {
+        let gfx = self.gfx.as_ref().unwrap();
+        let size = gfx.window.inner_size();
+        let layout = Layout {
+            width_px: size.width,
+            height_px: size.height,
+            scale_120: (gfx.window.scale_factor() * SCALE_DENOMINATOR as f64).round() as u32,
+            refresh_mhz: gfx.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000),
+        };
+        let (decode_tx, decode_rx) = mpsc::channel::<VideoFrame>();
+        let decoder = match Decoder::new(!self.args.software) {
+            Ok(d) => d,
+            Err(err) => {
+                let _ = self.proxy.send_event(UserEvent::Failed(format!("{err:#}")));
+                return;
+            }
+        };
+        let decoders = vec![DecoderCaps {
+            codec: Codec::H264,
+            chroma: Chroma::Yuv420,
+            bit_depth: 8,
+            max_width: 4096,
+            max_height: 4096,
+            hardware: decoder.hardware,
+            partial_decode: false,
+        }];
+        {
+            let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
+            let thread = std::thread::Builder::new()
+                .name("farsight-decode".into())
+                .spawn(move || decode_thread(decoder, decode_rx, proxy, cell))
+                .expect("spawning the decode thread");
+            self.decode_thread = Some(thread);
+        }
+        let cfg = Config { addr: self.addr, layout, decoders };
+        let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
+        let events = self.proxy.clone();
+        tracing::info!(?layout, "connecting");
+        self.runtime.spawn(async move {
+            let on_event = move |event| match event {
+                Event::Frame(f) => {
+                    let _ = decode_tx.send(f);
+                }
+                Event::Connected { .. } => {}
+                other => {
+                    let _ = events.send_event(UserEvent::Net(other));
+                }
+            };
+            match Client::connect(cfg, on_event).await {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    let _ = cell.set(client.clone());
+                    let _ = proxy.send_event(UserEvent::Connected(client));
+                }
+                Err(err) => {
+                    let _ = proxy.send_event(UserEvent::Failed(format!("{err:#}")));
+                }
+            }
+        });
+    }
+
+    fn input(&self, event: InputEvent) {
+        if let Some(c) = &self.client {
+            c.input(event);
+        }
+    }
+
+    fn set_cursor(&mut self, shape: CursorShape) {
+        let Some(gfx) = &self.gfx else { return };
+        match shape {
+            CursorShape::Hidden => gfx.window.set_cursor_visible(false),
+            CursorShape::Named(name) => {
+                gfx.window.set_cursor(name.parse::<CursorIcon>().unwrap_or_default());
+                gfx.window.set_cursor_visible(true);
+            }
+            CursorShape::Image(id) => {
+                if let Some(c) = self.cursors.get(&id) {
+                    gfx.window.set_cursor(c.clone());
+                    gfx.window.set_cursor_visible(true);
+                } else {
+                    tracing::warn!(id, "cursor image never arrived");
+                }
+            }
+        }
+    }
+
+    fn add_cursor_image(&mut self, event_loop: &ActiveEventLoop, image: CursorImage) {
+        tracing::debug!(id = image.id, size = ?(image.width, image.height), hotspot = ?image.hotspot, "cursor image");
+        // winit wants straight alpha; the server sends premultiplied BGRA.
+        let mut rgba = image.pixels;
+        for px in rgba.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            let un = |c: u8| (c as u32 * 255 + a / 2).checked_div(a).map_or(0, |v| v.min(255) as u8);
+            let (b, g, r) = (px[0], px[1], px[2]);
+            px[0] = un(r);
+            px[1] = un(g);
+            px[2] = un(b);
+        }
+        let hotspot =
+            (image.hotspot.0.clamp(0, image.width as i32 - 1), image.hotspot.1.clamp(0, image.height as i32 - 1));
+        match CustomCursor::from_rgba(rgba, image.width as u16, image.height as u16, hotspot.0 as u16, hotspot.1 as u16) {
+            Ok(source) => {
+                self.cursors.insert(image.id, event_loop.create_custom_cursor(source));
+            }
+            Err(err) => tracing::warn!(%err, "bad cursor image"),
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(gfx) = &mut self.gfx else { return };
+        let pending = self.pending.take();
+        if let Some(d) = &pending {
+            gfx.renderer.upload(&d.picture);
+        }
+        let size = gfx.window.inner_size();
+        self.placement = gfx.renderer.draw((size.width, size.height));
+        if let Err(err) = gfx.surface.swap_buffers(&gfx.context) {
+            tracing::warn!(%err, "swap");
+        }
+        if let (Some(d), Some(client)) = (pending, &self.client) {
+            let presented_us = client.now_us();
+            if d.decoded_us > 0
+                && let Some(capture) = client.server_to_local(d.header.capture_us)
+            {
+                self.stats.add(stats::Sample {
+                    encode_us: d.header.encode_us as u64,
+                    capture_local_us: capture,
+                    complete_us: d.complete_us,
+                    decoded_us: d.decoded_us,
+                    presented_us,
+                });
+            }
+            self.stats.maybe_report(presented_us, || client.stats());
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        if let Err(err) = self.create_window(event_loop) {
+            return self.fail(event_loop, err);
+        }
+        self.connect();
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Connected(client) => self.client = Some(client),
+            UserEvent::Failed(err) => self.fail(event_loop, anyhow::anyhow!(err)),
+            UserEvent::Decoded(d) => {
+                if let Some(gfx) = &self.gfx {
+                    if gfx.renderer.picture_size() != Some((d.picture.width, d.picture.height)) {
+                        tracing::info!(width = d.picture.width, height = d.picture.height, "video size");
+                    }
+                    gfx.window.request_redraw();
+                }
+                self.pending = Some(d);
+            }
+            UserEvent::Net(Event::CursorImage(image)) => self.add_cursor_image(event_loop, image),
+            UserEvent::Net(Event::Cursor(shape)) => self.set_cursor(shape),
+            UserEvent::Net(Event::Closed(reason)) => {
+                tracing::info!(%reason, "disconnected");
+                event_loop.exit();
+            }
+            UserEvent::Net(_) => {}
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let (Some(gfx), Some(w), Some(h)) =
+                    (&self.gfx, NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                {
+                    gfx.surface.resize(&gfx.context, w, h);
+                    gfx.window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Focused(false) => {
+                if let Some(c) = &self.client {
+                    c.release_all();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // The nested compositor's apps repeat keys themselves.
+                if event.repeat {
+                    return;
+                }
+                // On Linux, winit's scancode is the evdev code.
+                if let Some(code) = event.physical_key.to_scancode() {
+                    self.input(InputEvent::Key { code, pressed: event.state == ElementState::Pressed });
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(p) = self.placement {
+                    let (x, y) = p.to_picture(position.x, position.y);
+                    self.input(InputEvent::PointerAbs { x: x as f32, y: y as f32 });
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let code = match button {
+                    MouseButton::Left => 0x110,
+                    MouseButton::Right => 0x111,
+                    MouseButton::Middle => 0x112,
+                    MouseButton::Back => 0x113,
+                    MouseButton::Forward => 0x114,
+                    MouseButton::Other(_) => return,
+                };
+                self.input(InputEvent::Button { code, pressed: state == ElementState::Pressed });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Wayland's axes point down and right; winit's point up and
+                // left. One wheel click is 15 px, as in libinput.
+                let event = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => InputEvent::Scroll {
+                        dx: -x * 15.0,
+                        dy: -y * 15.0,
+                        v120_x: (-x * 120.0) as i32,
+                        v120_y: (-y * 120.0) as i32,
+                    },
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let s = self.placement.map_or(1.0, |p| p.scale);
+                        InputEvent::Scroll { dx: (-p.x * s) as f32, dy: (-p.y * s) as f32, v120_x: 0, v120_y: 0 }
+                    }
+                };
+                self.input(event);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn decode_thread(
+    mut decoder: Decoder,
+    rx: mpsc::Receiver<VideoFrame>,
+    proxy: EventLoopProxy<UserEvent>,
+    client: Arc<OnceLock<Arc<Client>>>,
+) {
+    for frame in rx {
+        match decoder.decode(&frame.data) {
+            Ok(Some(picture)) => {
+                let decoded_us = client.get().map_or(0, |c| c.now_us());
+                let d = Decoded { picture, header: frame.header, complete_us: frame.complete_us, decoded_us };
+                if proxy.send_event(UserEvent::Decoded(d)).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(frame = frame.header.frame, "{err:#}");
+                if let Some(c) = client.get() {
+                    c.request_keyframe();
+                }
+            }
+        }
+    }
 }

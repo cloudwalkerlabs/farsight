@@ -5,8 +5,10 @@ headless Wayland compositor, and it streams hardware-encoded video over QUIC
 datagrams. Clients run on the Linux desktop and on Android, and the Android
 client is built to work with touch alone.
 
-Early days: only the scaffolding exists. See [`docs/design.md`](docs/design.md)
-for the design and milestones.
+Early days: the Linux desktop client works end to end (M1): H.264 through
+VA-API at both ends, input, and a client-side cursor. See
+[`docs/design.md`](docs/design.md) for the design and milestones, and
+[`docs/m1-results.md`](docs/m1-results.md) for what M1 measured.
 
 ## Layout
 
@@ -33,9 +35,12 @@ cd android && ./gradlew assembleDebug                         # needs cargo-ndk
 cd android && ./gradlew assembleDebug -Pfarsight.abis=arm64-v8a   # one ABI only
 ```
 
-Run a server with `farsight-server [--port 7740]`. To keep a session
-running permanently, install `dist/farsight-server@.service`; the file
-explains how.
+Run a server with `farsight-server [--port 7740]`, and connect from a
+Wayland desktop with `farsight-desktop HOST[:PORT]`. Both need VA-API (the
+client falls back to software decoding). The server prints its certificate
+fingerprint at startup; the client prints the one it sees, but doesn't pin
+it yet. To keep a session running permanently, install
+`dist/farsight-server@.service`; the file explains how.
 
 The Android build runs `cargo ndk` itself and generates the Kotlin bindings,
 so there is no separate Rust step.

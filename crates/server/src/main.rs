@@ -5,13 +5,17 @@
 //! compositor in it, and serves clients on one port. Clients that disconnect
 //! can reconnect to the same session. See `docs/design.md` §6.
 //!
-//! Current state: the M0 spike. The host compositor runs the desktop nested,
-//! encodes it with VA-API and writes H.264 to a file. Spike experiments are
-//! driven by commands on stdin (see `control`).
+//! Current state: M1. The host compositor runs the desktop nested, encodes
+//! it with VA-API and streams it to one client at a time, which sends input
+//! back. The session's isolation (§6) comes in M3. Commands on stdin drive
+//! experiments (see `control`).
 
+mod cursor;
 mod encode;
 mod gpu;
 mod host;
+mod input;
+mod net;
 mod pipeline;
 
 use std::io::BufRead;
@@ -19,22 +23,24 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
-use smithay::input::keyboard::{FilterResult, Keycode, XkbConfig};
-use smithay::input::pointer::{ButtonEvent, MotionEvent};
+use smithay::input::keyboard::XkbConfig;
 use smithay::reexports::calloop::channel::{self, Channel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing_subscriber::EnvFilter;
 
+use farsight_proto::codec::Codec;
+use farsight_proto::control::{ClientMessage, ServerMessage, Welcome};
+use farsight_proto::input::InputEvent;
 use host::{ClientState, Host, Layout};
+use net::ToHost;
 
 #[derive(Parser)]
 #[command(version, about = "farsight server: a headless Wayland session served over QUIC")]
@@ -51,10 +57,18 @@ struct Args {
     /// Initial output scale.
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
-    /// Write the encoded H.264 elementary stream here (spike).
+    /// Pace video at this many Mbit/s. A stand-in for congestion control,
+    /// which comes in M4.
+    #[arg(long, default_value_t = 100)]
+    rate: u64,
+    /// Directory holding the server's TLS identity (`cert.der`, `key.der`);
+    /// created on first run. Default: `$XDG_CONFIG_HOME/farsight`.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Also write the encoded H.264 elementary stream here.
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Constant QP for the spike's encoder.
+    /// Constant QP for the encoder.
     #[arg(long, default_value_t = 24)]
     qp: u32,
     /// Read the probe client's frame number from each frame (spike).
@@ -80,16 +94,27 @@ fn main() -> anyhow::Result<()> {
     let mut event_loop: EventLoop<Host> = EventLoop::try_new()?;
     let display: Display<Host> = Display::new()?;
     let dh = display.handle();
+    let start = Instant::now();
+
+    let identity_dir = match args.identity.clone() {
+        Some(dir) => dir,
+        None => config_dir().context("no $XDG_CONFIG_HOME or $HOME; pass --identity")?,
+    };
+    let identity = farsight_net::endpoint::Identity::load_or_generate(&identity_dir)?;
+    let (to_host, from_net) = channel::channel();
+    let net = net::spawn(
+        net::Options { port: args.port, identity, rate_bps: args.rate * 1_000_000, start },
+        to_host,
+    )?;
 
     let gpu = gpu::open(&args.render_node)?;
-    let pipeline = pipeline::Pipeline::new(pipeline::Options {
-        render_node: args.render_node.clone(),
-        out: args.out.clone(),
-        qp: args.qp,
-        probe: args.probe,
-    })?;
-    let layout = Layout { width: args.size.0, height: args.size.1, scale: args.scale };
-    let mut host = Host::new(dh.clone(), gpu.renderer, gpu.feedback, pipeline, layout);
+    let pipeline = pipeline::Pipeline::new(
+        pipeline::Options { render_node: args.render_node.clone(), out: args.out.clone(), qp: args.qp, probe: args.probe },
+        start,
+        net.clone(),
+    )?;
+    let layout = Layout { width: args.size.0, height: args.size.1, scale: args.scale, refresh_mhz: 60_000 };
+    let mut host = Host::new(dh.clone(), event_loop.handle(), start, gpu.renderer, gpu.feedback, pipeline, net, layout);
 
     let socket = ListeningSocketSource::with_name(&format!("farsight-{}", args.port))
         .context("binding the host Wayland socket")?;
@@ -113,6 +138,13 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    loop_handle
+        .insert_source(from_net, |event, _, host| {
+            if let channel::Event::Msg(msg) = event {
+                on_net(host, msg);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     loop_handle
         .insert_source(control_channel(), |event, _, host| {
             if let channel::Event::Msg(line) = event {
@@ -143,6 +175,73 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn config_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("farsight"))
+}
+
+/// Messages from the network thread.
+fn on_net(host: &mut Host, msg: ToHost) {
+    match msg {
+        ToHost::Connected(id, hello) => {
+            if host.client.is_some() {
+                input::release_all(host);
+            }
+            host.client = Some(id);
+            host.input = Default::default();
+            if !hello.decoders.iter().any(|d| d.codec == Codec::H264) {
+                tracing::warn!(id, "the client offers no H.264 decoder; sending H.264 anyway");
+            }
+            // Resizing mid-session is M2; the first layout is applied as is.
+            let l = hello.layout;
+            let layout = Layout {
+                width: l.width_px as i32,
+                height: l.height_px as i32,
+                scale: l.scale_120 as f64 / farsight_proto::layout::SCALE_DENOMINATOR as f64,
+                refresh_mhz: if l.refresh_mhz == 0 { 60_000 } else { l.refresh_mhz },
+            };
+            let resized = layout != host.layout && layout.width > 0 && layout.height > 0;
+            if resized {
+                tracing::info!(?layout, "applying the client's layout");
+                host.apply_output(layout);
+            }
+            let welcome = Welcome { codec: Codec::H264, layout: farsight_proto::layout::Layout {
+                width_px: host.layout.width as u32,
+                height_px: host.layout.height as u32,
+                scale_120: (host.layout.scale * farsight_proto::layout::SCALE_DENOMINATOR as f64).round() as u32,
+                refresh_mhz: host.layout.refresh_mhz,
+            } };
+            let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(welcome)));
+            cursor::client_connected(host);
+            host.pipeline.set_client(Some(id));
+            // After a resize the desktop's next frame, at the new size, is the
+            // first keyframe; otherwise send what is on screen now.
+            if !resized {
+                pipeline::refresh(host);
+            }
+        }
+        ToHost::Message(id, msg) if host.client == Some(id) => match msg {
+            ClientMessage::RequestKeyframe => {
+                tracing::debug!("keyframe requested");
+                pipeline::refresh(host);
+            }
+            ClientMessage::SetLayout(layout) => tracing::info!(?layout, "SetLayout ignored until M2"),
+            ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
+        },
+        ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
+        ToHost::Disconnected(id) if host.client == Some(id) => {
+            input::release_all(host);
+            host.client = None;
+            host.pipeline.set_client(None);
+        }
+        _ => {} // from a connection that has been taken over
+    }
+    let _ = host.display.flush_clients();
+}
+
 fn spawn_desktop(cmd: &[String], socket: &std::ffi::OsStr) -> anyhow::Result<Child> {
     tracing::info!(?cmd, ?socket, "starting desktop");
     let mut c = Command::new(&cmd[0]);
@@ -161,7 +260,7 @@ fn spawn_desktop(cmd: &[String], socket: &std::ffi::OsStr) -> anyhow::Result<Chi
     c.spawn().with_context(|| format!("starting {}", cmd[0]))
 }
 
-/// Spike experiments, one command per line on stdin.
+/// Experiments, one command per line on stdin.
 fn control_channel() -> Channel<String> {
     let (tx, rx) = channel::channel();
     std::thread::spawn(move || {
@@ -177,13 +276,12 @@ fn control_channel() -> Channel<String> {
 fn control(host: &mut Host, line: &str) {
     let words: Vec<&str> = line.split_whitespace().collect();
     let num = |i: usize| words.get(i).and_then(|w| w.parse::<f64>().ok());
-    let time = (host.now_us() / 1000) as u32;
     match words.as_slice() {
         ["size", ..] | ["layout", ..] => {
             let (Some(w), Some(h)) = (num(1), num(2)) else { return usage() };
             let scale = num(3).unwrap_or(host.layout.scale);
             tracing::info!(w, h, scale, "control: layout");
-            host.apply_output(Layout { width: w as i32, height: h as i32, scale });
+            host.apply_output(Layout { width: w as i32, height: h as i32, scale, ..host.layout });
         }
         ["scale", _] => {
             let Some(scale) = num(1) else { return usage() };
@@ -193,17 +291,11 @@ fn control(host: &mut Host, line: &str) {
         ["key", ..] => {
             // evdev keycodes, pressed in order and released in reverse.
             let codes: Vec<u32> = words[1..].iter().filter_map(|w| w.parse().ok()).collect();
-            let Some(kbd) = host.seat.get_keyboard() else { return };
-            for (codes, state) in [
-                (codes.clone(), smithay::backend::input::KeyState::Pressed),
-                (codes.into_iter().rev().collect(), smithay::backend::input::KeyState::Released),
-            ] {
-                for code in codes {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    kbd.input::<(), _>(host, Keycode::new(code + 8), state, serial, time, |_, _, _| {
-                        FilterResult::Forward
-                    });
-                }
+            for &code in &codes {
+                input::inject(host, InputEvent::Key { code, pressed: true });
+            }
+            for &code in codes.iter().rev() {
+                input::inject(host, InputEvent::Key { code, pressed: false });
             }
         }
         ["keymap", layout, rest @ ..] => {
@@ -217,24 +309,14 @@ fn control(host: &mut Host, line: &str) {
         }
         ["move", ..] => {
             let (Some(x), Some(y)) = (num(1), num(2)) else { return usage() };
-            let Some(ptr) = host.seat.get_pointer() else { return };
-            let focus = host.toplevel.as_ref().map(|t| (t.wl_surface().clone(), (0.0, 0.0).into()));
-            let event = MotionEvent { location: (x, y).into(), serial: SERIAL_COUNTER.next_serial(), time };
-            ptr.motion(host, focus, &event);
-            ptr.frame(host);
+            input::inject(host, InputEvent::PointerAbs { x: x as f32, y: y as f32 });
         }
         ["click", ..] => {
-            let button = num(1).map(|b| b as u32).unwrap_or(0x110); // BTN_LEFT
-            let Some(ptr) = host.seat.get_pointer() else { return };
-            for state in [
-                smithay::backend::input::ButtonState::Pressed,
-                smithay::backend::input::ButtonState::Released,
-            ] {
-                let event = ButtonEvent { serial: SERIAL_COUNTER.next_serial(), time, button, state };
-                ptr.button(host, &event);
-                ptr.frame(host);
-            }
+            let code = num(1).map(|b| b as u32).unwrap_or(0x110); // BTN_LEFT
+            input::inject(host, InputEvent::Button { code, pressed: true });
+            input::inject(host, InputEvent::Button { code, pressed: false });
         }
+        ["keyframe"] => pipeline::refresh(host),
         ["quit"] => host.running = false,
         _ => usage(),
     }
@@ -243,6 +325,6 @@ fn control(host: &mut Host, line: &str) {
 
 fn usage() {
     tracing::warn!(
-        "commands: size W H [S] | scale S | key CODE... | keymap LAYOUT [VARIANT] | move X Y | click [BTN] | quit"
+        "commands: size W H [S] | scale S | key CODE... | keymap LAYOUT [VARIANT] | move X Y | click [BTN] | keyframe | quit"
     );
 }

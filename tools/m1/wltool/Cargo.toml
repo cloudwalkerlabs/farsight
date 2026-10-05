@@ -1,0 +1,15 @@
+# Test helper for headless wlroots compositors; not part of the workspace.
+[package]
+name = "wltool"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.8"

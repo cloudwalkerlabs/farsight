@@ -4,6 +4,7 @@
 
 pub mod endpoint;
 pub mod packetize;
+pub mod sched;
 pub mod stream;
 
 pub use quinn;
