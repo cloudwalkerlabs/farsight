@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use farsight_net::packetize::{EncodedFrame, Packetizer};
+use farsight_net::path::{self, PathState};
 use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{auth, endpoint, stream};
@@ -109,6 +110,7 @@ struct Conn {
     id: ConnId,
     conn: Connection,
     sched: Scheduler,
+    path: Arc<PathState>,
     control: mpsc::UnboundedSender<ServerMessage>,
     /// The client plays audio and hasn't muted it.
     audio: bool,
@@ -190,8 +192,10 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                 }
             }
             ToNet::Frame(f) => {
-                // One packetization fits every connection's path.
+                // One packetization fits every connection's path, and
+                // its parity the worst loss among them.
                 let Some(max) = conns.iter().filter_map(|c| c.conn.max_datagram_size()).min() else { continue };
+                let loss = conns.iter().map(|c| c.path.loss()).fold(0.0, f64::max);
                 let frame = EncodedFrame {
                     data: &f.data,
                     keyframe: f.keyframe,
@@ -199,7 +203,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     capture_us: f.capture_us,
                     encode_us: f.encode_us,
                 };
-                let datagrams = packetizer.packetize(&frame, max);
+                let datagrams = packetizer.packetize(&frame, max, loss);
                 for c in conns.iter() {
                     c.sched.send_frame(datagrams.clone(), f.keyframe);
                 }
@@ -298,8 +302,15 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // Audio goes to a client that plays it, from a session that has it.
     let audio_config = hello.audio.and(audio.config.get().copied());
-    let next =
-        Conn { id, conn: conn.clone(), sched: sched.clone(), control: control_tx, audio: audio_config.is_some(), view_only };
+    let next = Conn {
+        id,
+        conn: conn.clone(),
+        sched: sched.clone(),
+        path: path::monitor(conn.clone()),
+        control: control_tx,
+        audio: audio_config.is_some(),
+        view_only,
+    };
     {
         let mut conns = shared.conns.lock().unwrap();
         if !view_only {

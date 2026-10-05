@@ -115,14 +115,14 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let h = FragmentHeader { flags: 1, epoch: 1, frame: 2, index: 0, count: 1, capture_us: 3, encode_us: 4 };
+        let h = FragmentHeader { flags: 1, epoch: 1, frame: 2, index: 0, count: 1, data: 1, len: 3, capture_us: 3, encode_us: 4 };
         let input = InputPacket {
             seq: 9,
             events: vec![InputEvent::Key { code: 30, pressed: true }],
             snapshot: Some(Snapshot { keys: vec![30], buttons: vec![], pointer: Some((1.5, 2.0)) }),
         };
         for d in [
-            Datagram::Video(h, b"abc"),
+            Datagram::Video(h, b"abcd"),
             Datagram::Tiles(
                 TilesHeader {
                     epoch: 1,

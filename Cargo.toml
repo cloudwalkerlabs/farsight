@@ -16,3 +16,7 @@ undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 debug = "line-tables-only"
+
+# FEC runs on every frame; unoptimized, a keyframe's parity takes 100 ms.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3

@@ -70,6 +70,7 @@ impl Latency {
             rtt_ms = format!("{:.2}", stats.rtt_us as f64 / 1000.0),
             rtt_max_ms = format!("{:.2}", stats.rtt_max_us as f64 / 1000.0),
             lost = stats.lost - self.last.lost,
+            recovered = stats.recovered - self.last.recovered,
             keyframe_requests = stats.keyframe_requests - self.last.keyframe_requests,
             "latency ms, median/p95: {}",
             summary.join(", ")

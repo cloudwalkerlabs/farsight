@@ -4,7 +4,7 @@
 //! control are all still QUIC's; only the keys do nothing.
 //!
 //! The null handshake carries the transport parameters, a random value from
-//! each side and the identity `farsight-plain/0`:
+//! each side and the identity `farsight-plain/N` (N follows ALPN):
 //!
 //! ```text
 //! client → server  Initial    HELLO     identity, client random, parameters
@@ -36,8 +36,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 /// The QUIC version plaintext endpoints speak: "FSP" and 0.
 pub const VERSION: u32 = 0x4653_5000;
 
-/// Carried in HELLO, as ALPN is in TLS.
-pub const IDENTITY: &[u8] = b"farsight-plain/0";
+/// Carried in HELLO, as ALPN is in TLS; its number follows
+/// [`farsight_proto::ALPN`]'s.
+pub const IDENTITY: &[u8] = b"farsight-plain/3";
 
 const HELLO: u8 = 1;
 const ACCEPT: u8 = 2;

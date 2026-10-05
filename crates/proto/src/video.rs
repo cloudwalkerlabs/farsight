@@ -1,6 +1,13 @@
 //! Video fragments (`docs/design.md` §2). Each encoded frame is split into
-//! fragments that each fit one datagram. The header is fixed-size and
-//! hand-encoded: it rides on every packet of the stream.
+//! `data` equal shards that each fit one datagram, the last padded with
+//! zeros, followed by Reed-Solomon parity shards of the same size: any
+//! `data` of a frame's `count` shards rebuild it. The header is fixed-size
+//! and hand-encoded: it rides on every packet of the stream.
+//!
+//! The shard size is the payload's length. It may be more than the frame
+//! needs: QUIC packs small datagrams into one packet, and shards that share
+//! a packet are lost together, so a frame of more than one shard pads them
+//! all past half a datagram.
 
 /// Set on every fragment of a frame the decoder can start from.
 pub const FLAG_KEYFRAME: u8 = 1 << 0;
@@ -13,8 +20,14 @@ pub struct FragmentHeader {
     pub epoch: u16,
     /// Frame number, counting up across epochs.
     pub frame: u32,
+    /// Shards `0..data` are the frame's bytes, the rest parity.
     pub index: u16,
+    /// Data and parity shards.
     pub count: u16,
+    pub data: u16,
+    /// The frame's length in bytes; what is past it in the data shards is
+    /// padding.
+    pub len: u32,
     /// When the nested compositor committed the frame, in server µs.
     pub capture_us: u64,
     /// Commit to encoded, in µs.
@@ -22,7 +35,7 @@ pub struct FragmentHeader {
 }
 
 impl FragmentHeader {
-    pub const LEN: usize = 1 + 2 + 4 + 2 + 2 + 8 + 4;
+    pub const LEN: usize = 1 + 2 + 4 + 2 + 2 + 2 + 4 + 8 + 4;
 
     pub fn keyframe(&self) -> bool {
         self.flags & FLAG_KEYFRAME != 0
@@ -34,6 +47,8 @@ impl FragmentHeader {
         out.extend_from_slice(&self.frame.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.data.to_le_bytes());
+        out.extend_from_slice(&self.len.to_le_bytes());
         out.extend_from_slice(&self.capture_us.to_le_bytes());
         out.extend_from_slice(&self.encode_us.to_le_bytes());
     }
@@ -52,14 +67,27 @@ impl FragmentHeader {
             frame: u32_at(3),
             index: u16_at(7),
             count: u16_at(9),
-            capture_us: u64::from_le_bytes(h[11..19].try_into().unwrap()),
-            encode_us: u32_at(19),
+            data: u16_at(11),
+            len: u32_at(13),
+            capture_us: u64::from_le_bytes(h[17..25].try_into().unwrap()),
+            encode_us: u32_at(25),
         };
-        if header.count == 0 || header.index >= header.count {
+        if header.data == 0 || header.data > header.count || header.index >= header.count {
+            return None;
+        }
+        // The data shards must hold the frame.
+        if payload.len() < shard_size(header.len as usize, header.data as usize) || !payload.len().is_multiple_of(2) {
             return None;
         }
         Some((header, payload))
     }
+}
+
+/// The smallest shard size for a frame of `len` bytes in `data` shards:
+/// as even as the split allows (Reed-Solomon works on pairs of bytes),
+/// never empty.
+pub fn shard_size(len: usize, data: usize) -> usize {
+    (len.div_ceil(data.max(1)).max(1) + 1) & !1
 }
 
 #[cfg(test)]
@@ -74,24 +102,44 @@ mod tests {
             frame: 0xdead_beef,
             index: 7,
             count: 9,
+            data: 8,
+            len: 7 * 8 + 7,
             capture_us: 1 << 40,
             encode_us: 4321,
         };
         let mut buf = Vec::new();
         h.write(&mut buf);
         assert_eq!(buf.len(), FragmentHeader::LEN);
-        buf.extend_from_slice(b"payload");
+        buf.extend_from_slice(b"payload!");
         let (back, payload) = FragmentHeader::read(&buf).unwrap();
         assert_eq!(back, h);
-        assert_eq!(payload, b"payload");
+        assert_eq!(payload, b"payload!");
     }
 
     #[test]
-    fn rejects_bad_index() {
-        let h = FragmentHeader { flags: 0, epoch: 0, frame: 0, index: 2, count: 2, capture_us: 0, encode_us: 0 };
+    fn rejects_bad_shards() {
+        let h = FragmentHeader { flags: 0, epoch: 0, frame: 0, index: 2, count: 2, data: 1, len: 4, capture_us: 0, encode_us: 0 };
         let mut buf = Vec::new();
         h.write(&mut buf);
         assert!(FragmentHeader::read(&buf).is_none());
         assert!(FragmentHeader::read(&buf[..5]).is_none());
+        // Shards must hold the frame, in pairs of bytes.
+        let mut buf = Vec::new();
+        FragmentHeader { index: 1, ..h }.write(&mut buf);
+        buf.extend_from_slice(&[0; 2]);
+        assert!(FragmentHeader::read(&buf).is_none());
+        buf.extend_from_slice(&[0; 3]);
+        assert!(FragmentHeader::read(&buf).is_none());
+        buf.push(0);
+        assert!(FragmentHeader::read(&buf).is_some());
+    }
+
+    #[test]
+    fn shard_sizes_are_even_and_cover_the_frame() {
+        for (len, data) in [(0, 1), (1, 1), (1300, 2), (2401, 3), (1200, 1)] {
+            let s = shard_size(len, data);
+            assert!(s.is_multiple_of(2) && s * data >= len && s > 0, "{len} {data}");
+        }
+        assert_eq!(shard_size(1300, 2), 650);
     }
 }

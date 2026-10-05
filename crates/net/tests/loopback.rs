@@ -36,7 +36,7 @@ async fn frame_and_control_over_loopback() {
         let max = conn.max_datagram_size().unwrap();
         let frame = EncodedFrame { data: &sent, keyframe: true, epoch: 1, capture_us: 1, encode_us: 1 };
         let sched = Scheduler::spawn(conn.clone(), 1_000_000_000, endpoint::DATAGRAM_BUFFER);
-        sched.send_frame(Packetizer::new().packetize(&frame, max), true);
+        sched.send_frame(Packetizer::new().packetize(&frame, max, 0.0), true);
         // Hold the connection open until the client is done.
         conn.closed().await;
     });
@@ -75,7 +75,7 @@ async fn pings_overtake_a_keyframe() {
         let sched = Scheduler::spawn(conn.clone(), 20_000_000, endpoint::DATAGRAM_BUFFER);
         let data = vec![0x55; 1_000_000];
         let frame = EncodedFrame { data: &data, keyframe: true, epoch: 1, capture_us: 0, encode_us: 0 };
-        sched.send_frame(Packetizer::new().packetize(&frame, conn.max_datagram_size().unwrap()), true);
+        sched.send_frame(Packetizer::new().packetize(&frame, conn.max_datagram_size().unwrap(), 0.0), true);
         while let Ok(d) = conn.read_datagram().await {
             if let Some(Datagram::Ping(p)) = Datagram::decode(&d) {
                 sched.send(Priority::Input, Datagram::Pong(Pong { client_us: p.client_us, server_us: 0 }).to_vec().into());

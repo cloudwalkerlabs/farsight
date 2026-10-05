@@ -223,9 +223,14 @@ async fn drive(conn: Connection, shared: Arc<Shared>, buffer_size: usize) {
             let buffered = buffer_size.saturating_sub(conn.datagram_send_buffer_space());
             let next = shared.queues.lock().unwrap().next(Instant::now(), buffered);
             let Next::Send(d) = next else { break next };
-            if let Err(err) = conn.send_datagram(d) {
-                tracing::debug!(%err, "scheduler stopping");
-                return;
+            match conn.send_datagram(d) {
+                Ok(()) => {}
+                // Packetized for a larger datagram than the path now takes.
+                Err(quinn::SendDatagramError::TooLarge) => tracing::debug!("datagram too large; dropped"),
+                Err(err) => {
+                    tracing::debug!(%err, "scheduler stopping");
+                    return;
+                }
             }
         };
         let wake = shared.wake.notified();

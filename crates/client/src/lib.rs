@@ -141,6 +141,8 @@ pub struct TilesPacket {
 pub struct Stats {
     pub frames: u64,
     pub lost: u64,
+    /// Frames rebuilt from parity (FEC).
+    pub recovered: u64,
     pub keyframe_requests: u64,
     /// The shortest recent ping round trip, in µs.
     pub rtt_us: u64,
@@ -512,6 +514,10 @@ async fn run(
                 let _ = control.send(ClientMessage::RequestRefresh(refresh));
             }
             rx.expire(now);
+            let recovered = rx.take_recovered();
+            if recovered > 0 {
+                shared.stats.lock().unwrap().recovered += recovered as u64;
+            }
             let lost = rx.take_lost();
             if lost > 0 {
                 shared.stats.lock().unwrap().lost += lost as u64;
@@ -720,7 +726,8 @@ mod tests {
     use super::*;
 
     fn frame(epoch: u16, n: u32) -> VideoFrame {
-        let header = FragmentHeader { flags: 0, epoch, frame: n, index: 0, count: 1, capture_us: 0, encode_us: 0 };
+        let header =
+            FragmentHeader { flags: 0, epoch, frame: n, index: 0, count: 1, data: 1, len: 0, capture_us: 0, encode_us: 0 };
         VideoFrame { header, data: Vec::new(), first_us: 0, complete_us: 0 }
     }
 

@@ -234,9 +234,10 @@ off.
     way;
   - packet keys and header protection do nothing, and the packet tag is
     empty, so there is no integrity check beyond the UDP checksum.
-- **Its own ALPN-like identity, `farsight-plain/0`,** carried in the null
-  handshake. A TLS endpoint and a plaintext endpoint fail to connect
-  instead of misreading each other.
+- **Its own ALPN-like identity, `farsight-plain/3`** (its number follows
+  ALPN's), carried in the null handshake. A TLS endpoint and a plaintext
+  endpoint fail to connect instead of misreading each other, and so do
+  two plaintext endpoints of different protocol versions.
 - **Opt-in on both ends, never a fallback.**
   - The server serves either TLS or plaintext on a port, not both.
   - The client stores the mode per server in its address book and never

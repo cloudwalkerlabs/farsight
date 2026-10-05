@@ -73,12 +73,24 @@ pub fn fingerprint(cert: &[u8]) -> String {
 }
 
 /// Tuned for interactive media rather than bulk transfer.
+///
+/// - **The MTU stays at QUIC's minimum of 1200**, as media stacks do: path
+///   MTU discovery's black-hole detection takes random loss for a black
+///   hole, and when the MTU shrinks quinn drops every queued datagram that
+///   no longer fits, which is a whole frame.
+/// - `FARSIGHT_NO_GSO` turns UDP segmentation offload off. Only tests want
+///   it: `tc netem` drops an offloaded batch of packets whole, where a real
+///   link loses them one by one (tools/m4/netem.sh).
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(1)))
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
-        .datagram_send_buffer_size(DATAGRAM_BUFFER);
+        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .mtu_discovery_config(None);
+    if std::env::var_os("FARSIGHT_NO_GSO").is_some() {
+        t.enable_segmentation_offload(false);
+    }
     t
 }
 
