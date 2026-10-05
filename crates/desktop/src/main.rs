@@ -20,12 +20,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use farsight_client::{Client, Config, Event, VideoFrame};
+use farsight_client::{Client, Config, Event, TilesPacket, VideoFrame};
 use farsight_proto::codec::{Encoding, Format, Mode};
 use farsight_proto::control::{CursorImage, CursorShape};
 use farsight_proto::input::InputEvent;
 use farsight_proto::layout::{Layout, SCALE_DENOMINATOR};
-use farsight_proto::video::FragmentHeader;
+use farsight_proto::tiles::Rect;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
 use glutin::display::{GetGlDisplay, GlDisplay};
@@ -106,8 +106,10 @@ enum UserEvent {
 }
 
 struct Decoded {
-    picture: Picture,
-    header: FragmentHeader,
+    content: Content,
+    /// The server's commit time and its encode time, from the header.
+    capture_us: u64,
+    encode_us: u32,
     complete_us: u64,
     decoded_us: u64,
 }
@@ -128,7 +130,10 @@ struct App {
     client: Option<Arc<Client>>,
     /// Set once connected, for the decode thread.
     client_cell: Arc<OnceLock<Arc<Client>>>,
+    /// The newest decoded picture, not drawn yet.
     pending: Option<Decoded>,
+    /// Tiles not drawn yet: all of them, each only once.
+    pending_tiles: Vec<Decoded>,
     placement: Option<Placement>,
     cursors: HashMap<u64, CustomCursor>,
     stats: stats::Latency,
@@ -155,6 +160,7 @@ fn main() -> anyhow::Result<()> {
         client: None,
         client_cell: Arc::default(),
         pending: None,
+        pending_tiles: Vec::new(),
         placement: None,
         cursors: HashMap::new(),
         stats: stats::Latency::default(),
@@ -255,7 +261,10 @@ impl App {
                     let _ = decode_tx.send(ToDecoder::Frame(f));
                 }
                 Event::Epoch(e) => {
-                    let _ = decode_tx.send(ToDecoder::Epoch(e.epoch, e.encoding));
+                    let _ = decode_tx.send(ToDecoder::Epoch(e.epoch, e.encoding, (e.layout.width_px, e.layout.height_px)));
+                }
+                Event::Tiles(t) => {
+                    let _ = decode_tx.send(ToDecoder::Tiles(t));
                 }
                 Event::Connected { .. } => {}
                 other => {
@@ -324,9 +333,15 @@ impl App {
 
     fn redraw(&mut self) {
         let Some(gfx) = &mut self.gfx else { return };
-        let pending = self.pending.take();
-        if let Some(d) = &pending {
-            gfx.renderer.upload(&d.picture);
+        let mut pending = self.pending.take();
+        if let Some(Decoded { content: Content::Picture(picture), .. }) = &pending {
+            gfx.renderer.upload(picture);
+        }
+        for d in std::mem::take(&mut self.pending_tiles) {
+            if let Content::Tiles { size, tiles } = &d.content {
+                gfx.renderer.upload_tiles(*size, tiles);
+            }
+            pending = Some(d);
         }
         let size = gfx.window.inner_size();
         self.placement = gfx.renderer.draw((size.width, size.height));
@@ -336,10 +351,10 @@ impl App {
         if let (Some(d), Some(client)) = (pending, &self.client) {
             let presented_us = client.now_us();
             if d.decoded_us > 0
-                && let Some(capture) = client.server_to_local(d.header.capture_us)
+                && let Some(capture) = client.server_to_local(d.capture_us)
             {
                 self.stats.add(stats::Sample {
-                    encode_us: d.header.encode_us as u64,
+                    encode_us: d.encode_us as u64,
                     capture_local_us: capture,
                     complete_us: d.complete_us,
                     decoded_us: d.decoded_us,
@@ -368,12 +383,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Failed(err) => self.fail(event_loop, anyhow::anyhow!(err)),
             UserEvent::Decoded(d) => {
                 if let Some(gfx) = &self.gfx {
-                    if gfx.renderer.picture_size() != Some((d.picture.width, d.picture.height)) {
-                        tracing::info!(width = d.picture.width, height = d.picture.height, "video size");
-                    }
                     gfx.window.request_redraw();
                 }
-                self.pending = Some(d);
+                match d.content {
+                    Content::Picture(_) => self.pending = Some(d),
+                    Content::Tiles { .. } => self.pending_tiles.push(d),
+                }
             }
             UserEvent::Net(Event::CursorImage(image)) => self.add_cursor_image(event_loop, image),
             UserEvent::Net(Event::Cursor(shape)) => self.set_cursor(shape),
@@ -453,8 +468,17 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// From the connection to the decode thread, in order.
 enum ToDecoder {
-    Epoch(u16, Encoding),
+    /// A new epoch, with its size.
+    Epoch(u16, Encoding, (u32, u32)),
     Frame(VideoFrame),
+    Tiles(TilesPacket),
+}
+
+/// What a decoded frame or tiles datagram carries to the window.
+enum Content {
+    Picture(Picture),
+    /// Tiles for a screen of `size`, each RGBX with rows `4 * w` bytes.
+    Tiles { size: (u32, u32), tiles: Vec<(Rect, Vec<u8>)> },
 }
 
 fn decode_thread(
@@ -467,14 +491,45 @@ fn decode_thread(
     // only change size.
     let mut decoder: Option<(Format, Decoder)> = None;
     let mut current = None;
+    let mut tiles: Option<farsight_tiles::Decoder> = None;
+    let mut screen = (0, 0);
     for msg in rx {
         let frame = match msg {
-            ToDecoder::Epoch(epoch, encoding) => {
-                tracing::info!(epoch, %encoding, "new epoch");
+            ToDecoder::Epoch(epoch, encoding, size) => {
+                tracing::info!(epoch, %encoding, ?size, "new epoch");
+                screen = size;
                 current = match encoding {
                     Encoding::Video(f) => Some(f),
                     Encoding::Tiles => None,
                 };
+                continue;
+            }
+            ToDecoder::Tiles(t) => {
+                if tiles.is_none() {
+                    match farsight_tiles::Decoder::new() {
+                        Ok(d) => tiles = Some(d),
+                        Err(err) => {
+                            tracing::error!("{err:#}");
+                            continue;
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                let result = tiles.as_mut().unwrap().decode(&t.body, |rect, px| out.push((rect, px.to_vec())));
+                if let Err(err) = result {
+                    tracing::warn!(update = t.header.update, "{err:#}");
+                }
+                let decoded_us = client.get().map_or(0, |c| c.now_us());
+                let d = Decoded {
+                    content: Content::Tiles { size: screen, tiles: out },
+                    capture_us: t.header.capture_us,
+                    encode_us: t.header.encode_us,
+                    complete_us: t.received_us,
+                    decoded_us,
+                };
+                if proxy.send_event(UserEvent::Decoded(d)).is_err() {
+                    return;
+                }
                 continue;
             }
             ToDecoder::Frame(f) => f,
@@ -503,7 +558,13 @@ fn decode_thread(
         match d.decode(&frame.data) {
             Ok(Some(picture)) => {
                 let decoded_us = client.get().map_or(0, |c| c.now_us());
-                let d = Decoded { picture, header: frame.header, complete_us: frame.complete_us, decoded_us };
+                let d = Decoded {
+                    content: Content::Picture(picture),
+                    capture_us: frame.header.capture_us,
+                    encode_us: frame.header.encode_us,
+                    complete_us: frame.complete_us,
+                    decoded_us,
+                };
                 if proxy.send_event(UserEvent::Decoded(d)).is_err() {
                     return;
                 }

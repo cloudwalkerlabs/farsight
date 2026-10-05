@@ -6,6 +6,7 @@ pub mod control;
 pub mod datagram;
 pub mod input;
 pub mod layout;
+pub mod tiles;
 pub mod video;
 
 /// ALPN token for the QUIC connection. Bumped on incompatible changes.

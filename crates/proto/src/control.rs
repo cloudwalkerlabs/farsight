@@ -20,6 +20,8 @@ pub enum ClientMessage {
     SetLayout(Layout),
     /// The decoder lost its reference: a frame was lost or damaged.
     RequestKeyframe,
+    /// Tiles only: part of an update was lost; send these regions again.
+    RequestRefresh(Vec<crate::tiles::Rect>),
     /// The user switched between text and motion (§3); the server may pick
     /// another format.
     SetMode(Mode),

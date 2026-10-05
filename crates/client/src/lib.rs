@@ -8,6 +8,10 @@
 //! for a keyframe (RFI comes in M4), so the decoder never sees a damaged
 //! stream (§2). Each epoch's `Epoch` event comes before its first frame,
 //! even when the frame overtook the announcement on the wire.
+//!
+//! Tiles (when the server has no hardware encoder) are handed over a
+//! datagram at a time, as each decodes on its own. When part of an update
+//! is lost, the core asks for the cells it is missing.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -24,6 +28,7 @@ use farsight_proto::control::{ClientMessage, CursorImage, CursorShape, Epoch, He
 use farsight_proto::datagram::{Datagram, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
 use farsight_proto::layout::Layout;
+use farsight_proto::tiles::{self, Rect, TilesHeader};
 use farsight_proto::video::FragmentHeader;
 use tokio::sync::mpsc;
 
@@ -62,6 +67,8 @@ pub enum Event {
     Epoch(Epoch),
     /// A whole frame, ready to decode.
     Frame(VideoFrame),
+    /// One datagram of tiles, ready to decode.
+    Tiles(TilesPacket),
     CursorImage(CursorImage),
     Cursor(CursorShape),
     /// The connection ended; the reason.
@@ -75,6 +82,14 @@ pub struct VideoFrame {
     /// When its first and last fragments arrived, in [`Client::now_us`].
     pub first_us: u64,
     pub complete_us: u64,
+}
+
+#[derive(Debug)]
+pub struct TilesPacket {
+    pub header: TilesHeader,
+    pub body: Vec<u8>,
+    /// When it arrived, in [`Client::now_us`].
+    pub received_us: u64,
 }
 
 /// Running counts, for the app's statistics.
@@ -242,8 +257,8 @@ async fn run(
                     tracing::info!(epoch = epoch.epoch, encoding = %epoch.encoding, layout = ?epoch.layout, "epoch");
                     let held = gate.lock().unwrap().announce(epoch.epoch);
                     on_event(Event::Epoch(epoch));
-                    for f in held {
-                        on_event(Event::Frame(f));
+                    for m in held {
+                        on_event(m.into_event());
                     }
                 }
                 ServerMessage::CursorImage(image) => on_event(Event::CursorImage(image)),
@@ -273,6 +288,7 @@ async fn run(
     };
     let datagrams = async {
         let mut rx = Reassembler::new(FRAME_TIMEOUT_US);
+        let mut tracker = TileTracker::default();
         let mut samples: Vec<(u64, i64)> = Vec::new();
         let mut last_request: Option<Instant> = None;
         let request = |last: &mut Option<Instant>| {
@@ -307,10 +323,17 @@ async fn run(
                                 first_us: f.first_us,
                                 complete_us: f.complete_us,
                             };
-                            if let Some(f) = gate.lock().unwrap().admit(f) {
-                                on_event(Event::Frame(f));
+                            if let Some(m) = gate.lock().unwrap().admit(Media::Frame(f)) {
+                                on_event(m.into_event());
                             }
                         }
+                    }
+                }
+                Some(Datagram::Tiles(header, body)) => {
+                    tracker.receive(&header, body, now);
+                    let packet = TilesPacket { header, body: body.to_vec(), received_us: now };
+                    if let Some(m) = gate.lock().unwrap().admit(Media::Tiles(packet)) {
+                        on_event(m.into_event());
                     }
                 }
                 Some(Datagram::Pong(p)) => {
@@ -327,6 +350,12 @@ async fn run(
                     shared.offset_known.store(true, Ordering::Relaxed);
                 }
                 _ => {}
+            }
+            let refresh = tracker.expire(now);
+            if !refresh.is_empty() {
+                shared.stats.lock().unwrap().lost += 1;
+                tracing::debug!(?refresh, "tiles lost; asking again");
+                let _ = control.send(ClientMessage::RequestRefresh(refresh));
             }
             rx.expire(now);
             let lost = rx.take_lost();
@@ -359,7 +388,30 @@ async fn run(
 #[derive(Default)]
 struct EpochGate {
     known: Option<u16>,
-    held: Vec<VideoFrame>,
+    held: Vec<Media>,
+}
+
+/// What the gate holds.
+#[derive(Debug)]
+enum Media {
+    Frame(VideoFrame),
+    Tiles(TilesPacket),
+}
+
+impl Media {
+    fn epoch(&self) -> u16 {
+        match self {
+            Media::Frame(f) => f.header.epoch,
+            Media::Tiles(t) => t.header.epoch,
+        }
+    }
+
+    fn into_event(self) -> Event {
+        match self {
+            Media::Frame(f) => Event::Frame(f),
+            Media::Tiles(t) => Event::Tiles(t),
+        }
+    }
 }
 
 /// `a` comes after `b`, across wrap-around.
@@ -370,10 +422,10 @@ fn epoch_after(a: u16, b: u16) -> bool {
 impl EpochGate {
     /// The frame, if it can go to the app now. Frames of older epochs are
     /// dropped; frames of newer ones wait.
-    fn admit(&mut self, f: VideoFrame) -> Option<VideoFrame> {
+    fn admit(&mut self, f: Media) -> Option<Media> {
         match self.known {
-            Some(e) if e == f.header.epoch => Some(f),
-            Some(e) if epoch_after(e, f.header.epoch) => None,
+            Some(e) if e == f.epoch() => Some(f),
+            Some(e) if epoch_after(e, f.epoch()) => None,
             _ => {
                 if self.held.len() == MAX_HELD {
                     self.held.remove(0);
@@ -385,15 +437,83 @@ impl EpochGate {
     }
 
     /// Epoch `epoch` starts; returns its frames that were waiting.
-    fn announce(&mut self, epoch: u16) -> Vec<VideoFrame> {
+    fn announce(&mut self, epoch: u16) -> Vec<Media> {
         self.known = Some(epoch);
         let held = std::mem::take(&mut self.held);
         let (now, later): (Vec<_>, Vec<_>) = held
             .into_iter()
-            .filter(|f| !epoch_after(epoch, f.header.epoch))
-            .partition(|f| f.header.epoch == epoch);
+            .filter(|f| !epoch_after(epoch, f.epoch()))
+            .partition(|f| f.epoch() == epoch);
         self.held = later;
         now
+    }
+}
+
+/// Tiles updates still missing datagrams. One that stays incomplete for
+/// [`FRAME_TIMEOUT_US`] is lost: the cells it covers that no datagram that
+/// arrived does are asked for again.
+#[derive(Default)]
+struct TileTracker {
+    pending: Vec<PendingUpdate>,
+}
+
+struct PendingUpdate {
+    epoch: u16,
+    update: u32,
+    got: Vec<bool>,
+    left: usize,
+    bounds: Rect,
+    received: Vec<Rect>,
+    first_us: u64,
+}
+
+/// Updates tracked at once; older ones are given up.
+const MAX_PENDING: usize = 32;
+
+impl TileTracker {
+    fn receive(&mut self, h: &TilesHeader, body: &[u8], now_us: u64) {
+        // A new epoch starts with the whole screen: forget the old one.
+        self.pending.retain(|p| p.epoch == h.epoch);
+        let i = match self.pending.iter().position(|p| p.update == h.update) {
+            Some(i) => i,
+            None => {
+                if self.pending.len() == MAX_PENDING {
+                    self.pending.remove(0);
+                }
+                self.pending.push(PendingUpdate {
+                    epoch: h.epoch,
+                    update: h.update,
+                    got: vec![false; h.count as usize],
+                    left: h.count as usize,
+                    bounds: h.bounds,
+                    received: Vec::new(),
+                    first_us: now_us,
+                });
+                self.pending.len() - 1
+            }
+        };
+        let p = &mut self.pending[i];
+        let Some(got) = p.got.get_mut(h.index as usize) else { return };
+        if !std::mem::replace(got, true) {
+            p.left -= 1;
+            p.received.extend(tiles::tile_rects(body));
+        }
+        if p.left == 0 {
+            self.pending.remove(i);
+        }
+    }
+
+    /// The regions to ask for again, from updates that have timed out.
+    fn expire(&mut self, now_us: u64) -> Vec<Rect> {
+        let mut out = Vec::new();
+        self.pending.retain(|p| {
+            if now_us.saturating_sub(p.first_us) < FRAME_TIMEOUT_US {
+                return true;
+            }
+            out.extend(tiles::missing(p.bounds, &p.received));
+            false
+        });
+        out
     }
 }
 
@@ -406,19 +526,54 @@ mod tests {
         VideoFrame { header, data: Vec::new(), first_us: 0, complete_us: 0 }
     }
 
+    fn numbers(media: Vec<Media>) -> Vec<u32> {
+        media
+            .into_iter()
+            .map(|m| match m {
+                Media::Frame(f) => f.header.frame,
+                Media::Tiles(t) => t.header.update,
+            })
+            .collect()
+    }
+
     #[test]
     fn frames_wait_for_their_epoch() {
         let mut g = EpochGate::default();
-        assert!(g.admit(frame(1, 0)).is_none());
-        assert!(g.admit(frame(2, 1)).is_none());
-        let now: Vec<u32> = g.announce(1).iter().map(|f| f.header.frame).collect();
-        assert_eq!(now, [0]);
-        assert!(g.admit(frame(1, 2)).is_some());
-        let now: Vec<u32> = g.announce(2).iter().map(|f| f.header.frame).collect();
-        assert_eq!(now, [1]);
+        assert!(g.admit(Media::Frame(frame(1, 0))).is_none());
+        assert!(g.admit(Media::Frame(frame(2, 1))).is_none());
+        assert_eq!(numbers(g.announce(1)), [0]);
+        assert!(g.admit(Media::Frame(frame(1, 2))).is_some());
+        assert_eq!(numbers(g.announce(2)), [1]);
         // A late frame from the old epoch is dropped.
-        assert!(g.admit(frame(1, 3)).is_none());
+        assert!(g.admit(Media::Frame(frame(1, 3))).is_none());
         assert!(g.announce(3).is_empty());
         assert!(epoch_after(0, u16::MAX));
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+
+    fn header(update: u32, index: u16, count: u16) -> TilesHeader {
+        TilesHeader { epoch: 1, update, index, count, capture_us: 0, encode_us: 0, bounds: Rect::new(0, 0, 128, 64) }
+    }
+
+    fn body(x: u16) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&[64, 64, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn lost_cells_are_asked_for_once() {
+        let mut t = TileTracker::default();
+        t.receive(&header(1, 0, 2), &body(0), 0);
+        t.receive(&header(2, 0, 1), &body(0), 0); // complete
+        assert!(t.expire(FRAME_TIMEOUT_US - 1).is_empty());
+        assert_eq!(t.expire(FRAME_TIMEOUT_US), [Rect::new(64, 0, 64, 64)]);
+        assert!(t.expire(2 * FRAME_TIMEOUT_US).is_empty());
     }
 }

@@ -16,7 +16,8 @@ use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{endpoint, stream};
 use farsight_proto::control::{ClientMessage, Hello, ServerMessage};
-use farsight_proto::datagram::{Datagram, Pong};
+use farsight_proto::datagram::{self, Datagram, Pong};
+use farsight_proto::tiles::TilesHeader;
 use farsight_proto::input::InputPacket;
 use smithay::reexports::calloop::channel::Sender as HostSender;
 use tokio::sync::mpsc;
@@ -39,15 +40,23 @@ pub enum ToHost {
 #[derive(Debug)]
 pub enum ToNet {
     Frame(ConnId, Frame),
+    Tiles(ConnId, Tiles),
     Message(ConnId, ServerMessage),
-    /// Ends the connection, with a reason for the client.
-    Close(ConnId, String),
 }
 
 #[derive(Debug)]
 pub struct Frame {
     pub data: Vec<u8>,
     pub keyframe: bool,
+    pub epoch: u16,
+    pub capture_us: u64,
+    pub encode_us: u32,
+}
+
+/// One tiles update, ready to go.
+#[derive(Debug)]
+pub struct Tiles {
+    pub update: crate::encode::tiles::Update,
     pub epoch: u16,
     pub capture_us: u64,
     pub encode_us: u32,
@@ -119,6 +128,7 @@ async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>,
 /// Routes the host's output to the current connection.
 async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Option<Current>>>) {
     let mut packetizer = Packetizer::new();
+    let mut next_update: u32 = 0;
     while let Some(msg) = rx.recv().await {
         let cur = current.lock().unwrap();
         let Some(c) = cur.as_ref() else { continue };
@@ -134,10 +144,40 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Opt
                 };
                 c.sched.send_frame(packetizer.packetize(&frame, max), f.keyframe);
             }
+            ToNet::Tiles(id, t) if id == c.id => {
+                let count = t.update.bodies.len();
+                if count == 0 {
+                    continue;
+                }
+                let mut header = TilesHeader {
+                    epoch: t.epoch,
+                    update: next_update,
+                    index: 0,
+                    count: count.min(u16::MAX as usize) as u16,
+                    capture_us: t.capture_us,
+                    encode_us: t.encode_us,
+                    bounds: t.update.bounds,
+                };
+                next_update = next_update.wrapping_add(1);
+                let datagrams = t
+                    .update
+                    .bodies
+                    .iter()
+                    .take(u16::MAX as usize)
+                    .enumerate()
+                    .map(|(i, body)| {
+                        header.index = i as u16;
+                        let mut out = Vec::new();
+                        datagram::encode_tiles(&header, body, &mut out);
+                        Bytes::from(out)
+                    })
+                    .collect();
+                // Never superseded: each update carries only what changed.
+                c.sched.send_frame(datagrams, false);
+            }
             ToNet::Message(id, m) if id == c.id => {
                 let _ = c.control.send(m);
             }
-            ToNet::Close(id, reason) if id == c.id => c.conn.close(2u32.into(), reason.as_bytes()),
             _ => {} // for a connection that has gone
         }
     }

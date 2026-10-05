@@ -1,11 +1,14 @@
 //! Draws decoded pictures into the window with OpenGL ES 3: the planes are
 //! uploaded as textures and converted to RGB in the fragment shader
-//! (BT.709, limited range, as the server encodes). The picture keeps its
-//! aspect ratio, letterboxed in black.
+//! (BT.709, limited range, as the server encodes). Tiles go into an RGBA
+//! canvas the size of the remote screen, which keeps everything not sent
+//! again. The picture keeps its aspect ratio, letterboxed in black.
 
 use glow::HasContext;
 
-use crate::decode::{PixelFormat, Picture};
+use farsight_proto::tiles::Rect;
+
+use crate::decode::{Picture, PixelFormat};
 
 const VERTEX: &str = r#"#version 300 es
 out vec2 v_uv;
@@ -25,7 +28,13 @@ uniform sampler2D tex_y;
 uniform sampler2D tex_u;
 uniform sampler2D tex_v;
 uniform int nv12;
+uniform sampler2D tex_rgb;
+uniform int rgb;
 void main() {
+    if (rgb == 1) {
+        color = vec4(texture(tex_rgb, v_uv).rgb, 1.0);
+        return;
+    }
     float y = texture(tex_y, v_uv).r;
     vec2 uv = nv12 == 1 ? texture(tex_u, v_uv).rg : vec2(texture(tex_u, v_uv).r, texture(tex_v, v_uv).r);
     y = (y - 16.0 / 255.0) * (255.0 / 219.0);
@@ -70,7 +79,11 @@ pub struct Renderer {
     vao: glow::VertexArray,
     textures: [glow::Texture; 3],
     nv12: glow::UniformLocation,
-    /// The size of what is uploaded, if anything.
+    /// The tiles' canvas (texture unit 3), and whether it is what is shown.
+    canvas: glow::Texture,
+    canvas_size: Option<(u32, u32)>,
+    rgb: glow::UniformLocation,
+    /// The size of what is shown, if anything.
     picture: Option<(u32, u32)>,
 }
 
@@ -95,13 +108,14 @@ impl Renderer {
                 anyhow::bail!("program: {}", gl.get_program_info_log(program));
             }
             gl.use_program(Some(program));
-            for (i, name) in ["tex_y", "tex_u", "tex_v"].iter().enumerate() {
+            for (i, name) in ["tex_y", "tex_u", "tex_v", "tex_rgb"].iter().enumerate() {
                 gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), i as i32);
             }
             let nv12 = gl.get_uniform_location(program, "nv12").ok_or_else(|| anyhow::anyhow!("no nv12 uniform"))?;
+            let rgb = gl.get_uniform_location(program, "rgb").ok_or_else(|| anyhow::anyhow!("no rgb uniform"))?;
             let vao = gl.create_vertex_array().map_err(anyhow::Error::msg)?;
             let mut textures = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let t = gl.create_texture().map_err(anyhow::Error::msg)?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(t));
                 for (k, v) in [
@@ -114,7 +128,18 @@ impl Renderer {
                 }
                 textures.push(t);
             }
-            Ok(Self { gl, program, vao, textures: textures.try_into().unwrap(), nv12, picture: None })
+            let canvas = textures.pop().unwrap();
+            Ok(Self {
+                gl,
+                program,
+                vao,
+                textures: textures.try_into().unwrap(),
+                nv12,
+                canvas,
+                canvas_size: None,
+                rgb,
+                picture: None,
+            })
         }
     }
 
@@ -154,8 +179,57 @@ impl Renderer {
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             gl.use_program(Some(self.program));
             gl.uniform_1_i32(Some(&self.nv12), (pic.format == PixelFormat::Nv12) as i32);
+            gl.uniform_1_i32(Some(&self.rgb), 0);
         }
         self.picture = Some((pic.width, pic.height));
+    }
+
+    /// Draws tiles into the canvas for a screen of `size`, starting a black
+    /// one if the size changed, and shows it.
+    pub fn upload_tiles(&mut self, size: (u32, u32), tiles: &[(Rect, Vec<u8>)]) {
+        let gl = &self.gl;
+        // SAFETY: the context is current; each tile holds `4 * w * h` bytes
+        // and lies inside the canvas, which is checked.
+        unsafe {
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.canvas));
+            if self.canvas_size != Some(size) {
+                let black = vec![0u8; 4 * size.0 as usize * size.1 as usize];
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    size.0 as i32,
+                    size.1 as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&black)),
+                );
+                self.canvas_size = Some(size);
+            }
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            for (r, px) in tiles {
+                if r.x as u32 + r.w as u32 > size.0 || r.y as u32 + r.h as u32 > size.1 {
+                    continue;
+                }
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    r.x as i32,
+                    r.y as i32,
+                    r.w as i32,
+                    r.h as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(px)),
+                );
+            }
+            gl.use_program(Some(self.program));
+            gl.uniform_1_i32(Some(&self.rgb), 1);
+        }
+        self.picture = Some(size);
     }
 
     /// Draws the last uploaded picture; returns where it went.
@@ -173,17 +247,13 @@ impl Renderer {
             gl.viewport(p.x as i32, y as i32, p.width.round() as i32, p.height.round() as i32);
             gl.use_program(Some(self.program));
             gl.bind_vertex_array(Some(self.vao));
-            for (i, t) in self.textures.iter().enumerate() {
+            for (i, t) in self.textures.iter().chain([&self.canvas]).enumerate() {
                 gl.active_texture(glow::TEXTURE0 + i as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(*t));
             }
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             Some(p)
         }
-    }
-
-    pub fn picture_size(&self) -> Option<(u32, u32)> {
-        self.picture
     }
 }
 

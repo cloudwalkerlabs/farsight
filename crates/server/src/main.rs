@@ -36,7 +36,6 @@ use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing_subscriber::EnvFilter;
 
-use farsight_proto::codec::Encoding;
 use farsight_proto::control::{ClientMessage, ServerMessage, Welcome};
 use farsight_proto::input::InputEvent;
 use host::{ClientState, Host, Layout};
@@ -71,7 +70,11 @@ struct Args {
     /// Constant QP for the encoder.
     #[arg(long, default_value_t = 24)]
     qp: u32,
-    /// Hardware encoder backends to offer, best first: vaapi.
+    /// JPEG quality for tiles, when there is no hardware encoder.
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
+    jpeg_quality: u8,
+    /// Hardware encoder backends to offer, best first: vaapi. Empty for
+    /// tiles only.
     #[arg(long, value_delimiter = ',', default_values_t = ["vaapi".to_string()])]
     encoders: Vec<String>,
     /// Read the probe client's frame number from each frame (spike).
@@ -114,6 +117,7 @@ fn main() -> anyhow::Result<()> {
     let backends = args
         .encoders
         .iter()
+        .filter(|b| !b.is_empty())
         .map(|b| b.parse::<encode::Backend>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(anyhow::Error::msg)?;
@@ -125,7 +129,13 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let pipeline = pipeline::Pipeline::new(
-        pipeline::Options { render_node: args.render_node.clone(), out: args.out.clone(), qp: args.qp, probe: args.probe },
+        pipeline::Options {
+            render_node: args.render_node.clone(),
+            out: args.out.clone(),
+            qp: args.qp,
+            jpeg_quality: args.jpeg_quality,
+            probe: args.probe,
+        },
         encoders,
         start,
         net.clone(),
@@ -208,18 +218,13 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 input::release_all(host);
             }
             let choices = pipeline::negotiate(host.pipeline.encoders(), &hello.decoders, hello.mode);
-            if choices.is_empty() {
-                tracing::warn!(id, decoders = ?hello.decoders, "no video format in common");
-                let _ = host.net.send(net::ToNet::Close(id, "no video format in common".into()));
-                return;
-            }
-            tracing::info!(id, mode = ?hello.mode, formats = ?choices.iter().map(|c| c.format.to_string()).collect::<Vec<_>>(), "negotiated");
             host.client = Some(id);
             host.input = Default::default();
             host.decoders = hello.decoders;
             host.mode = hello.mode;
-            let encodings = choices.iter().map(|c| Encoding::Video(c.format)).collect();
-            host.pipeline.set_choices(choices);
+            host.pipeline.set_choices(choices, hello.mode);
+            let encodings = host.pipeline.encodings();
+            tracing::info!(id, mode = ?hello.mode, encodings = ?encodings.iter().map(|e| e.to_string()).collect::<Vec<_>>(), "negotiated");
             let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(Welcome { encodings })));
             // Resizing mid-session is M2; the first layout is applied as is.
             let resized = set_layout(host, hello.layout);
@@ -237,23 +242,23 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 pipeline::refresh(host);
             }
             ClientMessage::SetLayout(layout) => tracing::info!(?layout, "SetLayout ignored until M2"),
+            ClientMessage::RequestRefresh(rects) => {
+                tracing::debug!(?rects, "refresh requested");
+                pipeline::repaint(host, &rects);
+            }
             ClientMessage::SetMode(mode) => {
                 host.mode = mode;
                 let choices = pipeline::negotiate(host.pipeline.encoders(), &host.decoders, mode);
                 tracing::info!(?mode, formats = ?choices.iter().map(|c| c.format.to_string()).collect::<Vec<_>>(), "mode changed");
-                if choices.first().map(|c| c.format) != host.pipeline.choices().first().map(|c| c.format) {
-                    host.pipeline.set_choices(choices);
-                    pipeline::refresh(host);
-                }
+                // Tiles change their JPEG subsampling; video may change format.
+                host.pipeline.set_choices(choices, mode);
+                pipeline::refresh(host);
             }
             ClientMessage::DecoderFailed(format) => {
                 tracing::warn!(%format, "the client's decoder failed");
                 host.decoders.retain(|d| d.format != format);
-                if host.pipeline.drop_format(format) {
-                    pipeline::refresh(host);
-                } else {
-                    let _ = host.net.send(net::ToNet::Close(id, "no video format left".into()));
-                }
+                host.pipeline.drop_format(format);
+                pipeline::refresh(host);
             }
             ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
         },

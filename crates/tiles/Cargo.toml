@@ -1,0 +1,15 @@
+[package]
+name = "farsight-tiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+farsight-proto = { version = "0.1.0", path = "../proto" }
+flate2 = "1"
+libc = "0.2"

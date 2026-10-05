@@ -4,15 +4,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::input::InputPacket;
+use crate::tiles::TilesHeader;
 use crate::video::FragmentHeader;
 
 const TAG_VIDEO: u8 = 1;
 const TAG_INPUT: u8 = 2;
 const TAG_PING: u8 = 3;
 const TAG_PONG: u8 = 4;
+const TAG_TILES: u8 = 5;
 
 /// Bytes in front of a video fragment's payload.
 pub const VIDEO_OVERHEAD: usize = 1 + FragmentHeader::LEN;
+
+/// Bytes in front of a tiles datagram's tiles.
+pub const TILES_OVERHEAD: usize = 1 + TilesHeader::LEN;
 
 /// Clock sync: the client sends a ping, the server echoes it with its own
 /// time. The client estimates the server's clock offset from the
@@ -31,6 +36,7 @@ pub struct Pong {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datagram<'a> {
     Video(FragmentHeader, &'a [u8]),
+    Tiles(TilesHeader, &'a [u8]),
     Input(InputPacket),
     Ping(Ping),
     Pong(Pong),
@@ -46,6 +52,10 @@ impl<'a> Datagram<'a> {
                 let (h, payload) = FragmentHeader::read(body)?;
                 Datagram::Video(h, payload)
             }
+            TAG_TILES => {
+                let (h, body) = TilesHeader::read(body)?;
+                Datagram::Tiles(h, body)
+            }
             TAG_INPUT => Datagram::Input(postcard::from_bytes(body).ok()?),
             TAG_PING => Datagram::Ping(postcard::from_bytes(body).ok()?),
             TAG_PONG => Datagram::Pong(postcard::from_bytes(body).ok()?),
@@ -56,6 +66,7 @@ impl<'a> Datagram<'a> {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Datagram::Video(h, payload) => encode_video(h, payload, out),
+            Datagram::Tiles(h, body) => encode_tiles(h, body, out),
             Datagram::Input(p) => tagged(TAG_INPUT, p, out),
             Datagram::Ping(p) => tagged(TAG_PING, p, out),
             Datagram::Pong(p) => tagged(TAG_PONG, p, out),
@@ -74,6 +85,13 @@ pub fn encode_video(h: &FragmentHeader, payload: &[u8], out: &mut Vec<u8>) {
     out.push(TAG_VIDEO);
     h.write(out);
     out.extend_from_slice(payload);
+}
+
+pub fn encode_tiles(h: &TilesHeader, body: &[u8], out: &mut Vec<u8>) {
+    out.reserve(TILES_OVERHEAD + body.len());
+    out.push(TAG_TILES);
+    h.write(out);
+    out.extend_from_slice(body);
 }
 
 fn tagged<T: Serialize>(tag: u8, body: &T, out: &mut Vec<u8>) {
@@ -97,6 +115,18 @@ mod tests {
         };
         for d in [
             Datagram::Video(h, b"abc"),
+            Datagram::Tiles(
+                TilesHeader {
+                    epoch: 1,
+                    update: 2,
+                    index: 0,
+                    count: 1,
+                    capture_us: 3,
+                    encode_us: 4,
+                    bounds: crate::tiles::Rect::new(0, 0, 64, 64),
+                },
+                b"tiles",
+            ),
             Datagram::Input(input),
             Datagram::Ping(Ping { client_us: 5 }),
             Datagram::Pong(Pong { client_us: 5, server_us: 6 }),

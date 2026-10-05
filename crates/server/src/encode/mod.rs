@@ -8,14 +8,18 @@
 //!
 //! - **VA-API**: the conversion renders straight into the encoder's surfaces
 //!   (zero copy).
+//! - **Tiles**, with no hardware encoder: the damage is read back and coded
+//!   on the CPU.
 
 pub mod ffmpeg;
+pub mod tiles;
 mod vaapi;
 
 use std::path::Path;
 use std::str::FromStr;
 
 use farsight_proto::codec::{Chroma, EncoderCaps};
+use farsight_proto::tiles::Rect;
 use ffmpeg_sys_next as ff;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
@@ -147,16 +151,30 @@ impl Shaders {
 /// The main thread's half: converts into the encoder's input.
 pub enum Frames {
     Va(vaapi::Surfaces),
+    Tiles(tiles::Screen),
 }
 
 /// One converted picture, on its way to the encode thread.
 pub enum Input {
     Va(vaapi::Surface),
+    Tiles(tiles::Damage),
 }
 
 /// The encode thread's half.
 pub enum Encoder {
     Ffmpeg(ffmpeg::FfEncoder),
+    Tiles(tiles::TileEncoder),
+}
+
+/// What one picture encodes to.
+pub enum Output {
+    Video { data: Vec<u8>, keyframe: bool },
+    Tiles(tiles::Update),
+}
+
+/// Tiles for a `width`×`height` screen: one epoch.
+pub fn open_tiles(width: i32, height: i32) -> anyhow::Result<(Frames, Encoder)> {
+    Ok((Frames::Tiles(tiles::Screen { width, height }), Encoder::Tiles(tiles::TileEncoder::new()?)))
 }
 
 /// Opens `info`'s encoder for one size: one video epoch.
@@ -180,31 +198,44 @@ impl Frames {
     pub fn size(&self) -> (i32, i32) {
         match self {
             Frames::Va(s) => (s.width, s.height),
+            Frames::Tiles(s) => (s.width, s.height),
         }
     }
 
-    /// Converts `texture`. The sync point signals when the input is ready.
+    /// Converts `texture`. Tiles take only `damage` (aligned with
+    /// [`tiles::align`]); video takes the whole picture. The sync point
+    /// signals when the input is ready.
     pub fn convert(
         &mut self,
         renderer: &mut GlesRenderer,
         shaders: &Shaders,
         texture: &GlesTexture,
+        damage: &[Rect],
+        tile_options: farsight_tiles::Options,
     ) -> anyhow::Result<(Input, SyncPoint)> {
         match self {
             Frames::Va(s) => {
                 let (surface, sync) = s.convert(renderer, shaders, texture)?;
                 Ok((Input::Va(surface), sync))
             }
+            Frames::Tiles(s) => {
+                Ok((Input::Tiles(s.read(renderer, texture, damage, tile_options)?), SyncPoint::signaled()))
+            }
         }
     }
 }
 
 impl Encoder {
-    /// Encodes one picture into `out`; returns whether it is a keyframe.
-    pub fn encode(&mut self, input: Input, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+    pub fn encode(&mut self, input: Input, pts_us: i64, kind: FrameKind) -> anyhow::Result<Output> {
         match (self, input) {
-            // SAFETY: the surface comes from this epoch's VA-API pool.
-            (Encoder::Ffmpeg(c), Input::Va(s)) => unsafe { c.encode(s.into_raw(), pts_us, kind, out) },
+            (Encoder::Ffmpeg(c), Input::Va(s)) => {
+                let mut data = Vec::new();
+                // SAFETY: the surface comes from this epoch's VA-API pool.
+                let keyframe = unsafe { c.encode(s.into_raw(), pts_us, kind, &mut data)? };
+                Ok(Output::Video { data, keyframe })
+            }
+            (Encoder::Tiles(t), Input::Tiles(d)) => Ok(Output::Tiles(t.encode(d)?)),
+            _ => anyhow::bail!("input from another epoch's backend"),
         }
     }
 }

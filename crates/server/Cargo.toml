@@ -14,6 +14,7 @@ bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }
+farsight-tiles = { version = "0.1.0", path = "../tiles" }
 farsight-va = { version = "0.1.0", path = "../va" }
 ffmpeg-sys-next = "9"
 libc = "0.2.190"

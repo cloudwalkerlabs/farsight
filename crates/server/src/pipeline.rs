@@ -35,10 +35,15 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use farsight_proto::codec::{Choice, Encoding, Format, Mode};
 use farsight_proto::control::{Epoch, ServerMessage};
+use farsight_proto::tiles::Rect;
+use smithay::backend::renderer::utils::CommitCounter;
 
-use crate::encode::{self, Encoder, EncoderInfo, FrameKind, Frames, Input, Settings, Shaders};
+use crate::encode::{self, Encoder, EncoderInfo, FrameKind, Frames, Input, Output, Settings, Shaders};
 use crate::host::Host;
 use crate::net::{self, ConnId, ToNet};
+
+/// The largest screen sent as tiles.
+const TILES_MAX: u32 = 8192;
 
 /// Frames waiting for the encode thread. Beyond this the newest is dropped
 /// before encoding, which costs nothing: each frame is a whole picture.
@@ -48,6 +53,8 @@ pub struct Options {
     pub render_node: PathBuf,
     pub out: Option<PathBuf>,
     pub qp: u32,
+    /// JPEG quality for tiles.
+    pub jpeg_quality: u8,
     /// Read the probe client's frame number back from each nested frame.
     pub probe: bool,
 }
@@ -60,8 +67,15 @@ pub struct Pipeline {
     /// that fits the picture is used.
     choices: Vec<Choice>,
     shaders: Option<Shaders>,
-    /// This epoch's conversion, and its format.
-    frames: Option<(Frames, Format)>,
+    /// This epoch's conversion, and its encoding.
+    frames: Option<(Frames, Encoding)>,
+    /// Damage since the last converted frame, in buffer pixels. Only tiles
+    /// use it; video encodes the whole picture.
+    damage: Vec<Rect>,
+    /// The nested window's commit the damage runs up to.
+    last_commit: Option<CommitCounter>,
+    /// The client's mode: 4:4:4 JPEG in tiles for text.
+    mode: Mode,
     /// To the encode thread; `None` only while shutting down.
     jobs: Option<SyncSender<Job>>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
@@ -82,7 +96,7 @@ pub struct Pipeline {
 enum Job {
     /// A new epoch: frames after this use this encoder.
     Start(Encoder),
-    Encode(EncodeJob),
+    Encode(Box<EncodeJob>),
 }
 
 struct EncodeJob {
@@ -122,6 +136,9 @@ impl Pipeline {
             choices,
             shaders: None,
             frames: None,
+            damage: Vec::new(),
+            last_commit: None,
+            mode: Mode::default(),
             jobs: Some(jobs),
             encode_thread: Some(thread),
             last_buffer: None,
@@ -146,30 +163,32 @@ impl Pipeline {
         &self.encoders
     }
 
-    /// The formats a new client shares with us, best first. The next frame
-    /// starts a new epoch in the first that fits.
-    pub fn set_choices(&mut self, choices: Vec<Choice>) {
+    /// The formats a new client shares with us, best first, and its mode.
+    /// The next frame starts a new epoch in the first that fits, or in
+    /// tiles if none does.
+    pub fn set_choices(&mut self, choices: Vec<Choice>, mode: Mode) {
         self.choices = choices;
+        self.mode = mode;
         self.frames = None;
     }
 
-    pub fn choices(&self) -> &[Choice] {
-        &self.choices
+    /// The encodings on offer, best first: the formats, then tiles.
+    pub fn encodings(&self) -> Vec<Encoding> {
+        self.choices.iter().map(|c| Encoding::Video(c.format)).chain([Encoding::Tiles]).collect()
     }
 
-    /// The client can't decode `format` any more; move on to the next.
-    /// Returns false if nothing is left.
-    pub fn drop_format(&mut self, format: Format) -> bool {
+    /// The client can't decode `format` any more; move on to the next, or
+    /// to tiles.
+    pub fn drop_format(&mut self, format: Format) {
         self.choices.retain(|c| c.format != format);
-        if self.frames.as_ref().is_some_and(|(_, f)| *f == format) {
+        if self.frames.as_ref().is_some_and(|(_, e)| *e == Encoding::Video(format)) {
             self.frames = None;
         }
-        !self.choices.is_empty()
     }
 
-    /// The largest picture the first format allows.
+    /// The largest picture the first encoding allows.
     pub fn max_size(&self) -> (u32, u32) {
-        self.choices.first().map_or((4096, 4096), |c| (c.max_width, c.max_height))
+        self.choices.first().map_or((TILES_MAX, TILES_MAX), |c| (c.max_width, c.max_height))
     }
 
     fn encoding(&self) -> bool {
@@ -200,6 +219,7 @@ pub fn on_toplevel_commit(host: &mut Host, toplevel: &ToplevelSurface) {
         return; // null buffer: the nested window unmapped
     };
     log_buffer_change(host, surface);
+    collect_damage(host, surface);
 
     let size = texture.size();
     if !host.initial_configure_repeated {
@@ -218,11 +238,40 @@ pub fn on_toplevel_commit(host: &mut Host, toplevel: &ToplevelSurface) {
     present(host, surface);
 }
 
+/// Adds the nested window's damage since the last commit we saw.
+fn collect_damage(host: &mut Host, surface: &WlSurface) {
+    let p = &mut host.pipeline;
+    let commit = with_renderer_surface_state(surface, |rs| {
+        let damage = rs.damage_since(p.last_commit);
+        for r in damage.iter() {
+            let (x, y) = (r.loc.x.max(0), r.loc.y.max(0));
+            let (w, h) = ((r.loc.x + r.size.w - x).max(0), (r.loc.y + r.size.h - y).max(0));
+            p.damage.push(Rect::new(x as u16, y as u16, w as u16, h as u16));
+        }
+        rs.current_commit()
+    });
+    p.last_commit = commit;
+}
+
 /// Encodes the nested window's current buffer again, as a keyframe: for a
 /// client that just connected or lost its reference while the desktop is
 /// idle.
 pub fn refresh(host: &mut Host) {
     host.pipeline.force_keyframe = true;
+    encode_current(host);
+}
+
+/// Tiles: sends `rects` again, which the client lost.
+pub fn repaint(host: &mut Host, rects: &[Rect]) {
+    if !host.pipeline.frames.as_ref().is_some_and(|(_, e)| *e == Encoding::Tiles) {
+        return;
+    }
+    host.pipeline.damage.extend_from_slice(rects);
+    encode_current(host);
+}
+
+/// Encodes the nested window's current buffer.
+fn encode_current(host: &mut Host) {
     let Some(surface) = host.toplevel.as_ref().map(|t| t.wl_surface().clone()) else { return };
     let ctx = host.renderer.context_id();
     let Some(texture) = with_renderer_surface_state(&surface, |rs| rs.texture::<GlesTexture>(ctx).cloned()).flatten()
@@ -298,18 +347,19 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
             Err(err) => tracing::warn!(format = %c.format, backend = ?info.backend, "{err:#}; trying the next format"),
         }
     }
-    let Some(((frames, encoder), format)) = opened else {
-        anyhow::bail!("no encoder opens at {w}x{h}");
+    let ((frames, encoder), encoding) = match opened {
+        Some((pair, format)) => (pair, Encoding::Video(format)),
+        None => (encode::open_tiles(w, h)?, Encoding::Tiles),
     };
     // The encode thread takes it in order, after the old epoch's frames.
     let jobs = p.jobs.as_ref().expect("pipeline running");
     jobs.send(Job::Start(encoder)).map_err(|_| anyhow::anyhow!("encode thread gone"))?;
-    p.frames = Some((frames, format));
+    p.frames = Some((frames, encoding));
     p.epoch = p.epoch.wrapping_add(1);
     p.force_keyframe = true;
-    tracing::info!(epoch = p.epoch, w, h, %format, "new video epoch");
+    tracing::info!(epoch = p.epoch, w, h, %encoding, "new video epoch");
     if let Some(client) = p.client {
-        let epoch = Epoch { epoch: p.epoch, encoding: Encoding::Video(format), layout };
+        let epoch = Epoch { epoch: p.epoch, encoding, layout };
         let _ = host.net.send(ToNet::Message(client, ServerMessage::Epoch(epoch)));
     }
     Ok(())
@@ -334,9 +384,24 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> 
     let t_probe = now();
 
     let p = &mut host.pipeline;
-    let (frames, _) = p.frames.as_mut().unwrap();
+    let (frames, encoding) = p.frames.as_mut().unwrap();
+    // Tiles send the damage, or everything for a "keyframe".
+    let damage = match *encoding {
+        Encoding::Tiles if p.force_keyframe => vec![Rect::new(0, 0, w as u16, h as u16)],
+        Encoding::Tiles => encode::tiles::align(&p.damage, w, h),
+        Encoding::Video(_) => Vec::new(),
+    };
+    p.damage.clear();
+    if *encoding == Encoding::Tiles && damage.is_empty() {
+        return Ok(());
+    }
+    let tile_options = farsight_tiles::Options {
+        quality: p.opts.jpeg_quality,
+        chroma444: p.mode == Mode::Text,
+        lossless: false,
+    };
     let t_surface = now();
-    let (input, sync) = frames.convert(&mut host.renderer, p.shaders.as_ref().unwrap(), texture)?;
+    let (input, sync) = frames.convert(&mut host.renderer, p.shaders.as_ref().unwrap(), texture, &damage, tile_options)?;
 
     p.frame_count += 1;
     let job = EncodeJob {
@@ -352,9 +417,13 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> 
         t_probe,
         t_surface,
     };
-    match p.send(Job::Encode(job)) {
+    match p.send(Job::Encode(Box::new(job))) {
         Ok(()) => p.force_keyframe = false,
-        Err(TrySendError::Full(_)) => tracing::debug!("encoder busy; frame dropped"),
+        Err(TrySendError::Full(_)) => {
+            tracing::debug!("encoder busy; frame dropped");
+            // Tiles must still send what changed.
+            p.damage.extend_from_slice(&damage);
+        }
         Err(TrySendError::Disconnected(_)) => anyhow::bail!("encode thread gone"),
     }
     Ok(())
@@ -406,7 +475,6 @@ fn send_frame_callbacks(host: &mut Host) {
 fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant, net: UnboundedSender<ToNet>) {
     let now = || start.elapsed().as_micros() as u64;
     let mut codec = None;
-    let mut packet = Vec::new();
     for job in rx {
         let job = match job {
             Job::Start(c) => {
@@ -419,32 +487,40 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
         // The conversion pass must have finished writing the surface.
         let _ = job.sync.wait();
         let t_converted = now();
-        packet.clear();
         let kind = if job.force_keyframe { FrameKind::Keyframe } else { FrameKind::Normal };
-        let keyframe = match codec.encode(job.input, job.t_commit as i64, kind, &mut packet) {
-            Ok(k) => k,
+        let output = match codec.encode(job.input, job.t_commit as i64, kind) {
+            Ok(o) => o,
             Err(err) => {
                 tracing::error!("{err:#}");
                 continue;
             }
         };
         let t_encoded = now();
-        if let Some(f) = &mut out
-            && let Err(err) = f.write_all(&packet)
-        {
-            tracing::error!(%err, "writing the stream");
-            out = None;
-        }
-        if let Some(client) = job.client {
-            let frame = net::Frame {
-                data: packet.clone(),
-                keyframe,
-                epoch: job.epoch,
-                capture_us: job.t_commit,
-                encode_us: (t_encoded - job.t_commit) as u32,
-            };
-            let _ = net.send(ToNet::Frame(client, frame));
-        }
+        let encode_us = (t_encoded - job.t_commit) as u32;
+        let (bytes, keyframe) = match output {
+            Output::Video { data, keyframe } => {
+                if let Some(f) = &mut out
+                    && let Err(err) = f.write_all(&data)
+                {
+                    tracing::error!(%err, "writing the stream");
+                    out = None;
+                }
+                let bytes = data.len();
+                if let Some(client) = job.client {
+                    let frame = net::Frame { data, keyframe, epoch: job.epoch, capture_us: job.t_commit, encode_us };
+                    let _ = net.send(ToNet::Frame(client, frame));
+                }
+                (bytes, keyframe)
+            }
+            Output::Tiles(update) => {
+                let bytes = update.bodies.iter().map(Vec::len).sum();
+                if let Some(client) = job.client {
+                    let tiles = net::Tiles { update, epoch: job.epoch, capture_us: job.t_commit, encode_us };
+                    let _ = net.send(ToNet::Tiles(client, tiles));
+                }
+                (bytes, job.force_keyframe)
+            }
+        };
 
         // One line per frame, parsed by tools/m0/analyze.py.
         tracing::info!(
@@ -459,7 +535,7 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
             convert_us = t_converted - job.t_surface,
             encode_us = t_encoded - t_converted,
             total_us = t_encoded - job.t_commit,
-            bytes = packet.len(),
+            bytes,
             keyframe,
             "frame"
         );
