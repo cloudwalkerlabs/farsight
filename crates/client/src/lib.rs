@@ -758,9 +758,11 @@ impl EpochGate {
     }
 }
 
-/// Tiles updates still missing datagrams. One that stays incomplete for
-/// [`FRAME_TIMEOUT_US`] is lost: the cells it covers that no datagram that
-/// arrived does are asked for again.
+/// Tiles updates still missing datagrams. Updates are sent in order, so
+/// one still incomplete [`TILES_GRACE_US`] after a later update shows up
+/// is lost, as is one that nothing has arrived for in [`FRAME_TIMEOUT_US`]:
+/// the cells it covers that no datagram that arrived does are asked for
+/// again.
 #[derive(Default)]
 struct TileTracker {
     pending: Vec<PendingUpdate>,
@@ -773,8 +775,13 @@ struct PendingUpdate {
     left: usize,
     bounds: Rect,
     received: Vec<Rect>,
-    first_us: u64,
+    last_us: u64,
+    /// When a later update first showed up.
+    overtaken_us: Option<u64>,
 }
+
+/// Slack for datagrams that arrive out of order.
+const TILES_GRACE_US: u64 = 3_000;
 
 /// Updates tracked at once; older ones are given up.
 const MAX_PENDING: usize = 32;
@@ -783,6 +790,9 @@ impl TileTracker {
     fn receive(&mut self, h: &TilesHeader, body: &[u8], now_us: u64) {
         // A new epoch starts with the whole screen: forget the old one.
         self.pending.retain(|p| p.epoch == h.epoch);
+        for p in self.pending.iter_mut().filter(|p| before(p.update, h.update)) {
+            p.overtaken_us.get_or_insert(now_us);
+        }
         let i = match self.pending.iter().position(|p| p.update == h.update) {
             Some(i) => i,
             None => {
@@ -796,12 +806,14 @@ impl TileTracker {
                     left: h.count as usize,
                     bounds: h.bounds,
                     received: Vec::new(),
-                    first_us: now_us,
+                    last_us: now_us,
+                    overtaken_us: None,
                 });
                 self.pending.len() - 1
             }
         };
         let p = &mut self.pending[i];
+        p.last_us = now_us;
         let Some(got) = p.got.get_mut(h.index as usize) else { return };
         if !std::mem::replace(got, true) {
             p.left -= 1;
@@ -812,11 +824,12 @@ impl TileTracker {
         }
     }
 
-    /// The regions to ask for again, from updates that have timed out.
+    /// The regions to ask for again, from updates that are lost.
     fn expire(&mut self, now_us: u64) -> Vec<Rect> {
         let mut out = Vec::new();
         self.pending.retain(|p| {
-            if now_us.saturating_sub(p.first_us) < FRAME_TIMEOUT_US {
+            let overtaken = p.overtaken_us.is_some_and(|t| now_us.saturating_sub(t) >= TILES_GRACE_US);
+            if !overtaken && now_us.saturating_sub(p.last_us) < FRAME_TIMEOUT_US {
                 return true;
             }
             out.extend(tiles::missing(p.bounds, &p.received));
@@ -933,9 +946,17 @@ mod tracker_tests {
     fn lost_cells_are_asked_for_once() {
         let mut t = TileTracker::default();
         t.receive(&header(1, 0, 2), &body(0), 0);
-        t.receive(&header(2, 0, 1), &body(0), 0); // complete
         assert!(t.expire(FRAME_TIMEOUT_US - 1).is_empty());
         assert_eq!(t.expire(FRAME_TIMEOUT_US), [Rect::new(64, 0, 64, 64)]);
         assert!(t.expire(2 * FRAME_TIMEOUT_US).is_empty());
+    }
+
+    #[test]
+    fn a_later_update_shows_one_lost() {
+        let mut t = TileTracker::default();
+        t.receive(&header(1, 0, 2), &body(0), 0);
+        t.receive(&header(2, 0, 1), &body(0), 1_000); // complete
+        assert!(t.expire(1_000 + TILES_GRACE_US - 1).is_empty());
+        assert_eq!(t.expire(1_000 + TILES_GRACE_US), [Rect::new(64, 0, 64, 64)]);
     }
 }
