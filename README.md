@@ -37,12 +37,12 @@ crates/
   uniffi-bindgen/  Kotlin binding generator for the Android build
 android/           Android app (Gradle, Compose)
 dist/              example systemd unit
-packaging/         .deb, PKGBUILD and Homebrew formula (the build workflow runs these)
+packaging/         packages: .debs, apt repository, PKGBUILDs, Homebrew formula
 ```
 
 ## Downloads
 
-Each [release](https://github.com/simophin/farsight/releases) has the Linux
+Each [release](https://github.com/cloudwalkerlabs/farsight/releases) has the Linux
 server and desktop client (x86_64 and arm64), the desktop client for macOS
 (arm64) and Windows, and the Android app. The Linux binaries need glibc
 2.36 or later (Debian 12, Ubuntu 24.04, Fedora 37), PipeWire's library, and
@@ -53,17 +53,24 @@ They also come as packages, which install those dependencies, and the
 server's session daemons (dbus-daemon, PipeWire, WirePlumber and
 pipewire-pulse) and `farsight-server@.service`:
 
-- **Debian and Ubuntu:** `farsight-server_<version>_<arch>.deb` and
-  `farsight-desktop_<version>_<arch>.deb`; install with
-  `sudo apt install ./farsight-server_*.deb`. labwc comes as a recommended
-  package where the distribution has it (Debian 13, Ubuntu 24.04).
+- **Debian 12+ and Ubuntu 24.04+**, from farsight's apt repository, which
+  keeps them updated:
+  ```sh
+  sudo install -d -m 755 /etc/apt/keyrings
+  sudo curl -fsSLo /etc/apt/keyrings/farsight.gpg https://cloudwalkerlabs.github.io/farsight/apt/farsight.gpg
+  sudo curl -fsSLo /etc/apt/sources.list.d/farsight.sources https://cloudwalkerlabs.github.io/farsight/apt/farsight.sources
+  sudo apt update
+  sudo apt install farsight-server     # or farsight-desktop
+  ```
+  labwc comes as a recommended package where the distribution has it
+  (Debian 13, Ubuntu 24.04). Each release also has the .debs themselves.
+  The repository is signed with the Cloudwalker Labs release key,
+  `28FB E823 E55F 0E1B 03C8  4298 37F0 8092 1B1E 4AF7`
+  ([`packaging/release-key.asc`](packaging/release-key.asc)).
 - **Arch Linux:** `farsight-server-bin.PKGBUILD` and
-  `farsight-desktop-bin.PKGBUILD`, which repackage the .debs; save one as
-  `PKGBUILD` in an empty directory and run `makepkg -si`.
-- **macOS:** `farsight-desktop.rb`, a Homebrew formula: put it in a tap of
-  your own (`brew tap-new $USER/local`, then copy it into
-  `$(brew --repository $USER/local)/Formula/`) and run
-  `brew install $USER/local/farsight-desktop`.
+  `farsight-desktop-bin.PKGBUILD` on each release, which repackage the
+  .debs; save one as `PKGBUILD` in an empty directory and run `makepkg -si`.
+- **macOS:** `brew install cloudwalkerlabs/tap/farsight-desktop`.
 
 ## Building
 

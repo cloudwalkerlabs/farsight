@@ -10,7 +10,7 @@ pkgver=@PKGVER@
 pkgrel=1
 pkgdesc='Low-latency remote desktop server for headless Linux machines'
 arch=(x86_64 aarch64)
-url='https://github.com/simophin/farsight'
+url='https://github.com/cloudwalkerlabs/farsight'
 license=('MIT OR Apache-2.0')
 # The .deb's Depends under Arch's names: glibc, gcc-libs, libpipewire and
 # libgbm (mesa) from the ELF file, EGL, which it loads at runtime, and the

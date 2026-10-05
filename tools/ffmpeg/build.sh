@@ -150,6 +150,6 @@ It was configured with:
   configure ${configure[*]}
 
 To link farsight against a modified FFmpeg, build it from its source
-(https://github.com/simophin/farsight) with tools/ffmpeg/build.sh changed
+(https://github.com/cloudwalkerlabs/farsight) with tools/ffmpeg/build.sh changed
 to build yours.
 EOF

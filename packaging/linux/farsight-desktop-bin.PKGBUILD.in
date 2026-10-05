@@ -10,7 +10,7 @@ pkgver=@PKGVER@
 pkgrel=1
 pkgdesc='Low-latency remote desktop client for farsight servers'
 arch=(x86_64 aarch64)
-url='https://github.com/simophin/farsight'
+url='https://github.com/cloudwalkerlabs/farsight'
 license=('MIT OR Apache-2.0')
 # The .deb's Depends under Arch's names: glibc, gcc-libs, libpipewire and
 # alsa-lib from the ELF file, and the EGL and Wayland libraries winit and

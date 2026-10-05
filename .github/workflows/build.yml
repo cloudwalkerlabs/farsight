@@ -1,3 +1,17 @@
+# Builds the server, the desktop clients and the Android app, and their
+# packages: .debs (amd64 and arm64), PKGBUILDs that repackage those for Arch
+# Linux, and a Homebrew formula for the macOS client. A published release
+# gets them all attached; a full release (not a pre-release) also publishes
+# the signed apt repository to GitHub Pages and the formula to
+# cloudwalkerlabs/homebrew-tap. The scripts it runs are in packaging/.
+#
+# Secrets, the cloudwalkerlabs organization's unless this repository sets its
+# own of the same name (without them, everything but publishing still runs):
+#   RELEASE_GPG_KEY, RELEASE_GPG_PASSPHRASE  the release key's signing
+#       subkey (packaging/release_key.sh) and its passphrase
+#   TAP_DEPLOY_KEY  a deploy key of cloudwalkerlabs/homebrew-tap, with write
+#       access
+# GitHub Pages must be on, with Settings → Pages → Source: GitHub Actions.
 name: build
 
 on:
@@ -43,6 +57,23 @@ jobs:
             echo "version=0.0.0-dev+${SHA::7}" >> "$GITHUB_OUTPUT"
             echo "deb=0.0.0~dev+${SHA::7}" >> "$GITHUB_OUTPUT"
           fi
+
+  # The website job signs with the release key, but runs only for a
+  # release: check here, on every run, that the secrets can sign.
+  release-key:
+    name: Release key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$RELEASE_GPG_KEY" ]; then
+            echo "::warning::No RELEASE_GPG_KEY secret: a release can't publish the apt repository"
+            exit 0
+          fi
+          packaging/release_key.sh "$RUNNER_TEMP/gnupg"
 
   linux:
     name: Linux ${{ matrix.arch }} (server and desktop client)
@@ -347,7 +378,7 @@ jobs:
   release:
     name: Upload to the release
     if: github.event_name == 'release'
-    needs: [linux, linux-check, arch, macos, windows, android]
+    needs: [linux, linux-check, arch, macos, windows, android, release-key]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -359,3 +390,98 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" artifacts/* --clobber -R "${{ github.repository }}"
+
+  # Publishes the apt repository (packaging/linux/apt_repo.sh), holding this
+  # release's .debs, to GitHub Pages at /apt, once they are attached. A
+  # pre-release leaves it on the last full release.
+  website:
+    name: apt repository on GitHub Pages
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: linux-*
+          path: debs
+          merge-multiple: true
+      - name: Build
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+          packaging/release_key.sh "$RUNNER_TEMP/gnupg"
+          GNUPGHOME=$RUNNER_TEMP/gnupg packaging/linux/apt_repo.sh _site/apt debs/*.deb
+          # The site is only the repository; its root sends people to the
+          # instructions.
+          cat > _site/index.html <<HTML
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>farsight</title>
+          <meta http-equiv="refresh" content="0; url=https://github.com/$GITHUB_REPOSITORY#downloads">
+          <a href="https://github.com/$GITHUB_REPOSITORY#downloads">farsight's downloads</a>
+          HTML
+      # Installs from the repository on clean systems, as README.md says.
+      # Debian 13 checks signatures with sqv, Debian 12 with gpgv.
+      - name: Check the apt repository
+        run: |
+          for image in debian:12 debian:13 ubuntu:24.04; do
+            docker run --rm -v "$PWD:/w" -w /w "$image" \
+              packaging/linux/check_apt_repo.sh _site/apt
+          done
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Pushes the release's formula to the tap
+  # (brew install cloudwalkerlabs/tap/farsight-desktop), once the tarball it
+  # downloads is attached. The macOS job checked that it installs.
+  homebrew:
+    name: Publish to the Homebrew tap
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: macos
+          path: pkg
+      - env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ssh=$RUNNER_TEMP/ssh
+          install -d -m 700 "$ssh"
+          printf '%s\n' "$TAP_DEPLOY_KEY" >"$ssh/key"
+          chmod 600 "$ssh/key"
+          # GitHub's, as https://api.github.com/meta lists it.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git clone git@github.com:cloudwalkerlabs/homebrew-tap.git "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          cp pkg/farsight-desktop.rb "$RUNNER_TEMP/tap/Formula/"
+          cd "$RUNNER_TEMP/tap"
+          git add Formula/farsight-desktop.rb
+          if git diff --cached --quiet; then
+            echo "The formula is already at $VERSION"
+            exit 0
+          fi
+          git -c user.name=fanchao -c user.email=dev@fanchao.dev \
+            commit -m "farsight-desktop $VERSION"
+          git push origin HEAD

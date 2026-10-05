@@ -87,7 +87,7 @@ install -m 644 "$repo/README.md" "$notices"/* "$doc/"
 cat >"$doc/copyright" <<COPYRIGHT
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: farsight
-Source: https://github.com/simophin/farsight
+Source: https://github.com/cloudwalkerlabs/farsight
 
 Files: *
 Copyright: farsight's authors
@@ -126,7 +126,7 @@ test -n "$shlibs"
   printf 'Recommends: %s\n' "$recommends"
   if [ -n "$suggests" ]; then printf 'Suggests: %s\n' "$suggests"; fi
   printf 'Section: net\nPriority: optional\n'
-  printf 'Homepage: https://github.com/simophin/farsight\n'
+  printf 'Homepage: https://github.com/cloudwalkerlabs/farsight\n'
   printf 'Description: %s\n%s\n' "$summary" "$description"
 } >"$root/DEBIAN/control"
 

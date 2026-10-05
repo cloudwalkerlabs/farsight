@@ -1,13 +1,14 @@
-# farsight's desktop client as a Homebrew formula. The build workflow fills
-# in the @...@ fields (packaging/macos/formula.sh) and attaches the result
-# to the release as farsight-desktop.rb. To install it, put it in a tap:
+# farsight's desktop client as a Homebrew formula, for the
+# cloudwalkerlabs/homebrew-tap tap:
 #
-#   brew tap-new $USER/local
-#   cp farsight-desktop.rb "$(brew --repository $USER/local)/Formula/"
-#   brew install $USER/local/farsight-desktop
+#   brew install cloudwalkerlabs/tap/farsight-desktop
+#
+# The build workflow fills in the @...@ fields (packaging/macos/formula.sh),
+# attaches the result to the release and pushes it to the tap as
+# Formula/farsight-desktop.rb.
 class FarsightDesktop < Formula
   desc "Low-latency remote desktop client for farsight servers"
-  homepage "https://github.com/simophin/farsight"
+  homepage "https://github.com/cloudwalkerlabs/farsight"
   url "@URL@"
   version "@VERSION@"
   sha256 "@SHA256@"
