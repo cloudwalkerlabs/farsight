@@ -43,7 +43,10 @@ dist/              example systemd unit
 
 Each [release](https://github.com/simophin/farsight/releases) has the Linux
 server and desktop client, the desktop client for macOS and Windows, and the
-Android app.
+Android app. The Linux binaries need glibc 2.36 or later (Debian 12, Fedora
+37), PipeWire's library, and libasound (the client) or libgbm and the XKB
+keymaps (the server); they load libva and the GPU's libraries when they use
+them.
 
 ## Building
 

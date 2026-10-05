@@ -15,34 +15,48 @@ jobs:
   linux:
     name: Linux x86_64 (server and desktop client)
     runs-on: ubuntu-latest
-    # Arch has the PipeWire and Wayland the crates build against.
-    container: archlinux:latest
+    # Debian 12's glibc (2.36): the binaries run on distributions as old.
+    container: debian:12
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rustup clang cmake nasm meson ninja pkgconf \
-            libva libdrm pipewire wayland libxkbcommon mesa libglvnd alsa-lib
-          rustup default stable
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git curl ca-certificates xz-utils \
+            clang libclang-dev cmake nasm pkg-config bison python3-venv \
+            libva-dev libdrm-dev libpipewire-0.3-dev libwayland-dev libgbm-dev libegl-dev libasound2-dev
+          # Debian's meson is too old for libxkbcommon.
+          python3 -m venv /opt/meson
+          /opt/meson/bin/pip install meson ninja
+          echo /opt/meson/bin >> "$GITHUB_PATH"
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v5
       - id: ffmpeg
         uses: actions/cache@v4
         with:
           path: ffmpeg-prefix
-          key: ffmpeg-linux-${{ hashFiles('tools/ffmpeg/build.sh') }}
+          key: ffmpeg-linux-debian12-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: tools/ffmpeg/build.sh ffmpeg-prefix
       # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
       # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
+          key: debian12-ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-server -p farsight-desktop
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
+      # Everything else is built in or loaded when used.
       - name: Check linkage
         run: |
-          ! ldd target/release/farsight-server target/release/farsight-desktop | grep -E 'libav|libdav1d'
-          target/release/farsight-desktop --help > /dev/null
+          cd target/release
+          readelf -d farsight-server farsight-desktop | grep -E '^File|NEEDED'
+          # (`! cmd` alone wouldn't fail the step: -e ignores it.)
+          if readelf -d farsight-server farsight-desktop | grep NEEDED |
+            grep -vE '\[(lib(c|m|gcc_s|pipewire-0\.3|gbm|asound)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)\]'; then exit 1; fi
+          echo "glibc: $(objdump -T farsight-server farsight-desktop | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n 1)"
+          ./farsight-server --help > /dev/null
+          ./farsight-desktop --help > /dev/null
       - name: Package
         run: |
           mkdir -p out/farsight
@@ -79,7 +93,7 @@ jobs:
       - name: Check linkage
         run: |
           otool -L target/release/farsight-desktop
-          ! otool -L target/release/farsight-desktop | tail -n +2 | grep -vE '^\s+(/System/Library/|/usr/lib/)'
+          if otool -L target/release/farsight-desktop | tail -n +2 | grep -vE '^\s+(/System/Library/|/usr/lib/)'; then exit 1; fi
           target/release/farsight-desktop --help > /dev/null
       - name: Package
         run: |
