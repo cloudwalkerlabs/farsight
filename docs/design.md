@@ -18,29 +18,120 @@ requirements:
 6. **Clients:** desktop and Android. The Android app must work well with
    touch alone, like RealVNC Viewer.
 
-## Decision: our own compositor
+## Decision: a host compositor, with the desktop nested inside it
 
-The server is a headless Wayland compositor written with
-[Smithay](https://github.com/Smithay/smithay). It is not a capture tool
-attached to someone else's compositor, the way wayvnc is. Owning the compositor
-gives us:
+`farsight-server` is a **small headless Wayland compositor** written with
+[Smithay](https://github.com/Smithay/smithay). Its main client is a
+**real desktop compositor running nested**: labwc (for example
+`labwc --session xfce4-session`), sway, or anything else with a Wayland
+backend. The nested compositor draws its whole desktop into one fullscreen
+surface on the host. The host encodes that surface and feeds input back
+through its seat.
 
-- **Exact damage and frame timing.** We render only on damage, render
-  straight into the encoder's input buffer, and pace app frames to the
-  encoder instead of a fake vsync.
-- **Resizing and scaling built in.** The client's window size and scale
-  become the output's mode and scale in one atomic step.
-- **Direct input injection** into `wl_seat`, with no virtual-keyboard
-  protocols, libei or portals.
+```
+farsight-server ── runs ──▶ labwc --session xfce4-session
+  (host compositor:           draws its desktop into one surface on the host
+   one fullscreen surface,
+   encode, input, transport)
+```
+
+Nesting is a normal way to run a compositor; its developers use it every
+day. gamescope uses the same structure to stream games and desktops.
+
+**What the host gives us** that a capture tool attached to someone else's
+compositor (as wayvnc is) cannot:
+
+- **Frames with no capture step.** The nested compositor's output buffer
+  arrives as a dmabuf on commit, with exact damage, and goes straight to the
+  encoder.
+- **Frame pacing.** The host sends the frame callbacks, so the nested
+  compositor draws exactly when the encoder is ready.
+- **A cursor drawn on the client.** The nested compositor sets its cursor as
+  a separate surface on the host's seat.
+- **Real input:** keyboard with our keymap, pointer, and real `wl_touch`.
+  wayvnc relies on virtual keyboard/pointer protocols, and wlroots has no
+  virtual touch protocol.
+- **Resizing** by resizing the nested compositor's window. Scale needs more
+  work (§5).
 - **Control of the session lifecycle**, without a display manager.
+
+**What it costs** compared with being the desktop compositor ourselves:
+
+- **One more process boundary.**
+  - The nested compositor composites, then we encode, so colour conversion
+    is a separate GPU pass.
+  - If the nested compositor picks a buffer format the encoder can't
+    import, we pay a GPU blit.
+  - Its frame scheduling sits between the apps and us.
+- **The host is also a Wayland client *of* the nested compositor:**
+  - clipboard, through `ext-data-control`;
+  - IME and soft-keyboard text, through `input-method-v2`;
+  - output scale, through `wlr-output-management`.
+
+  wlroots' Wayland backend shares none of these with its host.
+- **Compositor support depends on its Wayland backend.**
+  - First-class and tested: **labwc** (including labwc + XFCE) and **sway**.
+  - Best effort: Hyprland, niri, KWin, Weston.
+  - Not supported: GNOME, because mutter's nested mode is for development
+    only.
+
+**Kiosk mode:** the host can also run a single app directly, with no nested
+compositor. This is also the first step towards option A below, so choosing
+B now doesn't close off A.
+
+### Alternatives considered
+
+**A: our own desktop compositor.** The server is a complete compositor with
+its own window manager, and apps connect to it directly.
+
+- **Pros:**
+  - The lowest possible latency: app surfaces are composited straight into
+    the encoder's buffer, with colour conversion in the same pass.
+  - Resize and scale apply in one atomic step.
+  - IME, clipboard and touch are direct.
+  - A single process.
+- **Cons:** we build the whole desktop compositor except the hardware
+  parts:
+  - 25–30 protocols with our own behaviour behind each: layer-shell,
+    foreign-toplevel, session-lock, data-control, input-method,
+    image-copy-capture, …;
+  - a window manager: placement, focus, move/resize grabs, popups, dialogs,
+    workspaces, keybindings, rules;
+  - server-side decorations;
+  - an Xwayland window manager;
+  - configuration;
+  - a portal backend.
+
+  Headless does remove DRM/KMS, libinput, hotplug, VT switching and
+  multi-GPU. The desktop would stay minimal for a long time.
+- **Viable** if B's measured latency turns out to matter, or if we want a
+  WM designed around touch. The host compositor grows into A rather than
+  being thrown away.
+
+**A′: fork a Smithay desktop compositor** (niri, or cosmic-comp), replacing
+its DRM and libinput backends with a farsight backend.
+
+- **Pros:** A's latency, with a real desktop on day one.
+- **Cons:**
+  - We maintain a fork of a fast-moving project.
+  - We inherit its WM style: niri is a scrolling tiler, and cosmic-comp is
+    tied to COSMIC.
+  - labwc + XFCE is no longer an option.
+- **Viable**, and the cheaper fallback if A is ever needed.
+
+**Capture an existing compositor (the wayvnc model).**
+
+- **How:** attach to a running compositor as a client, using
+  `ext-image-copy-capture` or the portal with PipeWire, plus virtual input
+  or libei.
+- **Pros:** it can share a physical desktop and works with GNOME.
+- **Cons:** no control over frame timing, no real touch, and an extra
+  capture step.
+- **Status:** kept only as a possible later "mirror backend" (M6).
 
 Both [Wolf](https://games-on-whales.github.io/wolf/stable/dev/wayland.html)
 (Games on Whales) and [wado](https://github.com/sandptel/wado) have shown that
 a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
-
-Later, a **mirror backend** can serve existing compositors (GNOME, KDE, sway)
-using `ext-image-copy-capture`, the portal with PipeWire, and libei. It would
-share the encoder and transport. Not in v1.
 
 ## Prior art
 
@@ -49,6 +140,7 @@ share the encoder and transport. Not in v1.
 | Sunshine/Moonlight | Frames split into packets with Reed-Solomon FEC (parity = data × fec%); intra-refresh and post-invalidation P-frames; per-frame FEC status from the client; reference frame invalidation instead of IDR |
 | Parsec | Its own protocol on UDP (BUD); proof that a tuned protocol beats general-purpose ones |
 | RDP 10 | AVC444: 4:4:4 text clarity from 4:2:0 hardware codecs, using a main stream plus an auxiliary chroma stream; a display control channel that carries the monitor layout and `DesktopScaleFactor` |
+| gamescope | A host compositor with a whole compositor or game nested inside it, streaming the result |
 | wado, Wolf, Selkies pixelflux | Zero-copy dmabuf → VA-API/NVENC with on-GPU RGB→NV12; a fallback ladder (zero-copy → readback → software); input on a channel that never queues behind video |
 
 ## Architecture
@@ -57,13 +149,19 @@ share the encoder and transport. Not in v1.
                  ┌──────── farsight-server --port 7740 (as the user) ──────┐
  client ──QUIC──▶│  ┌ auth (client keys), session state                    │
   (media,        │  ├ private runtime dir, D-Bus session bus, PipeWire     │
-   input,        │  ├ Smithay compositor (GLES/Vulkan on render node)      │
-      input,     │  │   xdg-shell, layer-shell, fractional-scale, viewporter│
-      control)   │  │   linux-dmabuf, presentation-time, Xwayland, IME…    │
+   input,        │  ├ host compositor (Smithay, render node)               │
+   control)      │  │   xdg-shell, linux-dmabuf (+feedback), seat, cursor, │
+                 │  │   fractional-scale, viewporter, presentation-time    │
+                 │  ├ client of the nested compositor: data-control,       │
+                 │  │   input-method, output-management                    │
                  │  ├ Encoder: VA-API │ NVENC │ Vulkan Video │ software    │
                  │  ├ Transport: quinn + datagrams + FEC + congestion ctrl │
-                 │  ├ Audio: PipeWire null sink → Opus                     │
-                 │  └ Input → wl_seat directly                             │
+                 │  └ Audio: PipeWire null sink → Opus                     │
+                 └───────────────▲──────────────────┬──────────────────────┘
+                     one surface │                  │ wl_seat input
+                 ┌───────────────┴──────────────────▼──────────────────────┐
+                 │ nested desktop: labwc --session xfce4-session (child)   │
+                 │   apps, Xwayland, panels, portals connect to it         │
                  └─────────────────────────────────────────────────────────┘
 ```
 
@@ -73,7 +171,7 @@ share the encoder and transport. Not in v1.
 |---|---|
 | `farsight-proto` | Wire types: packet headers, control messages, negotiation. No I/O. |
 | `farsight-net` | QUIC transport, packetization, FEC, congestion control. Shared by both sides. |
-| `farsight-server` | The server: session environment, compositor, encoder. Linux only. |
+| `farsight-server` | The server: session environment, host compositor, nested desktop, encoder. Linux only. |
 | `farsight-client` | Platform-independent client core: connection, negotiation, decode pipeline, input state sync, layout. |
 | `farsight-desktop` | Desktop client. |
 | `farsight-android` | Android bindings (uniffi, plus JNI for hot paths). |
@@ -107,10 +205,17 @@ share the encoder and transport. Not in v1.
 
 **Server, per frame:**
 
-1. Damage arrives, or a frame callback is due. Composite into a GBM dmabuf.
-2. Convert RGB→NV12 (or 4:4:4) in a shader during the same pass, so no VPP
-   step is needed.
-3. Hand the dmabuf to the encoder with zero copies:
+1. The nested compositor commits its output buffer (a dmabuf) with damage.
+   Through `linux-dmabuf` feedback, the host offers only the formats and
+   modifiers the encoder can import, so the buffer can be used as is. If the
+   buffer can't be used directly, a GPU blit is the fallback.
+2. Convert RGB→NV12 (or 4:4:4) in one shader pass into an encoder surface,
+   so no VPP step is needed. In kiosk mode, or under option A, this happens
+   in the same pass as compositing.
+3. Release the nested buffer and send the frame callback **as soon as the
+   conversion pass has read the buffer**. Don't wait for the encode to
+   finish, so the nested compositor can start its next frame at once.
+4. Hand the encoder surface to the encoder with zero copies:
    - **VA-API** (Intel/AMD): DRM-PRIME import.
    - **NVENC**: import the dmabuf through CUDA external memory and register
      it with NVENC in place. Re-import must be able to fail and be retried:
@@ -120,14 +225,14 @@ share the encoder and transport. Not in v1.
    - **Vulkan Video encode**: RADV and ANV now have H.264, H.265 and AV1.
      This could become the single cross-vendor path later.
    - **Software fallback**: x264 or SVT-AV1 in low-delay mode.
-4. Encoder settings:
+5. Encoder settings:
    - no B-frames, an endless GOP, and VBV of about one frame;
    - slices, so the client can decode before the whole frame arrives;
    - LTR/RFI for loss recovery. Intra-refresh is the fallback and a full
      IDR the last resort.
-5. **Idle refinement:** when damage stops, send one or two frames at a much
+6. **Idle refinement:** when damage stops, send one or two frames at a much
    lower QP so static text becomes sharp.
-6. **Text clarity, in order of preference:** HEVC RExt 4:4:4 where both
+7. **Text clarity, in order of preference:** HEVC RExt 4:4:4 where both
    ends support it; then an AVC444-style dual stream; then 4:2:0 with idle
    refinement.
 
@@ -200,7 +305,12 @@ key stuck down. So input travels as unreliable datagrams but is designed as
   way (§7).
 - **Text commits, IME and clipboard** go over a reliable stream.
 - Input is sent immediately with no batching, limited to about 1 kHz.
-- **The cursor is drawn on the client.** The server sends cursor images
+- **The server injects input** through the host's `wl_seat` into the nested
+  compositor, which routes it to apps as it would input from real devices.
+  Text commits go through the host's `input-method-v2` connection to the
+  nested compositor.
+- **The cursor is drawn on the client.** The nested compositor sets its
+  cursor as a surface on the host's seat. The server sends cursor images
   over a stream (cached by hash) and shape and visibility changes as
   datagrams. The client draws the cursor locally, so pointer movement has
   zero perceived latency.
@@ -222,14 +332,24 @@ The client's window is the source of truth for the output
 
   The client resends it on resize, on a move to a monitor with a different
   scale, and on an OS scale change.
-- **The server applies size and scale in one atomic step:**
-  - mode = physical pixels;
-  - scale = the client's scale;
-  - logical size = pixels ÷ scale.
+- **The server applies size and scale to the nested compositor:**
+  - **Size:** the host reconfigures the nested compositor's fullscreen
+    window to the new physical size, and the nested compositor resizes its
+    output to match.
+  - **Scale:** the host sets the output's scale and sends `preferred_scale`
+    to the nested window. If the nested compositor doesn't take its output
+    scale from that, the host also sets it through `wlr-output-management`
+    as a client of the nested compositor (which is what wayvnc does).
+  - The nested compositor then tells its apps the new scale, and they
+    redraw sharply. The client receives exactly its own pixel count and
+    draws it 1:1.
+  - **Open question for the M0 spike:** does a size + scale change through
+    two compositors still look like one step, or is there a frame at the
+    new size with the old scale? If there is, the host holds the old frame
+    until both have been applied.
 
-  It then sends `wl_output`/`xdg_output` events and `preferred_scale` to
-  every surface, so apps redraw sharply at the new scale. The client
-  receives exactly its own pixel count and draws it 1:1.
+  Under option A (or in kiosk mode) the host applies both in one atomic
+  step itself.
 - **The server can clamp the request**, for example to a codec level's
   limit. It replies with the layout actually in effect, and the client
   scales only in that case.
@@ -243,11 +363,12 @@ The client's window is the source of truth for the output
 - **Live drag-resize:** the client sends at most one `SetLayout` every
   ~50 ms and stretches the last frame until a frame from the new epoch
   arrives.
-- **Xwayland:** X apps blur under fractional scaling. Offer
-  xwayland-satellite, or render X at scale 1 and let X apps scale
-  themselves.
+- **Xwayland:** the nested compositor runs Xwayland, so X app scaling is
+  its policy. X apps blur under fractional scaling in labwc as they do
+  anywhere else.
 - **Multi-monitor (later):** one client window per output, each with its
-  own encoder stream.
+  own encoder stream. The nested compositor gets one host window per output
+  (the wlroots Wayland backend supports several).
 
 ## 6. The session
 
@@ -257,7 +378,8 @@ plain system service (`dist/farsight-server@.service`, one instance per
 port, with `User=` set). It doesn't need user systemd or lingering.
 
 ```
-farsight-server [--port 7740]
+farsight-server [--port 7740] [-- <desktop command>]    # default: labwc
+farsight-server --port 7741 -- labwc --session xfce4-session
 ```
 
 **Startup** builds an isolated environment and starts the session at once,
@@ -273,16 +395,23 @@ so it is already running before the first client connects:
 2. **A private D-Bus session bus**: `dbus-daemon --session` (or
    `dbus-broker-launch`) listening in that directory. Children get it as
    `DBUS_SESSION_BUS_ADDRESS`. Apps in the session never see another bus.
-3. **The compositor**: the Wayland socket goes in that directory, and
-   children get `WAYLAND_DISPLAY`. Xwayland is started on demand, with
-   `DISPLAY` set.
+3. **The host compositor**: its Wayland socket goes in that directory and
+   is given only to the nested compositor.
 4. **Session services**, launched as child processes on the private bus:
-   - PipeWire and WirePlumber, with a null sink for audio capture;
-   - `xdg-desktop-portal` with a small backend of our own;
-   - a notification daemon.
-5. **Autostart**: the commands in `~/.config/farsight/autostart` (bar,
-   launcher, terminal, …). Layer-shell lets waybar, fuzzel and similar tools
-   work unchanged.
+   PipeWire and WirePlumber, with a null sink for audio capture.
+5. **The desktop**: the desktop command, `labwc` by default, started with
+   the host's `WAYLAND_DISPLAY`.
+   - The nested compositor creates its own Wayland socket for apps, along
+     with Xwayland and its usual autostart. labwc's `--session` starts
+     xfce4-session, panels, portals (`xdg-desktop-portal-wlr` for wlroots
+     desktops) and so on, exactly as on a physical machine.
+   - Once its socket is up, the host connects to it as a client, for
+     clipboard, IME and output scale (§5).
+   - **If the desktop exits or crashes,** the host and the client connection
+     survive. The host restarts the desktop, or ends the session, depending
+     on its exit status and configuration.
+6. **Kiosk mode** (`--app <command>`): there is no nested compositor. The
+   app connects straight to the host, which shows it fullscreen.
 
 **Isolation:**
 - The environment comes from the steps above, not from whatever started
@@ -304,9 +433,9 @@ host restricts them, add the user to the `render` group.
 - **More than one client:** a second client can either take over the
   session or join it view-only.
 
-**Window manager:** keep v1 small: floating windows with
-maximise/fullscreen, plus a single-app kiosk mode. This is the largest
-scope risk.
+**Window manager:** none of our own. Window management, decorations,
+panels and Xwayland belong to the nested desktop (see "Alternatives
+considered" for building our own).
 
 **Later, if ever:** a login-screen style front end that starts sessions for
 any system user (as GDM's remote login does). It is deliberately out of
@@ -328,8 +457,10 @@ mouse, or a desktop-mode display, are a bonus. RealVNC Viewer sets the bar.
 - **Direct touch mode:**
   - The pointer jumps to the finger, so a tap clicks at that spot.
   - Long press = right click.
-  - Because we own the compositor, this mode can also forward real
-    `wl_touch` contacts, so touch-aware apps get genuine multi-touch.
+  - Because the host is a real compositor, this mode can also forward real
+    `wl_touch` contacts through the nested compositor, so touch-aware apps
+    get genuine multi-touch. How well that works depends on the nested
+    compositor's touch handling, which is basic in labwc.
 
 **Viewport (local, never sent to the server):**
 
@@ -345,8 +476,9 @@ mouse, or a desktop-mode display, are a bonus. RealVNC Viewer sets the bar.
 **Keyboard:**
 
 - The soft keyboard is opened from the toolbar. Typed text goes through IME
-  commit (`text-input-v3` on the server); key events are used where the
-  keyboard produces them.
+  commit (the host's `input-method-v2` connection to the nested
+  compositor, which passes it on to apps over `text-input-v3`). Key events
+  are used where the keyboard produces them.
 - An **extra keys bar** above the keyboard has sticky modifiers (Ctrl, Alt,
   Super, Shift), Esc, Tab, arrows, F-keys and a key-combo builder.
 - Hardware keyboards are passed through with physical scancodes.
@@ -368,7 +500,9 @@ sent directly, with relative pointer capture when the server asks for it.
 
 - **Audio:** Opus with 5–10 ms frames and in-band FEC, sent as datagrams.
   Microphone redirection comes later.
-- **Clipboard:** MIME-typed and fetched lazily, over a stream.
+- **Clipboard:** MIME-typed and fetched lazily, over a stream. The server
+  side reads and sets the nested desktop's clipboard through
+  `ext-data-control`.
 - **Latency telemetry:** a clock-offset exchange plus capture timestamps.
   The client reports present time, giving a measured glass-to-glass latency
   per stage. Target: under 16 ms on a LAN at 60 Hz.
@@ -377,18 +511,21 @@ sent directly, with relative pointer capture when the server asks for it.
 
 | # | Goal | Done when |
 |---|---|---|
-| M0 | Spike: Smithay headless → dmabuf → VA-API H.264 → file | foot and Firefox render; encode latency per frame measured |
+| M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
-| M3 | Session: isolated runtime dir, private D-Bus, PipeWire/portal children, autostart, client keys, reconnect and takeover | Runs as a system service; reconnect resumes the same session |
+| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover | Runs as a system service; reconnect resumes the same session |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; `tc netem` test matrix | No stuck keys and no artifact spreading at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio, clipboard | Daily-usable from a phone or tablet |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
 
 ## Risks
 
-1. **The window manager** expands scope. Keep it small and lean on
-   layer-shell.
+1. **Nested compositors' Wayland backends** are mostly used for
+   development, and each behaves a little differently (scale, buffer
+   formats, multiple outputs). labwc and sway are the tested targets;
+   everything else is best effort. If the M0 numbers are bad, fall back to
+   A′, then A.
 2. **NVIDIA zero-copy is fragile** (modifiers, CUDA import). Keep the
    readback fallback.
 3. **Quinn's datagram congestion control** needs our own controller.
