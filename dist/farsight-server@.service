@@ -1,4 +1,6 @@
-# One farsight session per instance; the instance name is the UDP port:
+# One farsight session per instance; the instance name is the UDP port.
+# The .deb and Arch packages install this unit, with ExecStart pointing at
+# /usr/bin; otherwise copy it first:
 #
 #   cp dist/farsight-server@.service /etc/systemd/system/
 #   systemctl edit farsight-server@7740     # set User= (see below)

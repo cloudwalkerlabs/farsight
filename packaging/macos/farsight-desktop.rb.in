@@ -1,0 +1,28 @@
+# farsight's desktop client as a Homebrew formula. The build workflow fills
+# in the @...@ fields (packaging/macos/formula.sh) and attaches the result
+# to the release as farsight-desktop.rb. To install it, put it in a tap:
+#
+#   brew tap-new $USER/local
+#   cp farsight-desktop.rb "$(brew --repository $USER/local)/Formula/"
+#   brew install $USER/local/farsight-desktop
+class FarsightDesktop < Formula
+  desc "Low-latency remote desktop client for farsight servers"
+  homepage "https://github.com/simophin/farsight"
+  url "@URL@"
+  version "@VERSION@"
+  sha256 "@SHA256@"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  depends_on arch: :arm64
+  depends_on :macos
+
+  def install
+    bin.install "farsight-desktop"
+    # README.md, and FFmpeg's and dav1d's notices.
+    doc.install Dir["*"]
+  end
+
+  test do
+    system bin/"farsight-desktop", "--help"
+  end
+end
