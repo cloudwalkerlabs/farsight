@@ -20,7 +20,7 @@ const LAYOUT: Layout = Layout { width_px: 1280, height_px: 720, scale_120: 120, 
 async fn frame_and_control_over_loopback() {
     let id = endpoint::Identity::generate().unwrap();
     let fingerprint = id.fingerprint();
-    let server = endpoint::server(0, &id).unwrap();
+    let server = endpoint::server(None, 0, &id).unwrap();
     let port = server.local_addr().unwrap().port();
 
     let frame_data: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
@@ -41,9 +41,9 @@ async fn frame_and_control_over_loopback() {
         conn.closed().await;
     });
 
-    let client = endpoint::client().unwrap();
+    let client = endpoint::client(false).unwrap();
     let (conn, fp) = endpoint::connect(&client, SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await.unwrap();
-    assert_eq!(fp, fingerprint);
+    assert_eq!(fp.as_deref(), Some(fingerprint.as_str()));
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     stream::send(&mut send, &ClientMessage::Hello(Hello { decoders: vec![], layout: LAYOUT, mode: Mode::Text, audio: None, auth: farsight_proto::control::ClientAuth { key: [0; 32], signature: vec![] } })).await.unwrap();
     let Some(ServerMessage::Welcome(w)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
@@ -67,7 +67,7 @@ async fn frame_and_control_over_loopback() {
 #[tokio::test]
 async fn pings_overtake_a_keyframe() {
     let id = endpoint::Identity::generate().unwrap();
-    let server = endpoint::server(0, &id).unwrap();
+    let server = endpoint::server(None, 0, &id).unwrap();
     let port = server.local_addr().unwrap().port();
 
     let server_task = tokio::spawn(async move {
@@ -83,7 +83,7 @@ async fn pings_overtake_a_keyframe() {
         }
     });
 
-    let client = endpoint::client().unwrap();
+    let client = endpoint::client(false).unwrap();
     let (conn, _) = endpoint::connect(&client, SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await.unwrap();
     let start = Instant::now();
     let now_us = || start.elapsed().as_micros() as u64;
@@ -108,4 +108,50 @@ async fn pings_overtake_a_keyframe() {
     assert!(worst < 20_000, "a ping waited {worst} µs behind video: {rtts:?}");
     conn.close(0u32.into(), b"done");
     server_task.abort();
+}
+
+/// Plaintext mode: a whole connection with the null crypto layer, the
+/// client key's proof across it, and a TLS client turned away at once.
+#[tokio::test]
+async fn plaintext_over_loopback() {
+    use farsight_net::auth::{ClientKey, verify};
+    let server = endpoint::server_plain(Ipv6Addr::LOCALHOST.into(), 0).unwrap();
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, server.local_addr().unwrap().port()));
+    let dir = std::env::temp_dir().join(format!("farsight-plain-{}", std::process::id()));
+    let key = ClientKey::load_or_generate(&dir.join("client_key")).unwrap();
+    let public = key.public();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let Some(ClientMessage::Hello(hello)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
+        assert_eq!(hello.auth.key, public);
+        assert!(verify(&conn, &hello.auth.key, &hello.auth.signature));
+        let mut forged = hello.auth.signature.clone();
+        forged[0] ^= 1;
+        assert!(!verify(&conn, &hello.auth.key, &forged));
+        stream::send(&mut send, &ServerMessage::Welcome(Welcome { encodings: vec![] })).await.unwrap();
+        conn.send_datagram(bytes::Bytes::from_static(b"plain datagram")).unwrap();
+        conn.closed().await;
+    });
+
+    let client = endpoint::client(true).unwrap();
+    let (conn, fp) = endpoint::connect(&client, addr).await.unwrap();
+    assert_eq!(fp, None);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let auth = farsight_proto::control::ClientAuth { key: key.public(), signature: key.sign(&conn).unwrap() };
+    let hello = Hello { decoders: vec![], layout: LAYOUT, mode: Mode::Text, audio: None, auth };
+    stream::send(&mut send, &ClientMessage::Hello(hello)).await.unwrap();
+    let Some(ServerMessage::Welcome(_)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
+    assert_eq!(&conn.read_datagram().await.unwrap()[..], b"plain datagram");
+    conn.close(0u32.into(), b"done");
+    server_task.await.unwrap();
+
+    // TLS against a plaintext server: version negotiation, not a timeout.
+    let server = endpoint::server_plain(Ipv6Addr::LOCALHOST.into(), 0).unwrap();
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, server.local_addr().unwrap().port()));
+    let started = Instant::now();
+    assert!(endpoint::connect(&endpoint::client(false).unwrap(), addr).await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&dir);
 }

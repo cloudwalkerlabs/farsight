@@ -1051,6 +1051,7 @@ dependencies = [
  "bytes",
  "farsight-proto",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring",
  "rustls",

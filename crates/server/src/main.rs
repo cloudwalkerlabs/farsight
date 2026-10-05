@@ -16,6 +16,7 @@ mod encode;
 mod gpu;
 mod host;
 mod input;
+mod listen;
 mod net;
 mod outputs;
 mod pipeline;
@@ -47,6 +48,15 @@ struct Args {
     /// UDP port to listen on.
     #[arg(short, long, default_value_t = farsight_proto::DEFAULT_PORT)]
     port: u16,
+    /// Address to listen on. Default: every address. Required with
+    /// --no-tls.
+    #[arg(long)]
+    listen: Option<std::net::IpAddr>,
+    /// Plaintext mode: no encryption or server certificate, for networks
+    /// that encrypt and authenticate every packet themselves (Tailscale,
+    /// WireGuard). Client keys still apply. Clients must use --no-tls too.
+    #[arg(long, requires = "listen")]
+    no_tls: bool,
     /// Render node for compositing and encoding.
     #[arg(long, default_value = "/dev/dri/renderD128")]
     render_node: PathBuf,
@@ -131,10 +141,24 @@ fn main() -> anyhow::Result<()> {
     if !authorized_keys.exists() {
         tracing::warn!(file = %authorized_keys.display(), "no authorized keys yet: no client can connect");
     }
+    if args.no_tls {
+        let addr = args.listen.expect("clap requires --listen");
+        match listen::protected(addr) {
+            Some(why) => tracing::info!(%addr, why, "plaintext mode"),
+            None => tracing::warn!(
+                %addr,
+                "PLAINTEXT MODE on a network farsight doesn't recognise as encrypted: the screen, keystrokes \
+                 and audio cross it unencrypted and unauthenticated. Use --no-tls only on a tailnet or a \
+                 WireGuard tunnel."
+            ),
+        }
+    }
     let (to_host, from_net) = channel::channel();
     let audio = Arc::new(net::Audio::default());
     let net = net::spawn(
         net::Options {
+            listen: args.listen,
+            plain: args.no_tls,
             port: args.port,
             authorized_keys,
             identity,

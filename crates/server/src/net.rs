@@ -81,6 +81,9 @@ pub struct Audio {
 pub const CLOSE_UNAUTHORIZED: u32 = 3;
 
 pub struct Options {
+    pub listen: Option<std::net::IpAddr>,
+    /// Plaintext mode (§1); needs `listen`.
+    pub plain: bool,
     pub port: u16,
     /// Client keys allowed in (§6), read on every connection.
     pub authorized_keys: std::path::PathBuf,
@@ -113,11 +116,15 @@ pub fn spawn(opts: Options, host: HostSender<ToHost>) -> anyhow::Result<mpsc::Un
         .build()?;
     let endpoint = {
         let _guard = rt.enter();
-        endpoint::server(opts.port, &opts.identity)?
+        match (opts.plain, opts.listen) {
+            (true, Some(addr)) => endpoint::server_plain(addr, opts.port)?,
+            (true, None) => anyhow::bail!("plaintext mode needs an address to listen on"),
+            (false, listen) => endpoint::server(listen, opts.port, &opts.identity)?,
+        }
     };
+    let fingerprint = if opts.plain { "none (plaintext)".to_string() } else { opts.identity.fingerprint() };
     tracing::info!(
-        addr = %endpoint.local_addr()?, fingerprint = opts.identity.fingerprint(),
-        rate_mbps = opts.rate_bps / 1_000_000, "listening"
+        addr = %endpoint.local_addr()?, %fingerprint, rate_mbps = opts.rate_bps / 1_000_000, "listening"
     );
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new().name("farsight-net".into()).spawn(move || {

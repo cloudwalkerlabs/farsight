@@ -80,6 +80,11 @@ struct Args {
     /// Don't play the session's audio; the server doesn't send it.
     #[arg(long)]
     no_audio: bool,
+    /// Plaintext mode, for a server started with --no-tls on a tailnet or
+    /// WireGuard tunnel. A server once reached over TLS is refused in
+    /// plaintext until its known_hosts line is removed.
+    #[arg(long)]
+    no_tls: bool,
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -323,6 +328,7 @@ impl App {
             server_name: self.server_name.clone(),
             key: self.key.clone(),
             known_hosts: farsight_net::auth::KnownHosts::new(self.config_dir.join("known_hosts")),
+            plain: self.args.no_tls,
             layout,
             decoders,
             mode: self.args.mode,

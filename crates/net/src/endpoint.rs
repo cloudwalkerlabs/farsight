@@ -3,7 +3,7 @@
 //! then checks its fingerprint against the one pinned on first use
 //! ([`crate::auth::KnownHosts`]), before it sends anything.
 
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use farsight_proto::ALPN;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, TransportConfig};
+use quinn::{Connection, Endpoint, EndpointConfig, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -86,8 +86,13 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// A server endpoint on `port`, on every address (IPv4 too).
-pub fn server(port: u16, id: &Identity) -> anyhow::Result<Endpoint> {
+/// Where a server listens: every address (IPv4 too) unless given one.
+fn listen_addr(listen: Option<IpAddr>, port: u16) -> SocketAddr {
+    SocketAddr::from((listen.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), port))
+}
+
+/// A server endpoint on `port`.
+pub fn server(listen: Option<IpAddr>, port: u16, id: &Identity) -> anyhow::Result<Endpoint> {
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -96,35 +101,57 @@ pub fn server(port: u16, id: &Identity) -> anyhow::Result<Endpoint> {
     tls.max_early_data_size = 0;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     config.transport_config(Arc::new(transport_config()));
-    let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
-    Endpoint::server(config, addr).with_context(|| format!("binding UDP port {port}"))
+    let addr = listen_addr(listen, port);
+    Endpoint::server(config, addr).with_context(|| format!("binding UDP {addr}"))
 }
 
-/// A client endpoint on an ephemeral port.
-pub fn client() -> anyhow::Result<Endpoint> {
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AnyCert(
-            rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )))
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+/// A plaintext server endpoint (§1) on `listen`, which must be given.
+pub fn server_plain(listen: IpAddr, port: u16) -> anyhow::Result<Endpoint> {
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crate::plain::ServerConfig));
     config.transport_config(Arc::new(transport_config()));
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.supported_versions(vec![crate::plain::VERSION]);
+    let addr = listen_addr(Some(listen), port);
+    let socket = std::net::UdpSocket::bind(addr).with_context(|| format!("binding UDP {addr}"))?;
+    Ok(Endpoint::new(endpoint_config, Some(config), socket, Arc::new(quinn::TokioRuntime))?)
+}
+
+/// A client endpoint on an ephemeral port, in TLS or plaintext mode.
+pub fn client(plain: bool) -> anyhow::Result<Endpoint> {
+    let mut config = if plain {
+        let mut c = quinn::ClientConfig::new(Arc::new(crate::plain::ClientConfig));
+        c.version(crate::plain::VERSION);
+        c
+    } else {
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert(
+                rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?))
+    };
+    config.transport_config(Arc::new(transport_config()));
+    let mut endpoint_config = EndpointConfig::default();
+    if plain {
+        endpoint_config.supported_versions(vec![crate::plain::VERSION]);
+    }
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
+    let mut endpoint = Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
 }
 
-/// Connects and returns the connection with the server's fingerprint.
-pub async fn connect(endpoint: &Endpoint, addr: SocketAddr) -> anyhow::Result<(Connection, String)> {
+/// Connects and returns the connection with the server's certificate
+/// fingerprint, or `None` in plaintext mode.
+pub async fn connect(endpoint: &Endpoint, addr: SocketAddr) -> anyhow::Result<(Connection, Option<String>)> {
     let conn = endpoint.connect(addr, "farsight")?.await.with_context(|| format!("connecting to {addr}"))?;
     let fp = conn
         .peer_identity()
         .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .and_then(|certs| certs.first().map(|c| fingerprint(c)))
-        .context("server sent no certificate")?;
+        .and_then(|certs| certs.first().map(|c| fingerprint(c)));
     Ok((conn, fp))
 }
 

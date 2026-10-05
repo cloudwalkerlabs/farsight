@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod endpoint;
 pub mod packetize;
+pub mod plain;
 pub mod sched;
 pub mod stream;
 

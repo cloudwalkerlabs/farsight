@@ -70,6 +70,8 @@ pub struct Config {
     pub server_name: String,
     pub key: Arc<ClientKey>,
     pub known_hosts: KnownHosts,
+    /// Plaintext mode (§1): no TLS, for tailnets.
+    pub plain: bool,
     pub layout: Layout,
     pub decoders: Vec<DecoderCaps>,
     pub mode: Mode,
@@ -159,11 +161,19 @@ impl Client {
     /// report through `on_event`, starting with `Connected`.
     pub async fn connect(cfg: Config, on_event: impl Fn(Event) + Send + Sync + 'static) -> anyhow::Result<Self> {
         let on_event: Callback = Arc::new(on_event);
-        let endpoint = endpoint::client()?;
+        let endpoint = endpoint::client(cfg.plain)?;
+        // Never TLS then plaintext: the mode is the user's, and known_hosts
+        // refuses a downgrade before anything is sent.
         let (conn, fingerprint) = endpoint::connect(&endpoint, cfg.addr).await?;
+        let pin = match (cfg.plain, &fingerprint) {
+            (true, _) => Pin::Plain,
+            (false, Some(fp)) => Pin::Tls(fp.clone()),
+            (false, None) => anyhow::bail!("the server sent no certificate"),
+        };
+        let fingerprint = fingerprint.unwrap_or_else(|| "none (plaintext)".into());
         tracing::info!(addr = %cfg.addr, %fingerprint, "connected");
         // Nothing goes to a server that isn't the one we know.
-        if let Err(err) = cfg.known_hosts.check(&cfg.server_name, &Pin::Tls(fingerprint.clone())) {
+        if let Err(err) = cfg.known_hosts.check(&cfg.server_name, &pin) {
             conn.close(0u32.into(), b"unknown server");
             return Err(err);
         }
