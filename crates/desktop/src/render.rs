@@ -1,8 +1,9 @@
-//! Draws decoded pictures into the window with OpenGL ES 3: the planes are
-//! uploaded as textures and converted to RGB in the fragment shader
-//! (BT.709, limited range, as the server encodes). Tiles go into an RGBA
-//! canvas the size of the remote screen, which keeps everything not sent
-//! again. The picture keeps its aspect ratio, letterboxed in black.
+//! Draws decoded pictures into the window with OpenGL ES 3, or desktop GL
+//! 3.3 where there is no GLES (macOS): the planes are uploaded as textures
+//! and converted to RGB in the fragment shader (BT.709, limited range, as
+//! the server encodes). Tiles go into an RGBA canvas the size of the
+//! remote screen, which keeps everything not sent again. The picture keeps
+//! its aspect ratio, letterboxed in black.
 
 use glow::HasContext;
 
@@ -10,7 +11,7 @@ use farsight_proto::tiles::Rect;
 
 use crate::decode::{Picture, PixelFormat};
 
-const VERTEX: &str = r#"#version 300 es
+const VERTEX: &str = r#"
 out vec2 v_uv;
 void main() {
     // A triangle strip over the whole viewport.
@@ -20,7 +21,7 @@ void main() {
 }
 "#;
 
-const FRAGMENT: &str = r#"#version 300 es
+const FRAGMENT: &str = r#"
 precision mediump float;
 in vec2 v_uv;
 out vec4 color;
@@ -112,7 +113,8 @@ impl Renderer {
             let program = gl.create_program().map_err(anyhow::Error::msg)?;
             for (kind, src) in [(glow::VERTEX_SHADER, VERTEX), (glow::FRAGMENT_SHADER, FRAGMENT)] {
                 let shader = gl.create_shader(kind).map_err(anyhow::Error::msg)?;
-                gl.shader_source(shader, src);
+                let version = if gl.version().is_embedded { "#version 300 es" } else { "#version 330 core" };
+                gl.shader_source(shader, &format!("{version}{src}"));
                 gl.compile_shader(shader);
                 if !gl.get_shader_compile_status(shader) {
                     anyhow::bail!("shader: {}", gl.get_shader_info_log(shader));

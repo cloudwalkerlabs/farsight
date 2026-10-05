@@ -57,6 +57,21 @@ impl std::fmt::Display for Format {
     }
 }
 
+/// Every 8-bit format.
+pub const FORMATS: [Format; 6] = {
+    const fn f(codec: Codec, chroma: Chroma) -> Format {
+        Format { codec, chroma, bit_depth: 8 }
+    }
+    [
+        f(Codec::H264, Chroma::Yuv420),
+        f(Codec::H264, Chroma::Yuv444),
+        f(Codec::Hevc, Chroma::Yuv420),
+        f(Codec::Hevc, Chroma::Yuv444),
+        f(Codec::Av1, Chroma::Yuv420),
+        f(Codec::Av1, Chroma::Yuv444),
+    ]
+};
+
 /// How a stream is sent: as video, or as tiles when the server has no
 /// hardware encoder for any format the client decodes (§2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

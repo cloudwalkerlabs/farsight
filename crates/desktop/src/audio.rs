@@ -1,6 +1,6 @@
 //! The session's audio, played through the desktop's sound server (cpal,
-//! PipeWire first). The output asks for 5 ms at a time where it can; the
-//! jitter buffer and drift correction are the client core's
+//! PipeWire first on Linux). The output asks for 5 ms at a time where it
+//! can; the jitter buffer and drift correction are the client core's
 //! (`farsight_client::audio`).
 
 use std::sync::Arc;
@@ -20,13 +20,11 @@ pub struct Output {
 }
 
 pub fn host() -> cpal::Host {
-    let preferred = [cpal::HostId::PipeWire];
-    for id in preferred {
-        if cpal::available_hosts().contains(&id)
-            && let Ok(host) = cpal::host_from_id(id)
-        {
-            return host;
-        }
+    #[cfg(target_os = "linux")]
+    if cpal::available_hosts().contains(&cpal::HostId::PipeWire)
+        && let Ok(host) = cpal::host_from_id(cpal::HostId::PipeWire)
+    {
+        return host;
     }
     cpal::default_host()
 }

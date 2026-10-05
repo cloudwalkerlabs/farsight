@@ -11,22 +11,28 @@ workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-cpal = { version = "0.18", features = ["pipewire"] }
+cpal = "0.18"
 rtrb = "0.3"
 sonora = "0.2"
 farsight-client = { version = "0.1.0", path = "../client" }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }
 farsight-tiles = { version = "0.1.0", path = "../tiles" }
-farsight-va = { version = "0.1.0", path = "../va" }
 ffmpeg-sys-next = "9"
 glow = "0.16"
 glutin = "0.32"
 glutin-winit = "0.5"
 libc = "0.2"
 raw-window-handle = "0.6"
-smithay-clipboard = "0.7"
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 winit = "0.30"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pipewire"] }
+farsight-va = { version = "0.1.0", path = "../va" }
+smithay-clipboard = "0.7"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = { version = "3", default-features = false }

@@ -16,6 +16,7 @@ mod audio;
 mod clipboard;
 mod cursor;
 mod decode;
+mod keymap;
 mod mic;
 mod render;
 mod stats;
@@ -36,7 +37,7 @@ use farsight_proto::input::InputEvent;
 use farsight_proto::layout::{Layout, SCALE_DENOMINATOR};
 use farsight_proto::tiles::Rect;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
-use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
+use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, PossiblyCurrentContext, Version};
 use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::prelude::{GlSurface, NotCurrentGlContext};
 use glutin::surface::{Surface, SwapInterval, WindowSurface};
@@ -46,7 +47,6 @@ use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use decode::{Decoder, Picture};
@@ -63,7 +63,8 @@ struct Args {
     #[arg(long)]
     print_key: bool,
     /// Directory holding this client's key (`client_key`) and the servers
-    /// it knows (`known_hosts`). Default: `$XDG_CONFIG_HOME/farsight`.
+    /// it knows (`known_hosts`). Default: `$XDG_CONFIG_HOME/farsight`, or
+    /// `%APPDATA%\farsight` on Windows.
     #[arg(long)]
     config_dir: Option<std::path::PathBuf>,
     /// Initial window size in logical pixels, WIDTHxHEIGHT.
@@ -126,14 +127,18 @@ fn default_config_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
     Some(base.join("farsight"))
 }
 
 /// `user@host`, to tell keys apart in `authorized_keys`.
 fn key_comment() -> String {
-    let user = std::env::var("USER").unwrap_or_default();
-    let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    let host = std::fs::read_to_string("/etc/hostname")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default();
     format!("{user}@{}", host.trim())
 }
 
@@ -304,11 +309,15 @@ impl App {
         let window = window.context("no window")?;
         let display = config.display();
         let raw = window.window_handle()?.as_raw();
-        let ctx_attrs =
-            ContextAttributesBuilder::new().with_context_api(ContextApi::Gles(Some(Version::new(3, 0)))).build(Some(raw));
+        // GLES 3 where there is one; desktop GL 3.3 otherwise, as on macOS.
+        let gles = ContextAttributesBuilder::new().with_context_api(ContextApi::Gles(Some(Version::new(3, 0)))).build(Some(raw));
+        let gl = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+            .with_profile(GlProfile::Core)
+            .build(Some(raw));
         // SAFETY: the window outlives the context and surface: Gfx drops
         // them first.
-        let context = unsafe { display.create_context(&config, &ctx_attrs)? };
+        let context = unsafe { display.create_context(&config, &gles).or_else(|_| display.create_context(&config, &gl))? };
         let surface_attrs = window.build_surface_attributes(Default::default())?;
         // SAFETY: as above.
         let surface = unsafe { display.create_window_surface(&config, &surface_attrs)? };
@@ -731,8 +740,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.repeat {
                     return;
                 }
-                // On Linux, winit's scancode is the evdev code.
-                if let Some(code) = event.physical_key.to_scancode() {
+                if let Some(code) = keymap::evdev(event.physical_key) {
                     self.input(InputEvent::Key { code, pressed: event.state == ElementState::Pressed });
                 }
             }

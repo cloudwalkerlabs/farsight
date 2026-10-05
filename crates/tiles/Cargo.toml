@@ -14,6 +14,7 @@ farsight-proto = { version = "0.1.0", path = "../proto" }
 flate2 = "1"
 libc = "0.2"
 
-# Android has no libturbojpeg: build the bundled one, statically.
-[target.'cfg(target_os = "android")'.dependencies]
+# Only Linux has libturbojpeg to hand: elsewhere, build the bundled one,
+# statically.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 turbojpeg-sys = { version = "1.2", default-features = false, features = ["cmake"] }
