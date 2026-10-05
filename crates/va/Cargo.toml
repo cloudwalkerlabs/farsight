@@ -12,3 +12,7 @@ workspace = true
 farsight-proto = { version = "0.1.0", path = "../proto" }
 libc = "0.2"
 tracing = "0.1"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

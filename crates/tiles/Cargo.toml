@@ -13,8 +13,6 @@ anyhow = "1"
 farsight-proto = { version = "0.1.0", path = "../proto" }
 flate2 = "1"
 libc = "0.2"
-
-# Only Linux has libturbojpeg to hand: elsewhere, build the bundled one,
-# statically.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+# Bundled and static everywhere: distributions' libjpeg-turbo may predate
+# TurboJPEG 3's API.
 turbojpeg-sys = { version = "1.2", default-features = false, features = ["cmake"] }

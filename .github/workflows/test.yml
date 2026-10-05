@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed base-devel git rustup clang cmake nasm pkgconf \
-            ffmpeg libva libjpeg-turbo opus pipewire wayland libxkbcommon mesa libglvnd alsa-lib
+            ffmpeg libva pipewire wayland libxkbcommon mesa libglvnd alsa-lib
           rustup default stable
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2

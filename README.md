@@ -43,7 +43,10 @@ dist/              example systemd unit
 
 Each [release](https://github.com/simophin/farsight/releases) has the Linux
 server and desktop client, the desktop client for macOS and Windows, and the
-Android app.
+Android app. The Linux binaries need glibc 2.36 or later (Debian 12, Fedora
+37), PipeWire's library, and libasound (the client) or libgbm and the XKB
+keymaps (the server); they load libva and the GPU's libraries when they use
+them.
 
 ## Building
 
@@ -69,11 +72,12 @@ cancelled, while an app in the session records from `farsight-mic`.
 The server encodes with VA-API or NVENC, and sends tiles without either;
 the client decodes with VA-API or in software. Both build against FFmpeg
 (the system's, or the small static one `tools/ffmpeg/build.sh` builds, as
-releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`), libjpeg-turbo
-and libopus; the server also needs dbus-daemon, PipeWire, WirePlumber and
-pipewire-pulse, and labwc for the default desktop. To keep a session
-running permanently, install `dist/farsight-server@.service`; the file
-explains how.
+releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`, which also has a
+static libxkbcommon) and libva's and libdrm's headers, and build
+libjpeg-turbo and libopus in; the server also needs dbus-daemon, PipeWire,
+WirePlumber and pipewire-pulse, and labwc for the default desktop. To keep
+a session running permanently, install `dist/farsight-server@.service`; the
+file explains how.
 
 The Android build runs `cargo ndk` itself and generates the Kotlin bindings,
 so there is no separate Rust step. In the app, "This device's key" gives
