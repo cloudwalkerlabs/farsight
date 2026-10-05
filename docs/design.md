@@ -1,11 +1,13 @@
 # farsight — design
 
-Status: 2026-10-05. M0–M4 are done: option B holds
+Status: 2026-10-05. M0–M5 are done: option B holds
 ([m0-results.md](m0-results.md)), the Linux desktop client works end to end
 ([m1-results.md](m1-results.md)), resize, scale, negotiation, NVENC and
 tiles work ([m2-results.md](m2-results.md)), the server is a session
-with audio ([m3-results.md](m3-results.md)), and the stream holds up on
-lossy, congested networks ([m4-results.md](m4-results.md)). M5 is next.
+with audio ([m3-results.md](m3-results.md)), the stream holds up on
+lossy, congested networks ([m4-results.md](m4-results.md)), and the
+Android client and the microphone work, on one phone so far
+([m5-results.md](m5-results.md)).
 
 farsight is a low-latency remote desktop for headless Linux servers. Its
 requirements:
@@ -615,8 +617,11 @@ mouse, or a desktop-mode display, are a bonus. RealVNC Viewer sets the bar.
     = drag.
   - Two-finger drag = scroll; three-finger tap = middle click.
 - **Direct touch mode:**
-  - The pointer jumps to the finger, so a tap clicks at that spot.
+  - The pointer jumps to the finger, so a tap clicks at that spot, and a
+    moving finger drags.
   - Long press = right click.
+  - Two fingers pan the zoomed desktop, or scroll when there is nothing
+    to pan.
   - Because the host is a real compositor, this mode can also forward real
     `wl_touch` contacts through the nested compositor, so touch-aware apps
     get genuine multi-touch. How well that works depends on the nested
@@ -635,10 +640,13 @@ mouse, or a desktop-mode display, are a bonus. RealVNC Viewer sets the bar.
 
 **Keyboard:**
 
-- The soft keyboard is opened from the toolbar. Typed text goes through IME
-  commit (the host's `input-method-v2` connection to the nested
-  compositor, which passes it on to apps over `text-input-v3`). Key events
-  are used where the keyboard produces them.
+- The soft keyboard is opened from the toolbar. While a text field in the
+  session has focus (`TextInput`), typed text goes through IME commit
+  (the host's `input-method-v2` connection to the nested compositor,
+  which passes it on to apps over `text-input-v3`); otherwise, as with
+  terminals and X apps, characters are typed as keys on a US keymap, and
+  a composition is retyped as it changes. Key events are used where the
+  keyboard produces them, and a latched modifier always makes keys.
 - An **extra keys bar** above the keyboard has sticky modifiers (Ctrl, Alt,
   Super, Shift), Esc, Tab, arrows, F-keys and a key-combo builder.
 - Hardware keyboards are passed through with physical scancodes.
@@ -650,8 +658,15 @@ mouse, or a desktop-mode display, are a bonus. RealVNC Viewer sets the bar.
 - Immersive full screen, with `adjustResize` so the keyboard shrinks the
   viewport instead of covering the cursor.
 - The Activity is never recreated: config changes are handled in place.
+  Back twice leaves the session.
 - An address book of saved servers with pinned keys, and a list of recent
   connections with thumbnails.
+- The session lasts while the app is in the foreground: it is closed in
+  the background and resumed on return (a foreground service for audio
+  and calls is later).
+- **The hot paths stay in Rust**: MediaCodec decodes into the view's
+  `Surface` (handed over through JNI, not uniffi), tiles are drawn into it
+  by the CPU, and audio runs on AAudio both ways.
 
 **Mouse and desktop mode:** a pointer device bypasses touch modes and is
 sent directly, with relative pointer capture when the server asks for it.
@@ -696,14 +711,21 @@ sent directly, with relative pointer capture when the server asks for it.
     - When an app starts recording from `farsight-mic`, the server sends
       `MicDemand(true)`. The client opens its mic according to the user's
       setting (never, ask or always) and shows an indicator.
-    - Opus `VOIP` mode, 10 ms frames, mono, with in-band FEC.
+    - Opus `VOIP` mode, 10 ms frames, mono, 32 kbit/s, with in-band FEC
+      and the frame before repeated (`Mic` datagrams). Capture times are
+      on the server's clock; the server plays the frames into the source
+      through the client's jitter buffer (`farsight-audio`).
+    - The user's answer to "ask" holds for the rest of the session.
     - **Echo cancellation runs on the client:** AAudio's
-      `VOICE_COMMUNICATION` preset on Android, and WebRTC's AEC3 on the
-      desktop. It can be turned off for headphones.
+      `VOICE_COMMUNICATION` preset on Android, with the output playing as
+      voice communication in communication mode; WebRTC's AEC3 (sonora,
+      a Rust port) on the desktop, fed what the client plays, lined up
+      with the microphone by time. AEC3 must get the far end before its
+      echo. It can be turned off for headphones.
   - **Wire:** datagram tags `TAG_AUDIO` and `TAG_MIC`, each carrying a
     sequence number, `capture_us` and the newest frames. On the control
-    stream: `AudioCaps` in `Hello`, plus `AudioConfig`, `MicDemand` and
-    `SetAudio`.
+    stream: `AudioCaps` and `mic` in `Hello`, plus `AudioConfig`,
+    `MicDemand` and `SetAudio`.
 - **Clipboard:** MIME-typed and fetched lazily, a QUIC stream per
   transfer. The server side reads and sets the nested desktop's clipboard
   through `ext-data-control`. (The desktop client handles text only.)
@@ -720,7 +742,7 @@ sent directly, with relative pointer capture when the server asks for it.
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles. **Done over loopback** ([results](m2-results.md)): layout changes hold frames 6–57 ms; AV1 is untested for want of an encoder. |
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured. **Done over loopback** ([results](m3-results.md)): 13–20 ms from the session's sink to the client's speaker; checked as a user service, not as root or with a user in `audio`; the client's keymap is still labwc's. |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss. **Done under netem on one machine** ([results](m4-results.md)): at 5% loss nothing lost after FEC, every decoded picture bit-exact, every typed line exact, no audio concealed; RFI through NVENC, keyframes through VA-API; a run between two machines is still to do. |
-| M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |
+| M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo. **Done on one phone over Tailscale** ([results](m5-results.md)): 29–31 ms capture to display with NVENC, audio 41–60 ms; a recorder in the session hears the phone's mic, its echo mostly cancelled; multi-finger gestures, IME typing and a real call are still to try by hand. |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
 
 ## Risks

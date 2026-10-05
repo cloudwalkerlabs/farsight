@@ -16,11 +16,16 @@ mode for tailnets, reconnection, takeover and view-only clients, and a
 kiosk mode for a single app. The stream holds up on lossy, congested
 networks (M4): delay-based congestion control, FEC, NACK on quick paths,
 reference frame invalidation, and audio redundancy that follows the loss.
+The Android client and the microphone (M5): MediaCodec straight to the
+screen, touchpad and direct touch, a zoomable viewport, extra keys and the
+soft keyboard, AAudio, clipboard; an app in the session that records
+hears the client's microphone, echo cancelled.
 See [`docs/design.md`](docs/design.md) for the design and milestones, and
 [`docs/m1-results.md`](docs/m1-results.md),
 [`docs/m2-results.md`](docs/m2-results.md),
-[`docs/m3-results.md`](docs/m3-results.md) and
-[`docs/m4-results.md`](docs/m4-results.md) for what was measured.
+[`docs/m3-results.md`](docs/m3-results.md),
+[`docs/m4-results.md`](docs/m4-results.md) and
+[`docs/m5-results.md`](docs/m5-results.md) for what was measured.
 
 ## Layout
 
@@ -69,4 +74,5 @@ keep a session running permanently, install
 `dist/farsight-server@.service`; the file explains how.
 
 The Android build runs `cargo ndk` itself and generates the Kotlin bindings,
-so there is no separate Rust step.
+so there is no separate Rust step. In the app, "This device's key" gives
+its line for the server's `authorized_keys`.
