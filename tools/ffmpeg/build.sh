@@ -63,7 +63,8 @@ case $os in
             --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox)
         ;;
     windows)
-        platform=(--toolchain=msvc --enable-d3d11va
+        # -MD: the CRT Rust links (cl's default is the static one).
+        platform=(--toolchain=msvc --extra-cflags=-MD --enable-d3d11va
             --enable-hwaccel=h264_d3d11va,hevc_d3d11va,h264_d3d11va2,hevc_d3d11va2)
         ;;
 esac
@@ -79,10 +80,16 @@ configure=(
     "${platform[@]}"
 )
 
+# For dav1d. On Windows, pkg-config is a native program and wants
+# Windows paths.
+if [ "$os" = windows ]; then
+    export PKG_CONFIG_PATH="$native_prefix/lib/pkgconfig"
+else
+    export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
 mkdir ffmpeg-build
 cd ffmpeg-build
-PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-    "../ffmpeg-$FFMPEG_VERSION/configure" --prefix="$native_prefix" "${configure[@]}"
+"../ffmpeg-$FFMPEG_VERSION/configure" --prefix="$native_prefix" "${configure[@]}"
 make -j"$jobs"
 make install
 cd ..
