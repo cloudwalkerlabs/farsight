@@ -5,7 +5,7 @@
 
 use glow::HasContext;
 
-use crate::decode::{Format, Picture};
+use crate::decode::{PixelFormat, Picture};
 
 const VERTEX: &str = r#"#version 300 es
 out vec2 v_uv;
@@ -119,12 +119,16 @@ impl Renderer {
     }
 
     pub fn upload(&mut self, pic: &Picture) {
-        let (w, h) = (pic.width as i32, pic.height as i32);
-        let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
-        let planes: &[(u32, i32, i32, u32)] = match pic.format {
-            Format::Nv12 => &[(glow::R8, w, h, glow::RED), (glow::RG8, cw, ch, glow::RG)],
-            Format::I420 => &[(glow::R8, w, h, glow::RED), (glow::R8, cw, ch, glow::RED), (glow::R8, cw, ch, glow::RED)],
-        };
+        let (w, h) = (pic.width as usize, pic.height as usize);
+        let planes: Vec<(u32, i32, i32, u32)> = (0..pic.format.planes())
+            .map(|i| {
+                let (bytes, rows) = pic.format.plane_size(i, w, h);
+                match (pic.format, i) {
+                    (PixelFormat::Nv12, 1) => (glow::RG8, bytes as i32 / 2, rows as i32, glow::RG),
+                    _ => (glow::R8, bytes as i32, rows as i32, glow::RED),
+                }
+            })
+            .collect();
         let gl = &self.gl;
         // SAFETY: the context is current; each plane holds `stride * rows`
         // bytes, as the row length below says.
@@ -149,7 +153,7 @@ impl Renderer {
             }
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             gl.use_program(Some(self.program));
-            gl.uniform_1_i32(Some(&self.nv12), (pic.format == Format::Nv12) as i32);
+            gl.uniform_1_i32(Some(&self.nv12), (pic.format == PixelFormat::Nv12) as i32);
         }
         self.picture = Some((pic.width, pic.height));
     }

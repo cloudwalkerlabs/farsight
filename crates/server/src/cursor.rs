@@ -120,7 +120,8 @@ fn read_image(host: &mut Host, surface: &WlSurface) -> Option<CursorImage> {
     let (width, height, hotspot) = (size.w as u32, size.h as u32, (hotspot.x * scale, hotspot.y * scale));
     let mut hasher = DefaultHasher::new();
     (width, height, hotspot, &pixels).hash(&mut hasher);
-    Some(CursorImage { id: hasher.finish(), width, height, hotspot, pixels })
+    let scale_120 = scale as u32 * farsight_proto::layout::SCALE_DENOMINATOR;
+    Some(CursorImage { id: hasher.finish(), width, height, hotspot, scale_120, pixels })
 }
 
 fn read_pixels(host: &mut Host, texture: &GlesTexture) -> anyhow::Result<Vec<u8>> {

@@ -1,4 +1,4 @@
-//! H.264 decoding through FFmpeg: VA-API when the machine has it, software
+//! Video decoding through FFmpeg: VA-API when the machine has it, software
 //! otherwise (§3). Decoded pictures are copied to memory for upload; the
 //! zero-copy path (dmabuf → EGLImage) is later work.
 
@@ -6,23 +6,100 @@ use std::ffi::CStr;
 use std::ptr;
 
 use anyhow::bail;
+use farsight_proto::codec::{Chroma, Codec, DecoderCaps, Format};
 use ffmpeg_sys_next as ff;
 
 const AVERROR_EAGAIN: i32 = -libc::EAGAIN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
+pub enum PixelFormat {
     /// Y plane, then interleaved U/V at half size.
     Nv12,
     /// Y, U and V planes, U and V at half size.
     I420,
+    /// Y, U and V planes at full size.
+    I444,
 }
+
+impl PixelFormat {
+    /// Bytes per row and rows of plane `i`, for a `w`×`h` picture.
+    pub fn plane_size(self, i: usize, w: usize, h: usize) -> (usize, usize) {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        match (self, i) {
+            (_, 0) | (PixelFormat::I444, _) => (w, h),
+            (PixelFormat::Nv12, _) => (2 * cw, ch),
+            (PixelFormat::I420, _) => (cw, ch),
+        }
+    }
+
+    pub fn planes(self) -> usize {
+        if self == PixelFormat::Nv12 { 2 } else { 3 }
+    }
+}
+
+/// Software decoders are offered up to this size.
+const SOFTWARE_MAX: u32 = 8192;
+
+fn software_decoder(codec: Codec) -> *const ff::AVCodec {
+    // SAFETY: lookups by id and by NUL-terminated name.
+    unsafe {
+        match codec {
+            Codec::H264 => ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_H264),
+            Codec::Hevc => ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_HEVC),
+            // FFmpeg's own AV1 decoder only drives hardware.
+            Codec::Av1 => ff::avcodec_find_decoder_by_name(c"libdav1d".as_ptr()),
+        }
+    }
+}
+
+fn codec_id(codec: Codec) -> ff::AVCodecID {
+    match codec {
+        Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
+        Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
+        Codec::Av1 => ff::AVCodecID::AV_CODEC_ID_AV1,
+    }
+}
+
+/// What this machine can decode: in hardware where VA-API can (4:2:0
+/// only, which is what the renderer takes from VA-API surfaces), else in
+/// software.
+pub fn offered(hardware: bool) -> Vec<DecoderCaps> {
+    let hw = if hardware {
+        farsight_va::query(std::path::Path::new(RENDER_NODE), farsight_va::Direction::Decode)
+    } else {
+        Vec::new()
+    };
+    let mut out = Vec::new();
+    for format in farsight_va::FORMATS {
+        if let Some(s) = hw.iter().find(|s| s.format == format && format.chroma == Chroma::Yuv420) {
+            out.push(DecoderCaps {
+                format,
+                max_width: s.max_width,
+                max_height: s.max_height,
+                hardware: true,
+                partial_decode: false,
+            });
+        } else if !software_decoder(format.codec).is_null() {
+            out.push(DecoderCaps {
+                format,
+                max_width: SOFTWARE_MAX,
+                max_height: SOFTWARE_MAX,
+                hardware: false,
+                partial_decode: false,
+            });
+        }
+    }
+    out
+}
+
+/// The VA-API device decoders open, as FFmpeg's default.
+const RENDER_NODE: &str = "/dev/dri/renderD128";
 
 /// One decoded picture in memory.
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    pub format: Format,
+    pub format: PixelFormat,
     pub planes: Vec<Vec<u8>>,
     /// Bytes per row of each plane.
     pub strides: Vec<usize>,
@@ -71,8 +148,9 @@ unsafe extern "C" fn get_format(_ctx: *mut ff::AVCodecContext, fmts: *const ff::
 }
 
 impl Decoder {
-    /// A decoder using VA-API if `hardware` and available, else software.
-    pub fn new(hardware: bool) -> anyhow::Result<Self> {
+    /// A decoder for `format` using VA-API if `hardware` and available,
+    /// else software.
+    pub fn new(format: Format, hardware: bool) -> anyhow::Result<Self> {
         let mut dec = Decoder {
             ctx: ptr::null_mut(),
             device: ptr::null_mut(),
@@ -85,9 +163,11 @@ impl Decoder {
         // SAFETY: plain FFmpeg setup; every pointer is checked and owned by
         // `dec`, whose Drop frees it.
         unsafe {
-            let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_H264);
+            let hardware = hardware && format.chroma == Chroma::Yuv420;
+            let codec =
+                if hardware { ff::avcodec_find_decoder(codec_id(format.codec)) } else { software_decoder(format.codec) };
             if codec.is_null() {
-                bail!("FFmpeg has no H.264 decoder");
+                bail!("FFmpeg has no {format} decoder");
             }
             dec.ctx = ff::avcodec_alloc_context3(codec);
             let c = &mut *dec.ctx;
@@ -112,12 +192,12 @@ impl Decoder {
                     Err(err) => tracing::warn!("{err:#}; decoding in software"),
                 }
             }
-            check(ff::avcodec_open2(dec.ctx, codec, ptr::null_mut()), "opening the H.264 decoder")?;
+            check(ff::avcodec_open2(dec.ctx, codec, ptr::null_mut()), &format!("opening the {format} decoder"))?;
             dec.frame = ff::av_frame_alloc();
             dec.sw_frame = ff::av_frame_alloc();
             dec.packet = ff::av_packet_alloc();
         }
-        tracing::info!(hardware = dec.hardware, "decoder ready");
+        tracing::info!(%format, hardware = dec.hardware, "decoder ready");
         Ok(dec)
     }
 
@@ -162,21 +242,23 @@ impl Decoder {
             }
             let (w, h) = ((*f).width as usize, (*f).height as usize);
             let format = match (*f).format {
-                x if x == ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 => Format::Nv12,
+                x if x == ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 => PixelFormat::Nv12,
                 x if x == ff::AVPixelFormat::AV_PIX_FMT_YUV420P as i32
                     || x == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32 =>
                 {
-                    Format::I420
+                    PixelFormat::I420
+                }
+                x if x == ff::AVPixelFormat::AV_PIX_FMT_YUV444P as i32
+                    || x == ff::AVPixelFormat::AV_PIX_FMT_YUVJ444P as i32 =>
+                {
+                    PixelFormat::I444
                 }
                 other => bail!("unsupported decoded format {other}"),
             };
-            let rows = match format {
-                Format::Nv12 => vec![h, h.div_ceil(2)],
-                Format::I420 => vec![h, h.div_ceil(2), h.div_ceil(2)],
-            };
             let mut planes = Vec::new();
             let mut strides = Vec::new();
-            for (i, rows) in rows.into_iter().enumerate() {
+            for i in 0..format.planes() {
+                let (_, rows) = format.plane_size(i, w, h);
                 let stride = (*f).linesize[i] as usize;
                 planes.push(std::slice::from_raw_parts((*f).data[i], stride * rows).to_vec());
                 strides.push(stride);

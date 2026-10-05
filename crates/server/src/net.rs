@@ -40,6 +40,8 @@ pub enum ToHost {
 pub enum ToNet {
     Frame(ConnId, Frame),
     Message(ConnId, ServerMessage),
+    /// Ends the connection, with a reason for the client.
+    Close(ConnId, String),
 }
 
 #[derive(Debug)]
@@ -135,6 +137,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Opt
             ToNet::Message(id, m) if id == c.id => {
                 let _ = c.control.send(m);
             }
+            ToNet::Close(id, reason) if id == c.id => c.conn.close(2u32.into(), reason.as_bytes()),
             _ => {} // for a connection that has gone
         }
     }

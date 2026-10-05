@@ -1,13 +1,13 @@
-//! VA-API H.264 encoding through FFmpeg (docs/design.md §2).
+//! VA-API encoding through FFmpeg (docs/design.md §2).
 //!
 //! Input surfaces come from an FFmpeg VA-API frame pool. Each surface is
 //! mapped once to dmabufs, one per NV12 plane (R8 luma, GR88 chroma), so the
 //! GLES conversion pass can render straight into it: no copy between the
 //! shader and the encoder.
 //!
-//! [`Surfaces::new`] returns two halves: [`Surfaces`] stays with the renderer
-//! on the main thread, and [`Codec`] moves to the encode thread. FFmpeg's
-//! frame pool is thread-safe, and each half is used from one thread only.
+//! [`open`] returns two halves: [`Surfaces`] stays with the renderer on the
+//! main thread, and the encoder moves to the encode thread. FFmpeg's frame
+//! pool is thread-safe, and each half is used from one thread only.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -16,9 +16,17 @@ use std::path::Path;
 use std::ptr;
 
 use anyhow::{Context, bail};
+use farsight_proto::codec::Codec;
 use ffmpeg_sys_next as ff;
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::{Bind, Frame, Renderer, Texture};
+use smithay::utils::{Rectangle, Transform};
+
+use super::ffmpeg::{FfEncoder, check};
+use super::{EncoderInfo, Settings, Shaders};
 
 /// One encoder input surface, as the two render targets of the conversion.
 #[derive(Clone)]
@@ -36,23 +44,19 @@ pub struct Surfaces {
     targets: HashMap<usize, Nv12Target>,
 }
 
-/// The encoder proper.
-pub struct Codec {
-    ctx: *mut ff::AVCodecContext,
-    packet: *mut ff::AVPacket,
-}
-
-// SAFETY: a Codec owns its FFmpeg context outright and is only used from one
-// thread at a time; the frame pool it shares with `Surfaces` is refcounted
-// and thread-safe.
-unsafe impl Send for Codec {}
-
-/// A surface taken from the pool, owned until passed to [`Codec::encode`]
+/// A surface taken from the pool, owned until passed to the encoder
 /// (or dropped).
 pub struct Surface(*mut ff::AVFrame);
 
-// SAFETY: as for Codec; the frame is a refcounted pool entry with one owner.
+// SAFETY: the frame is a refcounted pool entry with one owner.
 unsafe impl Send for Surface {}
+
+impl Surface {
+    /// The frame, now owned by the caller.
+    pub fn into_raw(mut self) -> *mut ff::AVFrame {
+        std::mem::replace(&mut self.0, ptr::null_mut())
+    }
+}
 
 impl Drop for Surface {
     fn drop(&mut self) {
@@ -61,97 +65,111 @@ impl Drop for Surface {
     }
 }
 
-fn check(ret: i32, what: &str) -> anyhow::Result<i32> {
-    if ret < 0 {
-        let mut buf = [0 as libc::c_char; 128];
-        // SAFETY: buf is valid for its length; av_strerror NUL-terminates.
-        let msg = unsafe {
-            ff::av_strerror(ret, buf.as_mut_ptr(), buf.len());
-            std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
-        };
-        bail!("{what}: {msg}");
+pub fn encoder_name(codec: Codec) -> &'static std::ffi::CStr {
+    match codec {
+        Codec::H264 => c"h264_vaapi",
+        Codec::Hevc => c"hevc_vaapi",
+        Codec::Av1 => c"av1_vaapi",
     }
-    Ok(ret)
 }
 
-const AVERROR_EAGAIN: i32 = -libc::EAGAIN;
+/// Opens the frame pool and the encoder for one size (one video epoch).
+pub fn open(
+    info: &EncoderInfo,
+    render_node: &Path,
+    width: i32,
+    height: i32,
+    settings: &Settings,
+) -> anyhow::Result<(Surfaces, FfEncoder)> {
+    let node = CString::new(render_node.as_os_str().as_encoded_bytes())?;
+    let mut enc = Surfaces { width, height, device: ptr::null_mut(), frames: ptr::null_mut(), targets: HashMap::new() };
+    // SAFETY: plain FFmpeg setup; every pointer is checked before use and
+    // owned by `enc`, whose Drop frees it.
+    unsafe {
+        check(
+            ff::av_hwdevice_ctx_create(
+                &mut enc.device,
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                node.as_ptr(),
+                ptr::null_mut(),
+                0,
+            ),
+            "VA-API device",
+        )?;
+        enc.frames = ff::av_hwframe_ctx_alloc(enc.device);
+        if enc.frames.is_null() {
+            bail!("av_hwframe_ctx_alloc");
+        }
+        let fc = (*enc.frames).data as *mut ff::AVHWFramesContext;
+        (*fc).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*fc).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*fc).width = width;
+        (*fc).height = height;
+        // Room for a surface being converted, one queued for the encode
+        // thread and the encoder's own references.
+        (*fc).initial_pool_size = 8;
+        check(ff::av_hwframe_ctx_init(enc.frames), "VA-API frame pool")?;
+    }
+    let name = encoder_name(info.caps.format.codec);
+    let profile = match info.caps.format.codec {
+        Codec::H264 => "high",
+        Codec::Hevc | Codec::Av1 => "main",
+    };
+    let frames = enc.frames;
+    let mut opts = vec![
+        (c"async_depth", "1".to_string()),
+        (c"rc_mode", "CQP".to_string()),
+        (c"profile", profile.to_string()),
+        (c"qp", settings.qp.to_string()),
+    ];
+    if info.low_power {
+        opts.push((c"low_power", "1".to_string()));
+    }
+    let codec = FfEncoder::open(
+        name,
+        width,
+        height,
+        |c| {
+            c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            // SAFETY: frames is a valid frame pool; the context takes a
+            // reference of its own.
+            c.hw_frames_ctx = unsafe { ff::av_buffer_ref(frames) };
+        },
+        &opts,
+    )?;
+    tracing::info!(width, height, encoder = %name.to_string_lossy(), qp = settings.qp, "encoder ready (CQP, async_depth 1)");
+    Ok((enc, codec))
+}
 
 impl Surfaces {
-    /// Opens the frame pool and the encoder for one size (one video epoch).
-    pub fn new(render_node: &Path, width: i32, height: i32, qp: u32) -> anyhow::Result<(Surfaces, Codec)> {
-        let node = CString::new(render_node.as_os_str().as_encoded_bytes())?;
-        let mut enc =
-            Surfaces { width, height, device: ptr::null_mut(), frames: ptr::null_mut(), targets: HashMap::new() };
-        let mut codec = Codec { ctx: ptr::null_mut(), packet: ptr::null_mut() };
-        // SAFETY: plain FFmpeg setup; every pointer is checked before use and
-        // owned by `enc` or `codec`, whose Drop frees it.
-        unsafe {
-            check(
-                ff::av_hwdevice_ctx_create(
-                    &mut enc.device,
-                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                    node.as_ptr(),
-                    ptr::null_mut(),
-                    0,
-                ),
-                "VA-API device",
-            )?;
-            enc.frames = ff::av_hwframe_ctx_alloc(enc.device);
-            if enc.frames.is_null() {
-                bail!("av_hwframe_ctx_alloc");
-            }
-            let fc = (*enc.frames).data as *mut ff::AVHWFramesContext;
-            (*fc).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            (*fc).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
-            (*fc).width = width;
-            (*fc).height = height;
-            // Room for a surface being converted, one queued for the encode
-            // thread and the encoder's own references.
-            (*fc).initial_pool_size = 8;
-            check(ff::av_hwframe_ctx_init(enc.frames), "VA-API frame pool")?;
-
-            let name = c"h264_vaapi";
-            let h264 = ff::avcodec_find_encoder_by_name(name.as_ptr());
-            if h264.is_null() {
-                bail!("FFmpeg has no h264_vaapi encoder");
-            }
-            codec.ctx = ff::avcodec_alloc_context3(h264);
-            let c = &mut *codec.ctx;
-            c.width = width;
-            c.height = height;
-            c.time_base = ff::AVRational { num: 1, den: 1_000_000 };
-            c.framerate = ff::AVRational { num: 60, den: 1 };
-            c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            c.hw_frames_ctx = ff::av_buffer_ref(enc.frames);
-            c.max_b_frames = 0;
-            c.gop_size = 600;
-            c.flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
-            c.color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
-            c.colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
-            c.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
-            c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-
-            let mut opts: *mut ff::AVDictionary = ptr::null_mut();
-            let qp = CString::new(qp.to_string())?;
-            for (k, v) in [
-                (c"async_depth", c"1"),
-                (c"rc_mode", c"CQP"),
-                (c"profile", c"high"),
-            ] {
-                ff::av_dict_set(&mut opts, k.as_ptr(), v.as_ptr(), 0);
-            }
-            ff::av_dict_set(&mut opts, c"qp".as_ptr(), qp.as_ptr(), 0);
-            let ret = ff::avcodec_open2(codec.ctx, h264, &mut opts);
-            ff::av_dict_free(&mut opts);
-            check(ret, "opening h264_vaapi")?;
-            codec.packet = ff::av_packet_alloc();
+    /// Converts `texture` into a free surface. The returned sync point
+    /// signals when the GPU has written it.
+    pub fn convert(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        shaders: &Shaders,
+        texture: &GlesTexture,
+    ) -> anyhow::Result<(Surface, SyncPoint)> {
+        let size = texture.size();
+        let (w, h) = (size.w, size.h);
+        let (surface, mut target) = self.next_surface()?;
+        let src = Rectangle::from_size(size.to_f64());
+        let mut sync = SyncPoint::signaled();
+        for (dmabuf, prog, (tw, th)) in [
+            (&mut target.luma, &shaders.luma, (w, h)),
+            (&mut target.chroma, &shaders.chroma, ((w + 1) / 2, (h + 1) / 2)),
+        ] {
+            let mut fb = renderer.bind(dmabuf)?;
+            let dst = Rectangle::from_size((tw, th).into());
+            let mut frame = renderer.render(&mut fb, (tw, th).into(), Transform::Normal)?;
+            frame.render_texture_from_to(texture, src, dst, &[dst], &[dst], Transform::Normal, 1.0, Some(prog), &[])?;
+            sync = frame.finish()?;
         }
-        tracing::info!(width, height, "encoder ready (h264_vaapi, CQP, async_depth 1)");
-        Ok((enc, codec))
+        Ok((surface, sync))
     }
 
     /// Take a free surface from the pool, with its render targets.
-    pub fn next_surface(&mut self) -> anyhow::Result<(Surface, Nv12Target)> {
+    fn next_surface(&mut self) -> anyhow::Result<(Surface, Nv12Target)> {
         // SAFETY: frames is an initialised VA-API frame pool.
         unsafe {
             let frame = Surface(ff::av_frame_alloc());
@@ -227,50 +245,3 @@ impl Drop for Surfaces {
     }
 }
 
-impl Codec {
-    /// Encode one converted surface into `out` (Annex B); returns whether
-    /// it is a keyframe. With `force_keyframe` the encoder starts a new GOP
-    /// with an IDR, SPS and PPS included.
-    pub fn encode(
-        &mut self,
-        frame: Surface,
-        pts_us: i64,
-        force_keyframe: bool,
-        out: &mut Vec<u8>,
-    ) -> anyhow::Result<bool> {
-        let mut keyframe = false;
-        // SAFETY: frame came from Surfaces::next_surface and is consumed here.
-        unsafe {
-            (*frame.0).pts = pts_us;
-            (*frame.0).pict_type = match force_keyframe {
-                true => ff::AVPictureType::AV_PICTURE_TYPE_I,
-                false => ff::AVPictureType::AV_PICTURE_TYPE_NONE,
-            };
-            let ret = ff::avcodec_send_frame(self.ctx, frame.0);
-            drop(frame);
-            check(ret, "send frame")?;
-            loop {
-                let ret = ff::avcodec_receive_packet(self.ctx, self.packet);
-                if ret == AVERROR_EAGAIN {
-                    break;
-                }
-                check(ret, "receive packet")?;
-                let p = &*self.packet;
-                out.extend_from_slice(std::slice::from_raw_parts(p.data, p.size as usize));
-                keyframe |= p.flags & ff::AV_PKT_FLAG_KEY != 0;
-                ff::av_packet_unref(self.packet);
-            }
-        }
-        Ok(keyframe)
-    }
-}
-
-impl Drop for Codec {
-    fn drop(&mut self) {
-        // SAFETY: each pointer is null or owned by us.
-        unsafe {
-            ff::av_packet_free(&mut self.packet);
-            ff::avcodec_free_context(&mut self.ctx);
-        }
-    }
-}

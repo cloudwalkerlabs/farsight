@@ -16,6 +16,7 @@
 # Needs: cargo build --release -p farsight-server -p farsight-desktop
 #        (cd tools/m1/wltool && cargo build --release)
 #        labwc, es2gears_wayland, alacritty, python3 with Pillow (input only)
+# CLIENT_ARGS and SERVER_ARGS are passed on, e.g. CLIENT_ARGS="--codec h264".
 set -e
 OUT=$(mkdir -p "$1" && cd "$1" && pwd); SCENARIO=${2:-gears}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -58,13 +59,13 @@ case $SCENARIO in
 esac
 
 rm -f "$OUT/ctl"; mkfifo "$OUT/ctl"
-env -u DISPLAY RUST_LOG=info,smithay=warn setsid "$BIN/farsight-server" --port $PORT \
+env -u DISPLAY RUST_LOG=info,smithay=warn setsid "$BIN/farsight-server" --port $PORT $SERVER_ARGS \
 	--identity "$OUT/identity" --rate $RATE -- labwc -C "$OUT/cfg" -s "$APP" \
 	> "$OUT/server.log" 2>&1 < "$OUT/ctl" &
 pids+=($!)
 exec 7>"$OUT/ctl"
 sleep 2
-env -u DISPLAY WAYLAND_DISPLAY=$OUTER setsid "$BIN/farsight-desktop" 127.0.0.1:$PORT --size 1600x900 \
+env -u DISPLAY WAYLAND_DISPLAY=$OUTER setsid "$BIN/farsight-desktop" 127.0.0.1:$PORT --size 1600x900 $CLIENT_ARGS \
 	> "$OUT/client.log" 2>&1 < /dev/null &
 pids+=($!)
 sleep 3

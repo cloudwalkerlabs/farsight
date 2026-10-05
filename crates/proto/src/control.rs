@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{Codec, DecoderCaps};
+use crate::codec::{DecoderCaps, Encoding, Format, Mode};
 use crate::layout::Layout;
 
 /// The largest control message accepted, in bytes. A 256×256 cursor image
@@ -15,21 +15,34 @@ pub const MAX_MESSAGE: usize = 1 << 20;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
     Hello(Hello),
-    /// The window changed size or scale (§5).
+    /// The window changed size or scale (§5). The server answers with an
+    /// `Epoch` once a frame at the new layout is ready.
     SetLayout(Layout),
     /// The decoder lost its reference: a frame was lost or damaged.
     RequestKeyframe,
+    /// The user switched between text and motion (§3); the server may pick
+    /// another format.
+    SetMode(Mode),
+    /// The decoder for this format failed and can't be used again. The
+    /// server moves on to the next format.
+    DecoderFailed(Format),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub decoders: Vec<DecoderCaps>,
     pub layout: Layout,
+    pub mode: Mode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
     Welcome(Welcome),
+    /// A new video epoch starts (§5): every frame tagged with this epoch is
+    /// in this encoding and layout, starting with a keyframe (for video) or
+    /// with the whole screen (for tiles). Sent before the
+    /// epoch's first frame, but datagrams can overtake it.
+    Epoch(Epoch),
     /// A cursor image, sent once per id before any `Cursor` names it.
     CursorImage(CursorImage),
     Cursor(CursorShape),
@@ -37,8 +50,19 @@ pub enum ServerMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Welcome {
-    pub codec: Codec,
-    /// The layout in effect, which may differ from the one asked for.
+    /// Every encoding both ends support, best first, ending with tiles.
+    /// The stream starts in the first; the rest are the fallback order
+    /// (§3).
+    pub encodings: Vec<Encoding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Epoch {
+    pub epoch: u16,
+    pub encoding: Encoding,
+    /// The layout in effect, which may differ from the one asked for: the
+    /// server keeps sizes even and within the format's limits. The client
+    /// scales the picture only then.
     pub layout: Layout,
 }
 
@@ -50,6 +74,9 @@ pub struct CursorImage {
     pub height: u32,
     /// The hotspot, in image pixels.
     pub hotspot: (i32, i32),
+    /// Image pixels per output pixel, in 1/120 steps: 240 for an image
+    /// drawn at twice the output's density.
+    pub scale_120: u32,
     /// Premultiplied ARGB8888, little-endian (B, G, R, A in memory), rows
     /// packed.
     pub pixels: Vec<u8>,
@@ -109,21 +136,20 @@ pub fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::Chroma;
+    use crate::codec::{Chroma, Codec};
 
     #[test]
     fn framed_round_trip() {
         let msg = ClientMessage::Hello(Hello {
             decoders: vec![DecoderCaps {
-                codec: Codec::H264,
-                chroma: Chroma::Yuv420,
-                bit_depth: 8,
+                format: Format { codec: Codec::H264, chroma: Chroma::Yuv420, bit_depth: 8 },
                 max_width: 4096,
                 max_height: 4096,
                 hardware: true,
                 partial_decode: false,
             }],
             layout: Layout { width_px: 1920, height_px: 1080, scale_120: 120, refresh_mhz: 60_000 },
+            mode: Mode::Text,
         });
         let bytes = encode_framed(&msg);
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::Parser;
 use farsight_client::{Client, Config, Event, VideoFrame};
-use farsight_proto::codec::{Chroma, Codec, DecoderCaps};
+use farsight_proto::codec::{Encoding, Format, Mode};
 use farsight_proto::control::{CursorImage, CursorShape};
 use farsight_proto::input::InputEvent;
 use farsight_proto::layout::{Layout, SCALE_DENOMINATOR};
@@ -54,6 +54,27 @@ struct Args {
     /// Decode in software even if VA-API is available.
     #[arg(long)]
     software: bool,
+    /// What matters most: `text` (sharp text, 4:4:4 where it can) or
+    /// `motion`.
+    #[arg(long, default_value = "text", value_parser = parse_mode)]
+    mode: Mode,
+    /// Offer only these formats, e.g. `hevc,h264:444`.
+    #[arg(long, value_delimiter = ',')]
+    codec: Vec<String>,
+}
+
+fn parse_mode(s: &str) -> Result<Mode, String> {
+    match s {
+        "text" => Ok(Mode::Text),
+        "motion" => Ok(Mode::Motion),
+        _ => Err("expected text or motion".into()),
+    }
+}
+
+/// `h264` is short for `h264:420`.
+fn format_matches(format: Format, name: &str) -> bool {
+    let full = format.to_string();
+    full == name || full.strip_suffix(":420") == Some(name)
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -208,39 +229,33 @@ impl App {
             scale_120: (gfx.window.scale_factor() * SCALE_DENOMINATOR as f64).round() as u32,
             refresh_mhz: gfx.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000),
         };
-        let (decode_tx, decode_rx) = mpsc::channel::<VideoFrame>();
-        let decoder = match Decoder::new(!self.args.software) {
-            Ok(d) => d,
-            Err(err) => {
-                let _ = self.proxy.send_event(UserEvent::Failed(format!("{err:#}")));
-                return;
-            }
-        };
-        let decoders = vec![DecoderCaps {
-            codec: Codec::H264,
-            chroma: Chroma::Yuv420,
-            bit_depth: 8,
-            max_width: 4096,
-            max_height: 4096,
-            hardware: decoder.hardware,
-            partial_decode: false,
-        }];
+        let (decode_tx, decode_rx) = mpsc::channel::<ToDecoder>();
+        let mut decoders = decode::offered(!self.args.software);
+        if !self.args.codec.is_empty() {
+            decoders.retain(|d| self.args.codec.iter().any(|c| format_matches(d.format, c)));
+        }
+        for d in &decoders {
+            tracing::info!(format = %d.format, hardware = d.hardware, max = ?(d.max_width, d.max_height), "decoder available");
+        }
         {
-            let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
+            let (proxy, cell, hardware) = (self.proxy.clone(), self.client_cell.clone(), !self.args.software);
             let thread = std::thread::Builder::new()
                 .name("farsight-decode".into())
-                .spawn(move || decode_thread(decoder, decode_rx, proxy, cell))
+                .spawn(move || decode_thread(hardware, decode_rx, proxy, cell))
                 .expect("spawning the decode thread");
             self.decode_thread = Some(thread);
         }
-        let cfg = Config { addr: self.addr, layout, decoders };
+        let cfg = Config { addr: self.addr, layout, decoders, mode: self.args.mode };
         let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
         let events = self.proxy.clone();
         tracing::info!(?layout, "connecting");
         self.runtime.spawn(async move {
             let on_event = move |event| match event {
                 Event::Frame(f) => {
-                    let _ = decode_tx.send(f);
+                    let _ = decode_tx.send(ToDecoder::Frame(f));
+                }
+                Event::Epoch(e) => {
+                    let _ = decode_tx.send(ToDecoder::Epoch(e.epoch, e.encoding));
                 }
                 Event::Connected { .. } => {}
                 other => {
@@ -436,14 +451,56 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// From the connection to the decode thread, in order.
+enum ToDecoder {
+    Epoch(u16, Encoding),
+    Frame(VideoFrame),
+}
+
 fn decode_thread(
-    mut decoder: Decoder,
-    rx: mpsc::Receiver<VideoFrame>,
+    hardware: bool,
+    rx: mpsc::Receiver<ToDecoder>,
     proxy: EventLoopProxy<UserEvent>,
     client: Arc<OnceLock<Arc<Client>>>,
 ) {
-    for frame in rx {
-        match decoder.decode(&frame.data) {
+    // The decoder for the current epoch's format, kept across epochs that
+    // only change size.
+    let mut decoder: Option<(Format, Decoder)> = None;
+    let mut current = None;
+    for msg in rx {
+        let frame = match msg {
+            ToDecoder::Epoch(epoch, encoding) => {
+                tracing::info!(epoch, %encoding, "new epoch");
+                current = match encoding {
+                    Encoding::Video(f) => Some(f),
+                    Encoding::Tiles => None,
+                };
+                continue;
+            }
+            ToDecoder::Frame(f) => f,
+        };
+        let Some(format) = current else { continue };
+        if decoder.as_ref().is_none_or(|(f, _)| *f != format) {
+            // Close the old one first: one VA context at a time.
+            decoder = None;
+            match Decoder::new(format, hardware).or_else(|err| {
+                tracing::warn!("{err:#}; trying software");
+                Decoder::new(format, false)
+            }) {
+                Ok(d) => decoder = Some((format, d)),
+                Err(err) => {
+                    tracing::warn!("{err:#}");
+                    if let Some(c) = client.get() {
+                        c.decoder_failed(format);
+                    }
+                    // Nothing more to do until the next epoch.
+                    current = None;
+                    continue;
+                }
+            }
+        }
+        let (_, d) = decoder.as_mut().unwrap();
+        match d.decode(&frame.data) {
             Ok(Some(picture)) => {
                 let decoded_us = client.get().map_or(0, |c| c.now_us());
                 let d = Decoded { picture, header: frame.header, complete_us: frame.complete_us, decoded_us };

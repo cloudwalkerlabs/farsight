@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use farsight_net::packetize::{EncodedFrame, Packetizer, Reassembler};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{endpoint, stream};
-use farsight_proto::codec::Codec;
+use farsight_proto::codec::{Chroma, Codec, Encoding, Format, Mode};
+
+const H264: Format = Format { codec: Codec::H264, chroma: Chroma::Yuv420, bit_depth: 8 };
 use farsight_proto::control::{ClientMessage, Hello, ServerMessage, Welcome};
 use farsight_proto::datagram::{Datagram, Ping, Pong};
 use farsight_proto::layout::Layout;
@@ -28,7 +30,7 @@ async fn frame_and_control_over_loopback() {
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
         let Some(ClientMessage::Hello(hello)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
         assert_eq!(hello.layout, LAYOUT);
-        stream::send(&mut send, &ServerMessage::Welcome(Welcome { codec: Codec::H264, layout: hello.layout }))
+        stream::send(&mut send, &ServerMessage::Welcome(Welcome { encodings: vec![Encoding::Video(H264)] }))
             .await
             .unwrap();
         let max = conn.max_datagram_size().unwrap();
@@ -43,9 +45,9 @@ async fn frame_and_control_over_loopback() {
     let (conn, fp) = endpoint::connect(&client, SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await.unwrap();
     assert_eq!(fp, fingerprint);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    stream::send(&mut send, &ClientMessage::Hello(Hello { decoders: vec![], layout: LAYOUT })).await.unwrap();
+    stream::send(&mut send, &ClientMessage::Hello(Hello { decoders: vec![], layout: LAYOUT, mode: Mode::Text })).await.unwrap();
     let Some(ServerMessage::Welcome(w)) = stream::recv(&mut recv).await.unwrap() else { panic!() };
-    assert_eq!(w.codec, Codec::H264);
+    assert_eq!(w.encodings, [Encoding::Video(H264)]);
 
     let mut rx = Reassembler::new(1_000_000);
     let frame = loop {

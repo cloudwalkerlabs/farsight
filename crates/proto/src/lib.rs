@@ -9,7 +9,7 @@ pub mod layout;
 pub mod video;
 
 /// ALPN token for the QUIC connection. Bumped on incompatible changes.
-pub const ALPN: &[u8] = b"farsight/0";
+pub const ALPN: &[u8] = b"farsight/1";
 
 /// UDP port the server listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7740;

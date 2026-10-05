@@ -29,7 +29,19 @@ impl Layout {
             self.height_px * SCALE_DENOMINATOR / s,
         )
     }
+
+    /// The layout the server can apply: each side even (4:2:0 can't crop
+    /// to an odd size), at least [`MIN_SIZE`] and within `max`. A side
+    /// over the limit is clamped on its own; the client scales the picture
+    /// to fit its window.
+    pub fn constrained(self, max: (u32, u32)) -> Self {
+        let side = |v: u32, max: u32| (v.clamp(MIN_SIZE, max.max(MIN_SIZE))) & !1;
+        Self { width_px: side(self.width_px, max.0), height_px: side(self.height_px, max.1), ..self }
+    }
 }
+
+/// The smallest side the server applies.
+pub const MIN_SIZE: u32 = 64;
 
 #[cfg(test)]
 mod tests {
@@ -44,5 +56,16 @@ mod tests {
             refresh_mhz: 60_000,
         };
         assert_eq!(layout.logical_size(), (1920, 1200));
+    }
+
+    #[test]
+    fn constrained_is_even_and_within_limits() {
+        let l = Layout { width_px: 1601, height_px: 9001, scale_120: 150, refresh_mhz: 60_000 };
+        let c = l.constrained((4096, 4096));
+        assert_eq!((c.width_px, c.height_px, c.scale_120), (1600, 4096, 150));
+        let c = l.constrained((4095, 2160));
+        assert_eq!((c.width_px, c.height_px), (1600, 2160));
+        let tiny = Layout { width_px: 3, height_px: 0, ..l }.constrained((4096, 4096));
+        assert_eq!((tiny.width_px, tiny.height_px), (MIN_SIZE, MIN_SIZE));
     }
 }

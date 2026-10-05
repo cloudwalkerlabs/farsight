@@ -1,11 +1,16 @@
-//! Per-frame work (docs/design.md §2, steps 1–5): nested buffer → RGB→NV12
+//! Per-frame work (docs/design.md §2, steps 1–5): nested buffer → RGB→YUV
 //! shader passes on the main thread → encoder on the encode thread → the
 //! network, and optionally a file.
 //!
-//! The main thread only submits the conversion. The encode thread waits for
-//! its fence, encodes and hands the packet on, so the event loop is free for
-//! the nested compositor's next frame. Frame callbacks go out as soon as the
-//! conversion is submitted, but no faster than the client's refresh rate.
+//! The main thread only submits the conversion (or, for encoders that take
+//! memory, reads it back). The encode thread waits for its fence, encodes
+//! and hands the packet on, so the event loop is free for the nested
+//! compositor's next frame. Frame callbacks go out as soon as the conversion
+//! is submitted, but no faster than the client's refresh rate.
+//!
+//! Each encoder lives for one video epoch: one size and one format. A new
+//! size, or a new format from negotiation (§3), starts a new epoch, which
+//! the client hears about in an `Epoch` message before its first frame.
 
 use std::fs::File;
 use std::io::Write;
@@ -15,58 +20,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use smithay::backend::allocator::{Buffer as _, Fourcc};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::{import_surface, with_renderer_surface_state};
-use smithay::backend::renderer::{Bind, ExportMem, Frame, Renderer, Texture};
+use smithay::backend::renderer::{ExportMem, Renderer, Texture};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Clock, Monotonic, Rectangle, Transform};
+use smithay::utils::{Clock, Monotonic, Rectangle};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::presentation::{PresentationFeedbackCachedState, Refresh};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::encode::{Codec, Surface, Surfaces};
+use farsight_proto::codec::{Choice, Encoding, Format, Mode};
+use farsight_proto::control::{Epoch, ServerMessage};
+
+use crate::encode::{self, Encoder, EncoderInfo, FrameKind, Frames, Input, Settings, Shaders};
 use crate::host::Host;
 use crate::net::{self, ConnId, ToNet};
-
-const SHADER_HEAD: &str = r#"#version 100
-//_DEFINES_
-#if defined(EXTERNAL)
-#extension GL_OES_EGL_image_external : require
-#endif
-precision highp float;
-#if defined(EXTERNAL)
-uniform samplerExternalOES tex;
-#else
-uniform sampler2D tex;
-#endif
-uniform float alpha;
-varying vec2 v_coords;
-"#;
-
-// BT.709, limited range.
-const LUMA_MAIN: &str = r#"
-void main() {
-    vec3 rgb = texture2D(tex, v_coords).rgb;
-    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-    gl_FragColor = vec4(16.0 / 255.0 + y * 219.0 / 255.0, 0.0, 0.0, 1.0);
-}
-"#;
-
-// Rendered at half size: bilinear sampling at the centre of each 2×2 block
-// averages it.
-const CHROMA_MAIN: &str = r#"
-void main() {
-    vec3 rgb = texture2D(tex, v_coords).rgb;
-    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-    float cb = (rgb.b - y) / 1.8556;
-    float cr = (rgb.r - y) / 1.5748;
-    gl_FragColor = vec4(0.5 + cb * 224.0 / 255.0, 0.5 + cr * 224.0 / 255.0, 0.0, 1.0);
-}
-"#;
 
 /// Frames waiting for the encode thread. Beyond this the newest is dropped
 /// before encoding, which costs nothing: each frame is a whole picture.
@@ -82,14 +54,19 @@ pub struct Options {
 
 pub struct Pipeline {
     opts: Options,
-    luma: Option<GlesTexProgram>,
-    chroma: Option<GlesTexProgram>,
-    surfaces: Option<Surfaces>,
+    /// What this machine can encode, best backend first.
+    encoders: Vec<EncoderInfo>,
+    /// The formats the client and we share, best first (§3). The first one
+    /// that fits the picture is used.
+    choices: Vec<Choice>,
+    shaders: Option<Shaders>,
+    /// This epoch's conversion, and its format.
+    frames: Option<(Frames, Format)>,
     /// To the encode thread; `None` only while shutting down.
     jobs: Option<SyncSender<Job>>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
     last_buffer: Option<(Fourcc, u64, (i32, i32))>,
-    frames: u64,
+    frame_count: u64,
     epoch: u16,
     /// The client frames go to. With none (and no `--out`), nothing is
     /// converted or encoded.
@@ -104,12 +81,12 @@ pub struct Pipeline {
 
 enum Job {
     /// A new epoch: frames after this use this encoder.
-    Start(Codec),
+    Start(Encoder),
     Encode(EncodeJob),
 }
 
 struct EncodeJob {
-    surface: Surface,
+    input: Input,
     sync: SyncPoint,
     client: Option<ConnId>,
     force_keyframe: bool,
@@ -123,7 +100,14 @@ struct EncodeJob {
 }
 
 impl Pipeline {
-    pub fn new(opts: Options, start: Instant, net: UnboundedSender<ToNet>) -> anyhow::Result<Self> {
+    pub fn new(
+        opts: Options,
+        encoders: Vec<EncoderInfo>,
+        start: Instant,
+        net: UnboundedSender<ToNet>,
+    ) -> anyhow::Result<Self> {
+        // With no client, `--out` gets the best encoder.
+        let choices = if encoders.is_empty() { Vec::new() } else { vec![choice(&encoders, 0)] };
         let out = match &opts.out {
             Some(p) => Some(File::create(p).with_context(|| format!("creating {}", p.display()))?),
             None => None,
@@ -134,13 +118,14 @@ impl Pipeline {
             .spawn(move || encode_thread(rx, out, start, net))?;
         Ok(Self {
             opts,
-            luma: None,
-            chroma: None,
-            surfaces: None,
+            encoders,
+            choices,
+            shaders: None,
+            frames: None,
             jobs: Some(jobs),
             encode_thread: Some(thread),
             last_buffer: None,
-            frames: 0,
+            frame_count: 0,
             epoch: 0,
             client: None,
             force_keyframe: false,
@@ -155,6 +140,36 @@ impl Pipeline {
     pub fn set_client(&mut self, client: Option<ConnId>) {
         self.client = client;
         self.force_keyframe = true;
+    }
+
+    pub fn encoders(&self) -> &[EncoderInfo] {
+        &self.encoders
+    }
+
+    /// The formats a new client shares with us, best first. The next frame
+    /// starts a new epoch in the first that fits.
+    pub fn set_choices(&mut self, choices: Vec<Choice>) {
+        self.choices = choices;
+        self.frames = None;
+    }
+
+    pub fn choices(&self) -> &[Choice] {
+        &self.choices
+    }
+
+    /// The client can't decode `format` any more; move on to the next.
+    /// Returns false if nothing is left.
+    pub fn drop_format(&mut self, format: Format) -> bool {
+        self.choices.retain(|c| c.format != format);
+        if self.frames.as_ref().is_some_and(|(_, f)| *f == format) {
+            self.frames = None;
+        }
+        !self.choices.is_empty()
+    }
+
+    /// The largest picture the first format allows.
+    pub fn max_size(&self) -> (u32, u32) {
+        self.choices.first().map_or((4096, 4096), |c| (c.max_width, c.max_height))
     }
 
     fn encoding(&self) -> bool {
@@ -253,61 +268,84 @@ fn log_buffer_change(host: &mut Host, surface: &WlSurface) {
     }
 }
 
+/// The ranked formats from client `decoders` and the `mode` it wants.
+pub fn negotiate(encoders: &[EncoderInfo], decoders: &[farsight_proto::codec::DecoderCaps], mode: Mode) -> Vec<Choice> {
+    let caps: Vec<_> = encoders.iter().map(|e| e.caps.clone()).collect();
+    farsight_proto::codec::rank(&caps, decoders, mode)
+}
+
+/// Encoder `i` as a choice of its own, for when there is no client.
+fn choice(encoders: &[EncoderInfo], i: usize) -> Choice {
+    let c = &encoders[i].caps;
+    Choice { format: c.format, max_width: c.max_width, max_height: c.max_height, encoder: i, hardware: c.hardware as u8 }
+}
+
+/// Starts a new epoch at `w`×`h`: opens the first format that fits and
+/// opens, and tells the client.
+fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
+    let layout = farsight_proto::layout::Layout { width_px: w as u32, height_px: h as u32, ..host.wire_layout() };
+    let p = &mut host.pipeline;
+    p.frames = None;
+    let fits: Vec<Choice> = p.choices.iter().copied().filter(|c| c.fits(w as u32, h as u32)).collect();
+    let mut opened = None;
+    for c in fits.iter().chain(p.choices.first()) {
+        let info = &p.encoders[c.encoder];
+        match encode::open(info, &p.opts.render_node, &mut host.renderer, w, h, &Settings { qp: p.opts.qp }) {
+            Ok(pair) => {
+                opened = Some((pair, c.format));
+                break;
+            }
+            Err(err) => tracing::warn!(format = %c.format, backend = ?info.backend, "{err:#}; trying the next format"),
+        }
+    }
+    let Some(((frames, encoder), format)) = opened else {
+        anyhow::bail!("no encoder opens at {w}x{h}");
+    };
+    // The encode thread takes it in order, after the old epoch's frames.
+    let jobs = p.jobs.as_ref().expect("pipeline running");
+    jobs.send(Job::Start(encoder)).map_err(|_| anyhow::anyhow!("encode thread gone"))?;
+    p.frames = Some((frames, format));
+    p.epoch = p.epoch.wrapping_add(1);
+    p.force_keyframe = true;
+    tracing::info!(epoch = p.epoch, w, h, %format, "new video epoch");
+    if let Some(client) = p.client {
+        let epoch = Epoch { epoch: p.epoch, encoding: Encoding::Video(format), layout };
+        let _ = host.net.send(ToNet::Message(client, ServerMessage::Epoch(epoch)));
+    }
+    Ok(())
+}
+
 fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> anyhow::Result<()> {
     let size = texture.size();
     let (w, h) = (size.w, size.h);
     let start = host.start;
     let now = || start.elapsed().as_micros() as u64;
-    let p = &mut host.pipeline;
 
-    if p.luma.is_none() {
-        p.luma = Some(host.renderer.compile_custom_texture_shader(format!("{SHADER_HEAD}{LUMA_MAIN}"), &[])?);
-        p.chroma = Some(host.renderer.compile_custom_texture_shader(format!("{SHADER_HEAD}{CHROMA_MAIN}"), &[])?);
+    if host.pipeline.shaders.is_none() {
+        host.pipeline.shaders = Some(Shaders::compile(&mut host.renderer)?);
     }
-    if p.surfaces.as_ref().is_none_or(|s| (s.width, s.height) != (w, h)) {
+    if host.pipeline.frames.as_ref().is_none_or(|(f, _)| f.size() != (w, h)) {
         // A new size is a new video epoch (§5).
-        p.surfaces = None;
-        let (surfaces, codec) = Surfaces::new(&p.opts.render_node, w, h, p.opts.qp)?;
-        p.surfaces = Some(surfaces);
-        // The encode thread takes it in order, after the old epoch's frames.
-        let jobs = p.jobs.as_ref().expect("pipeline running");
-        jobs.send(Job::Start(codec)).map_err(|_| anyhow::anyhow!("encode thread gone"))?;
-        p.epoch = p.epoch.wrapping_add(1);
-        p.force_keyframe = true;
-        tracing::info!(epoch = p.epoch, w, h, "new video epoch");
+        new_epoch(host, w, h)?;
     }
 
     let t_start = now();
-    let probe = if p.opts.probe { read_probe(&mut host.renderer, texture)? } else { None };
+    let probe = if host.pipeline.opts.probe { read_probe(&mut host.renderer, texture)? } else { None };
     let t_probe = now();
 
-    let (surface, mut target) = p.surfaces.as_mut().unwrap().next_surface()?;
-    let t_surface = now();
-
-    let luma_prog = p.luma.clone().unwrap();
-    let chroma_prog = p.chroma.clone().unwrap();
-    let src = Rectangle::from_size(size.to_f64());
-    let mut sync = SyncPoint::signaled();
-    for (dmabuf, prog, (tw, th)) in [
-        (&mut target.luma, &luma_prog, (w, h)),
-        (&mut target.chroma, &chroma_prog, ((w + 1) / 2, (h + 1) / 2)),
-    ] {
-        let mut fb = host.renderer.bind(dmabuf)?;
-        let dst = Rectangle::from_size((tw, th).into());
-        let mut frame = host.renderer.render(&mut fb, (tw, th).into(), Transform::Normal)?;
-        frame.render_texture_from_to(texture, src, dst, &[dst], &[dst], Transform::Normal, 1.0, Some(prog), &[])?;
-        sync = frame.finish()?;
-    }
-
     let p = &mut host.pipeline;
-    p.frames += 1;
+    let (frames, _) = p.frames.as_mut().unwrap();
+    let t_surface = now();
+    let (input, sync) = frames.convert(&mut host.renderer, p.shaders.as_ref().unwrap(), texture)?;
+
+    p.frame_count += 1;
     let job = EncodeJob {
-        surface,
+        input,
         sync,
         client: p.client,
         force_keyframe: p.force_keyframe,
         epoch: p.epoch,
-        n: p.frames,
+        n: p.frame_count,
         probe,
         t_commit,
         t_start,
@@ -382,7 +420,8 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
         let _ = job.sync.wait();
         let t_converted = now();
         packet.clear();
-        let keyframe = match codec.encode(job.surface, job.t_commit as i64, job.force_keyframe, &mut packet) {
+        let kind = if job.force_keyframe { FrameKind::Keyframe } else { FrameKind::Normal };
+        let keyframe = match codec.encode(job.input, job.t_commit as i64, kind, &mut packet) {
             Ok(k) => k,
             Err(err) => {
                 tracing::error!("{err:#}");

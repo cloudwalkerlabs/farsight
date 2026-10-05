@@ -885,6 +885,7 @@ dependencies = [
  "farsight-client",
  "farsight-net",
  "farsight-proto",
+ "farsight-va",
  "ffmpeg-sys-next",
  "glow",
  "glutin",
@@ -930,6 +931,7 @@ dependencies = [
  "clap",
  "farsight-net",
  "farsight-proto",
+ "farsight-va",
  "ffmpeg-sys-next",
  "libc",
  "smithay",
@@ -946,6 +948,15 @@ name = "farsight-uniffi-bindgen"
 version = "0.1.0"
 dependencies = [
  "uniffi",
+]
+
+[[package]]
+name = "farsight-va"
+version = "0.1.0"
+dependencies = [
+ "farsight-proto",
+ "libc",
+ "tracing",
 ]
 
 [[package]]

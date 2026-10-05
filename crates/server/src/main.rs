@@ -5,10 +5,10 @@
 //! compositor in it, and serves clients on one port. Clients that disconnect
 //! can reconnect to the same session. See `docs/design.md` §6.
 //!
-//! Current state: M1. The host compositor runs the desktop nested, encodes
-//! it with VA-API and streams it to one client at a time, which sends input
-//! back. The session's isolation (§6) comes in M3. Commands on stdin drive
-//! experiments (see `control`).
+//! Current state: M2. The host compositor runs the desktop nested, encodes
+//! it in the format negotiated with the client (§3) and streams it to one
+//! client at a time, which sends input back. The session's isolation (§6)
+//! comes in M3. Commands on stdin drive experiments (see `control`).
 
 mod cursor;
 mod encode;
@@ -36,7 +36,7 @@ use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing_subscriber::EnvFilter;
 
-use farsight_proto::codec::Codec;
+use farsight_proto::codec::Encoding;
 use farsight_proto::control::{ClientMessage, ServerMessage, Welcome};
 use farsight_proto::input::InputEvent;
 use host::{ClientState, Host, Layout};
@@ -71,6 +71,9 @@ struct Args {
     /// Constant QP for the encoder.
     #[arg(long, default_value_t = 24)]
     qp: u32,
+    /// Hardware encoder backends to offer, best first: vaapi.
+    #[arg(long, value_delimiter = ',', default_values_t = ["vaapi".to_string()])]
+    encoders: Vec<String>,
     /// Read the probe client's frame number from each frame (spike).
     #[arg(long)]
     probe: bool,
@@ -108,8 +111,22 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let gpu = gpu::open(&args.render_node)?;
+    let backends = args
+        .encoders
+        .iter()
+        .map(|b| b.parse::<encode::Backend>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
+    let encoders = encode::probe(&args.render_node, &backends);
+    for e in &encoders {
+        tracing::info!(
+            format = %e.caps.format, backend = ?e.backend, max = ?(e.caps.max_width, e.caps.max_height),
+            "encoder available"
+        );
+    }
     let pipeline = pipeline::Pipeline::new(
         pipeline::Options { render_node: args.render_node.clone(), out: args.out.clone(), qp: args.qp, probe: args.probe },
+        encoders,
         start,
         net.clone(),
     )?;
@@ -190,31 +207,22 @@ fn on_net(host: &mut Host, msg: ToHost) {
             if host.client.is_some() {
                 input::release_all(host);
             }
+            let choices = pipeline::negotiate(host.pipeline.encoders(), &hello.decoders, hello.mode);
+            if choices.is_empty() {
+                tracing::warn!(id, decoders = ?hello.decoders, "no video format in common");
+                let _ = host.net.send(net::ToNet::Close(id, "no video format in common".into()));
+                return;
+            }
+            tracing::info!(id, mode = ?hello.mode, formats = ?choices.iter().map(|c| c.format.to_string()).collect::<Vec<_>>(), "negotiated");
             host.client = Some(id);
             host.input = Default::default();
-            if !hello.decoders.iter().any(|d| d.codec == Codec::H264) {
-                tracing::warn!(id, "the client offers no H.264 decoder; sending H.264 anyway");
-            }
+            host.decoders = hello.decoders;
+            host.mode = hello.mode;
+            let encodings = choices.iter().map(|c| Encoding::Video(c.format)).collect();
+            host.pipeline.set_choices(choices);
+            let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(Welcome { encodings })));
             // Resizing mid-session is M2; the first layout is applied as is.
-            let l = hello.layout;
-            let layout = Layout {
-                width: l.width_px as i32,
-                height: l.height_px as i32,
-                scale: l.scale_120 as f64 / farsight_proto::layout::SCALE_DENOMINATOR as f64,
-                refresh_mhz: if l.refresh_mhz == 0 { 60_000 } else { l.refresh_mhz },
-            };
-            let resized = layout != host.layout && layout.width > 0 && layout.height > 0;
-            if resized {
-                tracing::info!(?layout, "applying the client's layout");
-                host.apply_output(layout);
-            }
-            let welcome = Welcome { codec: Codec::H264, layout: farsight_proto::layout::Layout {
-                width_px: host.layout.width as u32,
-                height_px: host.layout.height as u32,
-                scale_120: (host.layout.scale * farsight_proto::layout::SCALE_DENOMINATOR as f64).round() as u32,
-                refresh_mhz: host.layout.refresh_mhz,
-            } };
-            let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(welcome)));
+            let resized = set_layout(host, hello.layout);
             cursor::client_connected(host);
             host.pipeline.set_client(Some(id));
             // After a resize the desktop's next frame, at the new size, is the
@@ -229,6 +237,24 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 pipeline::refresh(host);
             }
             ClientMessage::SetLayout(layout) => tracing::info!(?layout, "SetLayout ignored until M2"),
+            ClientMessage::SetMode(mode) => {
+                host.mode = mode;
+                let choices = pipeline::negotiate(host.pipeline.encoders(), &host.decoders, mode);
+                tracing::info!(?mode, formats = ?choices.iter().map(|c| c.format.to_string()).collect::<Vec<_>>(), "mode changed");
+                if choices.first().map(|c| c.format) != host.pipeline.choices().first().map(|c| c.format) {
+                    host.pipeline.set_choices(choices);
+                    pipeline::refresh(host);
+                }
+            }
+            ClientMessage::DecoderFailed(format) => {
+                tracing::warn!(%format, "the client's decoder failed");
+                host.decoders.retain(|d| d.format != format);
+                if host.pipeline.drop_format(format) {
+                    pipeline::refresh(host);
+                } else {
+                    let _ = host.net.send(net::ToNet::Close(id, "no video format left".into()));
+                }
+            }
             ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
         },
         ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
@@ -240,6 +266,24 @@ fn on_net(host: &mut Host, msg: ToHost) {
         _ => {} // from a connection that has been taken over
     }
     let _ = host.display.flush_clients();
+}
+
+/// Applies the client's layout, within what the encoder allows. Returns
+/// whether the output changed.
+fn set_layout(host: &mut Host, l: farsight_proto::layout::Layout) -> bool {
+    let l = l.constrained(host.pipeline.max_size());
+    let layout = Layout {
+        width: l.width_px as i32,
+        height: l.height_px as i32,
+        scale: l.scale_120 as f64 / farsight_proto::layout::SCALE_DENOMINATOR as f64,
+        refresh_mhz: if l.refresh_mhz == 0 { 60_000 } else { l.refresh_mhz },
+    };
+    if layout == host.layout {
+        return false;
+    }
+    tracing::info!(?layout, "applying the client's layout");
+    host.apply_output(layout);
+    true
 }
 
 fn spawn_desktop(cmd: &[String], socket: &std::ffi::OsStr) -> anyhow::Result<Child> {

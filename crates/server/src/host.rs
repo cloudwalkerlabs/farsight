@@ -84,6 +84,10 @@ pub struct Host {
     /// The connected client, if any.
     pub client: Option<ConnId>,
     pub input: farsight_proto::input::InputReceiver,
+    /// What the client can decode and the mode it wants, for negotiating
+    /// again mid-session (§3).
+    pub decoders: Vec<farsight_proto::codec::DecoderCaps>,
+    pub mode: farsight_proto::codec::Mode,
     pub cursor: Cursor,
     pub net: tokio::sync::mpsc::UnboundedSender<ToNet>,
     /// labwc drops the configure that arrives before its output is enabled;
@@ -156,6 +160,8 @@ impl Host {
             running: true,
             client: None,
             input: Default::default(),
+            decoders: Vec::new(),
+            mode: Default::default(),
             cursor: Cursor::default(),
             net,
             initial_configure_repeated: false,
@@ -186,6 +192,16 @@ impl Host {
                     fs.set_preferred_scale(scale);
                 });
             });
+        }
+    }
+
+    /// The layout in effect, as the client sees it.
+    pub fn wire_layout(&self) -> farsight_proto::layout::Layout {
+        farsight_proto::layout::Layout {
+            width_px: self.layout.width as u32,
+            height_px: self.layout.height as u32,
+            scale_120: (self.layout.scale * farsight_proto::layout::SCALE_DENOMINATOR as f64).round() as u32,
+            refresh_mhz: self.layout.refresh_mhz,
         }
     }
 
