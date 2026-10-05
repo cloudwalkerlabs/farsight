@@ -142,6 +142,7 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
 | Parsec | Its own protocol on UDP (BUD); proof that a tuned protocol beats general-purpose ones |
 | RDP 10 | AVC444: 4:4:4 text clarity from 4:2:0 hardware codecs, using a main stream plus an auxiliary chroma stream; a display control channel that carries the monitor layout and `DesktopScaleFactor` |
 | gamescope | A host compositor with a whole compositor or game nested inside it, streaming the result |
+| TigerVNC / TurboVNC (Tight) | Per-rectangle encoding chosen by content: solid fills, palettes with zlib for text and UI, JPEG for photos; the fallback when there is no hardware encoder |
 | wado, Wolf, Selkies pixelflux | Zero-copy dmabuf → VA-API/NVENC with on-GPU RGB→NV12; a fallback ladder (zero-copy → readback → software); input on a channel that never queues behind video |
 
 ## Architecture
@@ -280,7 +281,9 @@ off.
      after suspend.
    - **Vulkan Video encode**: RADV and ANV now have H.264, H.265 and AV1.
      This could become the single cross-vendor path later.
-   - **Software fallback**: x264 or SVT-AV1 in low-delay mode.
+   - **No software video encoding.** x264 or SVT-AV1 would spend several
+     cores to save bandwidth, so video is only used with a hardware
+     encoder. Without one, the server sends tiles instead (below).
 5. Encoder settings:
    - no B-frames, an endless GOP, and VBV of about one frame;
    - slices, so the client can decode before the whole frame arrives;
@@ -291,6 +294,27 @@ off.
 7. **Text clarity, in order of preference:** HEVC RExt 4:4:4 where both
    ends support it; then an AVC444-style dual stream; then 4:2:0 with idle
    refinement.
+
+**Without a hardware encoder: tiles, as VNC's Tight does.** The nested
+compositor reports exact damage, so only what changed is sent:
+
+- The damaged region is cut into tiles of at most 64×64, read back from
+  the GPU after the conversion pass.
+- Each tile is classified on the CPU, as Tight does:
+  - **one colour**: a fill;
+  - **a few colours** (up to 16, as most text and UI is): a palette and
+    indices, zlib-compressed. This is lossless, so text stays sharp;
+  - **anything else**: TurboJPEG, 4:4:4 in text mode and 4:2:0 in motion
+    mode.
+- **Every tile stands alone:** no references between tiles or frames. A
+  lost datagram costs its tile and nothing more. The client asks for the
+  region again (`RequestRefresh`) rather than for a keyframe.
+- **Idle refinement** works as for video: once damage stops, lossy tiles
+  are sent again losslessly.
+- The client draws tiles into a persistent texture of the session's size,
+  and presents it once a frame's tiles are in.
+- Its cost scales with the damage, not the screen: typing touches a few
+  tiles, and a full-screen video is the worst case.
 
 **Packetization and loss:**
 
@@ -322,7 +346,9 @@ off.
   - hardware or software;
   - whether it supports slices and partial decode, and LTR/RFI;
   - a measured decode latency (the client runs a quick test decode).
-- The server intersects the two lists and ranks the matches:
+- The server intersects the two lists and ranks the matches. Only its
+  hardware encoders take part; tiles (§2) are the last entry, which every
+  client supports.
   1. Hardware on both ends.
   2. The mode the user asked for: "text" mode prefers 4:4:4, "motion" mode
      prefers efficiency.
@@ -620,7 +646,7 @@ sent directly, with relative pointer capture when the server asks for it.
 |---|---|---|
 | M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, datagram priority scheduler and video pacing (§1), VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured; input latency doesn't rise during keyframes. **Done over loopback** ([results](m1-results.md)): 10 ms from commit to the client's swap; a run between two machines is still to do. |
-| M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
+| M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles |
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |
