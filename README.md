@@ -69,8 +69,8 @@ cancelled, while an app in the session records from `farsight-mic`.
 The server encodes with VA-API or NVENC, and sends tiles without either;
 the client decodes with VA-API or in software. Both build against FFmpeg
 (the system's, or the small static one `tools/ffmpeg/build.sh` builds, as
-releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`), libjpeg-turbo
-and libopus; the server also needs dbus-daemon, PipeWire, WirePlumber and
+releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`), and build
+libjpeg-turbo and libopus in; the server also needs dbus-daemon, PipeWire, WirePlumber and
 pipewire-pulse, and labwc for the default desktop. To keep a session
 running permanently, install `dist/farsight-server@.service`; the file
 explains how.

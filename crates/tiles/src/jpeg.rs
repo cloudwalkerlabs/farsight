@@ -1,5 +1,5 @@
-//! The few TurboJPEG 3 calls tiles need. The system's library on Linux;
-//! elsewhere, the one turbojpeg-sys bundles and builds.
+//! The few TurboJPEG 3 calls tiles need, from the library turbojpeg-sys
+//! bundles and builds statically.
 
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 
@@ -7,10 +7,8 @@ use anyhow::bail;
 
 type Handle = *mut c_void;
 
-#[cfg(not(target_os = "linux"))]
 use turbojpeg_sys as _;
 
-#[cfg_attr(target_os = "linux", link(name = "turbojpeg"))]
 unsafe extern "C" {
     fn tj3Init(init_type: c_int) -> Handle;
     fn tj3Destroy(handle: Handle);

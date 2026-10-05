@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed base-devel git rustup clang cmake nasm meson ninja pkgconf \
-            libva libdrm libjpeg-turbo opus pipewire wayland libxkbcommon mesa libglvnd alsa-lib
+            libva libdrm pipewire wayland libxkbcommon mesa libglvnd alsa-lib
           rustup default stable
       - uses: actions/checkout@v5
       - id: ffmpeg
