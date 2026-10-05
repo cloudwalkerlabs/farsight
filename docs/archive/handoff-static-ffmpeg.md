@@ -19,6 +19,9 @@ What was built differs from the plan below in a few places:
 - Local builds without `PKG_CONFIG_PATH` still link the system's FFmpeg
   dynamically: the pkg-config crate only links statically from outside
   `/usr`.
+- ffmpeg-sys-next's rlib bundles the static FFmpeg it links, so after
+  rebuilding the prefix in place, `cargo clean -p ffmpeg-sys-next` (cargo
+  doesn't notice); CI keys its Rust cache on `tools/ffmpeg/build.sh`.
 - The binaries still link libva, libva-drm and libdrm at load time; making
   them optional is separate work.
 
