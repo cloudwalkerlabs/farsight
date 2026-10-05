@@ -20,6 +20,12 @@
 # Needs what tools/m3/audio.sh needs, plus iproute2's tc and the sch_netem
 # module. SERVER_ARGS, CLIENT_ARGS and SESSION_APP as for tools/m1/e2e.sh;
 # SERVER_LOG and CLIENT_LOG are their RUST_LOG.
+#
+# CHECK_FRAMES=1 checks that every picture the client decoded is exactly
+# what decoding the server's whole stream gives: the client decodes in
+# software and hashes each picture, and FFmpeg decodes the stream the
+# server wrote (--out). A frame decoded against a missing or wrong
+# reference doesn't match.
 set -e
 if [ -z "$FARSIGHT_NETNS" ]; then
 	exec unshare -rn env FARSIGHT_NETNS=1 "$0" "$@"
@@ -69,6 +75,11 @@ done
 [ -n "$OUTER" ] || { echo "the headless labwc did not start" >&2; exit 1; }
 
 APP=${SESSION_APP:-es2gears_wayland}
+if [ -n "$CHECK_FRAMES" ]; then
+	SERVER_ARGS="$SERVER_ARGS --out $OUT/stream.bin"
+	CLIENT_ARGS="$CLIENT_ARGS --software"
+	export FARSIGHT_FRAME_MD5=$OUT/client.md5
+fi
 mkdir -p "$OUT/server"; rm -f "$OUT/client/known_hosts"
 "$BIN/farsight-desktop" --config-dir "$OUT/client" --print-key > "$OUT/server/authorized_keys"
 rm -f "$OUT/ctl"; mkfifo "$OUT/ctl"
@@ -91,3 +102,25 @@ sleep 1
 echo "netem: $(cat "$OUT/netem.txt")"
 grep -o 'fps=.*' "$OUT/client.log" | sed 's/^/  video: /' || true
 grep -o 'audio: .*' "$OUT/client.log" | sed 's/^/  /' || true
+if [ -n "$CHECK_FRAMES" ]; then
+	codec=$(grep -o 'encoding=[a-z0-9]*' "$OUT/server.log" | tail -1 | cut -d= -f2)
+	ffmpeg -nostdin -y -loglevel fatal -f "$codec" -i "$OUT/stream.bin" -fps_mode passthrough -f framemd5 "$OUT/stream.md5"
+	python3 - "$OUT/stream.md5" "$OUT/client.md5" <<'PY'
+import sys
+from collections import Counter
+ref = [l.split(",")[-1].strip() for l in open(sys.argv[1]) if not l.startswith("#")]
+got = [(int(n), md5) for n, md5 in (l.split() for l in open(sys.argv[2]))]
+# The server's file holds the last epoch, which starts at some frame:
+# line up on the offset most frames agree on, and leave out frames of
+# earlier epochs.
+where = {}
+for i, md5 in enumerate(ref):
+    where.setdefault(md5, []).append(i)
+offsets = Counter(i - n for n, md5 in got for i in where.get(md5, []))
+off = offsets.most_common(1)[0][0] if offsets else 0
+got = [(n, md5) for n, md5 in got if n + off >= 0]
+bad = [n for n, md5 in got if n + off >= len(ref) or ref[n + off] != md5]
+print(f"  frames: {len(got) - len(bad)} of {len(got)} decoded exactly as the whole stream decodes"
+      + (f"; differ: {bad[:10]}" if bad else ""))
+PY
+fi

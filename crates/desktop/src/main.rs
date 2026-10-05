@@ -229,6 +229,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    decode::count_errors();
     let args = Args::parse();
     let config_dir = match &args.config_dir {
         Some(d) => d.clone(),
@@ -794,6 +795,9 @@ fn decode_thread(
     let mut current = None;
     let mut tiles: Option<farsight_tiles::Decoder> = None;
     let mut screen = (0, 0);
+    // Tests: each decoded picture's frame number and MD5, to check against
+    // a decode of the server's whole stream (tools/m4/netem.sh).
+    let mut md5_log = std::env::var_os("FARSIGHT_FRAME_MD5").and_then(|p| std::fs::File::create(p).ok());
     for msg in rx {
         let frame = match msg {
             ToDecoder::Epoch(epoch, encoding, size) => {
@@ -859,6 +863,10 @@ fn decode_thread(
         let (_, d) = decoder.as_mut().unwrap();
         match d.decode(&frame.data) {
             Ok(Some(picture)) => {
+                if let Some(f) = &mut md5_log {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{} {}", frame.header.frame, picture.md5());
+                }
                 let decoded_us = client.get().map_or(0, |c| c.now_us());
                 let d = Decoded {
                     content: Content::Picture(picture),

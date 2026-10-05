@@ -3,12 +3,12 @@
 //! quinn sends datagrams from one FIFO, so an input packet queued behind a
 //! keyframe would wait for all of it. Everything goes through here instead:
 //!
-//! - strict priority: input and ping > audio > video;
+//! - strict priority: input and ping > audio > repairs > video;
 //! - quinn's own buffer is only allowed to hold about one pacing interval of
 //!   video, and the rest waits in per-class queues;
-//! - video, keyframes included, is paced at a set rate (the congestion
-//!   controller's estimate, once there is one), so it never fills the
-//!   congestion window in one burst;
+//! - video, keyframes included, is paced at the congestion controller's
+//!   rate, so it never fills the congestion window in one burst; so are
+//!   repairs, shards sent again for a NACK, ahead of new video;
 //! - only the video queue drops: a keyframe supersedes the frames queued
 //!   before it, and a backlog beyond [`MAX_BACKLOG`] drops the oldest frames
 //!   that haven't started.
@@ -67,6 +67,7 @@ pub enum Next {
 pub struct Queues {
     input: VecDeque<Bytes>,
     audio: VecDeque<Bytes>,
+    repair: VecDeque<Bytes>,
     video: VecDeque<VideoFrame>,
     video_bytes: usize,
     rate_bps: u64,
@@ -81,6 +82,7 @@ impl Queues {
         let mut q = Self {
             input: VecDeque::new(),
             audio: VecDeque::new(),
+            repair: VecDeque::new(),
             video: VecDeque::new(),
             video_bytes: 0,
             rate_bps: 1,
@@ -109,6 +111,11 @@ impl Queues {
         }
     }
 
+    /// Queues shards sent again, ahead of new video.
+    pub fn push_repair(&mut self, datagrams: Vec<Bytes>) {
+        self.repair.extend(datagrams);
+    }
+
     /// Queues one video frame's datagrams, in order.
     pub fn push_frame(&mut self, fragments: Vec<Bytes>, keyframe: bool) {
         let bytes: usize = fragments.iter().map(Bytes::len).sum();
@@ -133,7 +140,8 @@ impl Queues {
         if let Some(d) = self.input.pop_front().or_else(|| self.audio.pop_front()) {
             return Next::Send(d);
         }
-        let Some(len) = self.video.front().map(|f| f.fragments.front().map_or(0, Bytes::len)) else {
+        let next = self.repair.front().or_else(|| self.video.front().and_then(|f| f.fragments.front()));
+        let Some(len) = next.map(Bytes::len) else {
             return Next::Idle;
         };
         if quinn_buffered + len > self.burst() {
@@ -145,6 +153,9 @@ impl Queues {
             return Next::WaitUntil(now + Duration::from_secs_f64(wait));
         }
         self.tokens -= len as f64;
+        if let Some(d) = self.repair.pop_front() {
+            return Next::Send(d);
+        }
         let frame = self.video.front_mut().unwrap();
         frame.started = true;
         let d = frame.fragments.pop_front().unwrap_or_default();
@@ -204,6 +215,11 @@ impl Scheduler {
 
     pub fn send(&self, priority: Priority, datagram: Bytes) {
         self.shared.queues.lock().unwrap().push(priority, datagram);
+        self.shared.wake.notify_one();
+    }
+
+    pub fn send_repair(&self, datagrams: Vec<Bytes>) {
+        self.shared.queues.lock().unwrap().push_repair(datagrams);
         self.shared.wake.notify_one();
     }
 
@@ -311,6 +327,15 @@ mod tests {
         // Input still goes.
         q.push(Priority::Input, d(b'i', 10));
         assert_eq!(q.next(t, q.burst()), Next::Send(d(b'i', 10)));
+    }
+
+    #[test]
+    fn repairs_go_ahead_of_video_at_its_pace() {
+        let t = Instant::now();
+        let mut q = Queues::new(9_600_000, t);
+        q.push_frame((0..10).map(|_| d(b'v', 1200)).collect(), false);
+        q.push_repair(vec![d(b'r', 1200), d(b'r', 1200)]);
+        assert_eq!(drain(&mut q, t), [b'r', b'r', b'v', b'v', b'v']);
     }
 
     #[test]

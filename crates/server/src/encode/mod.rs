@@ -291,9 +291,27 @@ impl Encoder {
         !matches!(self, Encoder::Tiles(_))
     }
 
-    /// Encodes `input`; video goes `qp_offset` above its QP (on H.264's
-    /// scale), to stay within the rate (`rate`).
-    pub fn encode(&mut self, input: Input, pts_us: i64, kind: FrameKind, qp_offset: u32) -> anyhow::Result<Output> {
+    /// Makes frames `from..=to` unusable as references, so the next frame
+    /// is predicted from `from - 1` (reference frame invalidation, §2).
+    /// False if this encoder can't: it no longer holds `from - 1`, or has
+    /// no RFI at all; then only a keyframe will do.
+    pub fn invalidate(&mut self, from: u32, to: u32) -> bool {
+        match self {
+            Encoder::Nvenc(c) => c.invalidate(from, to),
+            Encoder::Ffmpeg(_) | Encoder::Tiles(_) => false,
+        }
+    }
+
+    /// Encodes `input`, frame `number`; video goes `qp_offset` above its QP
+    /// (on H.264's scale), to stay within the rate (`rate`).
+    pub fn encode(
+        &mut self,
+        input: Input,
+        pts_us: i64,
+        number: u32,
+        kind: FrameKind,
+        qp_offset: u32,
+    ) -> anyhow::Result<Output> {
         match (self, input) {
             (Encoder::Ffmpeg(c), Input::Va(s)) => {
                 let mut data = Vec::new();
@@ -303,7 +321,7 @@ impl Encoder {
             }
             (Encoder::Nvenc(c), Input::Mem(f)) => {
                 let mut data = Vec::new();
-                let keyframe = c.encode(f, pts_us, kind, qp_offset, &mut data)?;
+                let keyframe = c.encode(f, number, kind, qp_offset, &mut data)?;
                 Ok(Output::Video { data, keyframe })
             }
             (Encoder::Tiles(t), Input::Tiles(d)) => Ok(Output::Tiles(t.encode(d)?)),

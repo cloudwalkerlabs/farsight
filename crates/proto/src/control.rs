@@ -29,8 +29,15 @@ pub enum ClientMessage {
     /// The window changed size or scale (§5). The server answers with an
     /// `Epoch` once a frame at the new layout is ready.
     SetLayout(Layout),
-    /// The decoder lost its reference: a frame was lost or damaged.
+    /// The decoder lost its state, as when it failed: send a keyframe.
     RequestKeyframe,
+    /// Reference frame invalidation (§2): frames after `good`, up to and
+    /// including `lost`, can't be decoded. The server encodes the next
+    /// frame from `good` if its encoder still holds it, and as a keyframe
+    /// if not. The client repeats it, with `lost` updated, until it can
+    /// decode again; one that names no frame after the last it answered is
+    /// a repeat, and is ignored.
+    Rfi { lost: u32, good: u32 },
     /// Tiles only: part of an update was lost; send these regions again.
     RequestRefresh(Vec<crate::tiles::Rect>),
     /// The user switched between text and motion (§3); the server may pick

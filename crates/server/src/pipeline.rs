@@ -13,7 +13,7 @@
 //! the client hears about in an `Epoch` message before its first frame.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -205,6 +205,9 @@ pub struct Pipeline {
     /// converted or encoded.
     watched: bool,
     force_keyframe: bool,
+    /// Reference frame invalidation asked for: the newest frame lost and
+    /// the oldest good one, of all who asked since the last frame.
+    rfi: Option<(u32, u32)>,
     /// When frame callbacks last went out, in host µs.
     last_callback_us: u64,
     callback_timer: bool,
@@ -227,6 +230,7 @@ struct EncodeJob {
     /// To the network, as well as to `--out`.
     send: bool,
     kind: FrameKind,
+    rfi: Option<(u32, u32)>,
     epoch: u16,
     n: u64,
     probe: Option<u32>,
@@ -278,6 +282,7 @@ impl Pipeline {
             epoch: 0,
             watched: false,
             force_keyframe: false,
+            rfi: None,
             last_callback_us: 0,
             callback_timer: false,
             skipped: None,
@@ -454,6 +459,18 @@ pub fn refresh(host: &mut Host) {
     encode_current(host, false);
 }
 
+/// A client can't decode frames after `good`, up to `lost`: encode the
+/// next frame from `good`, or as a keyframe (RFI, §2).
+pub fn recover(host: &mut Host, lost: u32, good: u32) {
+    use farsight_proto::video::before;
+    let p = &mut host.pipeline;
+    p.rfi = Some(match p.rfi {
+        Some((l, g)) => (if before(l, lost) { lost } else { l }, if before(good, g) { good } else { g }),
+        None => (lost, good),
+    });
+    encode_current(host, false);
+}
+
 /// Tiles: sends `rects` again, which the client lost.
 pub fn repaint(host: &mut Host, rects: &[Rect]) {
     if !host.pipeline.frames.as_ref().is_some_and(|(_, e)| *e == Encoding::Tiles) {
@@ -625,6 +642,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
         sync,
         send: p.watched,
         kind,
+        rfi: p.rfi,
         epoch: p.epoch,
         n: p.frame_count,
         probe,
@@ -637,6 +655,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
     match p.send(Job::Encode(Box::new(job))) {
         Ok(()) => {
             p.force_keyframe = false;
+            p.rfi = None;
             if kind != FrameKind::Refine {
                 changed(host);
             }
@@ -661,8 +680,9 @@ fn skip_for_network(host: &mut Host, refine: bool) -> bool {
     let p = &mut host.pipeline;
     let now = host.start.elapsed().as_micros() as u64;
     let drain_at = p.opts.video_drain_at.load(Ordering::Relaxed);
-    // A keyframe replaces whatever is queued.
-    if p.force_keyframe || now + MAX_QUEUED_US >= drain_at {
+    // A keyframe replaces whatever is queued, and a client waiting to
+    // recover can't use what is.
+    if p.force_keyframe || p.rfi.is_some() || now + MAX_QUEUED_US >= drain_at {
         p.skipped = None;
         return false;
     }
@@ -740,10 +760,23 @@ fn encode_thread(
 ) {
     let now = || start.elapsed().as_micros() as u64;
     let mut codec = None;
+    // Video frame numbers, across epochs; the first of this encoder's; the
+    // last frame before the latest RFI answer.
+    let mut next_frame: u32 = 0;
+    let mut epoch_first: u32 = 0;
+    let mut answered: Option<u32> = None;
     for job in rx {
         let job = match job {
             Job::Start(c) => {
                 codec = Some(c);
+                epoch_first = next_frame;
+                // A new epoch may be another size, or codec.
+                if let Some(f) = &mut out
+                    && let Err(err) = f.set_len(0).and_then(|()| f.rewind())
+                {
+                    tracing::error!(%err, "restarting the stream file");
+                    out = None;
+                }
                 continue;
             }
             Job::Encode(job) => job,
@@ -760,12 +793,18 @@ fn encode_thread(
         // The conversion pass must have finished writing the surface.
         let _ = job.sync.wait();
         let t_converted = now();
-        let kind = job.kind;
+        let number = next_frame;
+        let (kind, mut refs) = match job.rfi {
+            Some((lost, good)) if codec.is_video() => {
+                rfi_answer(codec, job.kind, number, epoch_first, &mut answered, lost, good)
+            }
+            _ => (job.kind, number.wrapping_sub(1)),
+        };
         let qp_offset = match codec.is_video() && job.send {
             true => qp.next(Instant::now(), target.load(Ordering::Relaxed)),
             false => 0,
         };
-        let output = match codec.encode(job.input, job.t_commit as i64, kind, qp_offset) {
+        let output = match codec.encode(job.input, job.t_commit as i64, number, kind, qp_offset) {
             Ok(o) => o,
             Err(err) => {
                 tracing::error!("{err:#}");
@@ -777,6 +816,10 @@ fn encode_thread(
         let video = matches!(output, Output::Video { .. });
         let (bytes, keyframe) = match output {
             Output::Video { data, keyframe } => {
+                next_frame = next_frame.wrapping_add(1);
+                if keyframe {
+                    refs = number;
+                }
                 if let Some(f) = &mut out
                     && let Err(err) = f.write_all(&data)
                 {
@@ -785,7 +828,15 @@ fn encode_thread(
                 }
                 let bytes = data.len();
                 if job.send {
-                    let frame = net::Frame { data, keyframe, epoch: job.epoch, capture_us: job.t_commit, encode_us };
+                    let frame = net::Frame {
+                        data,
+                        keyframe,
+                        epoch: job.epoch,
+                        number,
+                        refs,
+                        capture_us: job.t_commit,
+                        encode_us,
+                    };
                     let _ = net.send(ToNet::Frame(frame));
                 }
                 (bytes, keyframe)
@@ -822,8 +873,41 @@ fn encode_thread(
             keyframe,
             refine = kind == FrameKind::Refine,
             qp_offset,
+            frame = video.then_some(number),
+            refs = (video && refs != number.wrapping_sub(1)).then_some(refs),
             "frame"
         );
+    }
+}
+
+/// How frame `number` answers an RFI for `good..=lost`: as `kind` from
+/// `good`, if the encoder still holds it, or as a keyframe. A repeat of
+/// one already answered is ignored. Returns the kind and the newest frame
+/// referenced.
+fn rfi_answer(
+    codec: &mut Encoder,
+    kind: FrameKind,
+    number: u32,
+    epoch_first: u32,
+    answered: &mut Option<u32>,
+    lost: u32,
+    good: u32,
+) -> (FrameKind, u32) {
+    use farsight_proto::video::before;
+    let previous = number.wrapping_sub(1);
+    if answered.is_some_and(|a| !before(a, lost)) {
+        tracing::debug!(lost, good, "RFI answered already");
+        return (kind, previous);
+    }
+    *answered = Some(previous);
+    // `good` must be this encoder's, and earlier than this frame.
+    let ours = !before(good, epoch_first) && before(good, number);
+    if kind != FrameKind::Keyframe && ours && codec.invalidate(good.wrapping_add(1), previous) {
+        tracing::debug!(lost, good, number, "RFI: predicting from the last good frame");
+        (kind, good)
+    } else {
+        tracing::debug!(lost, good, number, "RFI: keyframe");
+        (FrameKind::Keyframe, number)
     }
 }
 

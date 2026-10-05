@@ -83,7 +83,8 @@ struct Args {
     /// Default: `authorized_keys` in the config directory.
     #[arg(long)]
     authorized_keys: Option<PathBuf>,
-    /// Also write the encoded H.264 elementary stream here.
+    /// Also write the encoded elementary stream here. Each video epoch
+    /// starts it again, so it holds the latest epoch's.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Constant QP for the encoder.
@@ -350,6 +351,10 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 ClientMessage::RequestKeyframe => {
                     tracing::debug!(id, "keyframe requested");
                     pipeline::refresh(host);
+                }
+                ClientMessage::Rfi { lost, good } => {
+                    tracing::debug!(id, lost, good, "RFI");
+                    pipeline::recover(host, lost, good);
                 }
                 ClientMessage::RequestRefresh(rects) => {
                     tracing::debug!(?rects, "refresh requested");

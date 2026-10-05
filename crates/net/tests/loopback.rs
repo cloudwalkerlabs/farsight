@@ -4,7 +4,7 @@
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use farsight_net::packetize::{EncodedFrame, Packetizer, Reassembler};
+use farsight_net::packetize::{EncodedFrame, Reassembler, Repair, packetize};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{endpoint, stream};
 use farsight_proto::codec::{Chroma, Codec, Encoding, Format, Mode};
@@ -34,9 +34,9 @@ async fn frame_and_control_over_loopback() {
             .await
             .unwrap();
         let max = conn.max_datagram_size().unwrap();
-        let frame = EncodedFrame { data: &sent, keyframe: true, epoch: 1, capture_us: 1, encode_us: 1 };
+        let frame = EncodedFrame { data: &sent, keyframe: true, epoch: 1, frame: 0, refs: 0, capture_us: 1, encode_us: 1 };
         let sched = Scheduler::spawn(conn.clone(), 1_000_000_000, endpoint::DATAGRAM_BUFFER);
-        sched.send_frame(Packetizer::new().packetize(&frame, max, 0.0), true);
+        sched.send_frame(packetize(&frame, max, 0.0), true);
         // Hold the connection open until the client is done.
         conn.closed().await;
     });
@@ -53,7 +53,8 @@ async fn frame_and_control_over_loopback() {
     let frame = loop {
         let d = conn.read_datagram().await.unwrap();
         let Some(Datagram::Video(h, payload)) = Datagram::decode(&d) else { panic!() };
-        if let Some(frame) = rx.push(h, payload, 0) {
+        rx.push(h, payload, 0);
+        if let Some(frame) = rx.poll(0, Repair::NONE).0.pop() {
             break frame;
         }
     };
@@ -74,8 +75,8 @@ async fn pings_overtake_a_keyframe() {
         let conn = server.accept().await.unwrap().await.unwrap();
         let sched = Scheduler::spawn(conn.clone(), 20_000_000, endpoint::DATAGRAM_BUFFER);
         let data = vec![0x55; 1_000_000];
-        let frame = EncodedFrame { data: &data, keyframe: true, epoch: 1, capture_us: 0, encode_us: 0 };
-        sched.send_frame(Packetizer::new().packetize(&frame, conn.max_datagram_size().unwrap(), 0.0), true);
+        let frame = EncodedFrame { data: &data, keyframe: true, epoch: 1, frame: 0, refs: 0, capture_us: 0, encode_us: 0 };
+        sched.send_frame(packetize(&frame, conn.max_datagram_size().unwrap(), 0.0), true);
         while let Ok(d) = conn.read_datagram().await {
             if let Some(Datagram::Ping(p)) = Datagram::decode(&d) {
                 sched.send(Priority::Input, Datagram::Pong(Pong { client_us: p.client_us, server_us: 0 }).to_vec().into());
@@ -98,7 +99,12 @@ async fn pings_overtake_a_keyframe() {
         let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(5), conn.read_datagram()).await else { continue };
         match Datagram::decode(&d) {
             Some(Datagram::Pong(p)) => rtts.push(now_us() - p.client_us),
-            Some(Datagram::Video(h, payload)) if rx.push(h, payload, 0).is_some() => break start.elapsed(),
+            Some(Datagram::Video(h, payload)) => {
+                rx.push(h, payload, 0);
+                if !rx.poll(0, Repair::NONE).0.is_empty() {
+                    break start.elapsed();
+                }
+            }
             _ => {}
         }
     };

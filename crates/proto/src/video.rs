@@ -20,6 +20,11 @@ pub struct FragmentHeader {
     pub epoch: u16,
     /// Frame number, counting up across epochs.
     pub frame: u32,
+    /// The newest frame this one may reference: the one before it,
+    /// normally; an older one, after reference frame invalidation (RFI,
+    /// §2); itself, for a keyframe. A client that decoded up to `refs`
+    /// (from the last keyframe on) can decode it.
+    pub refs: u32,
     /// Shards `0..data` are the frame's bytes, the rest parity.
     pub index: u16,
     /// Data and parity shards.
@@ -35,7 +40,7 @@ pub struct FragmentHeader {
 }
 
 impl FragmentHeader {
-    pub const LEN: usize = 1 + 2 + 4 + 2 + 2 + 2 + 4 + 8 + 4;
+    pub const LEN: usize = 1 + 2 + 4 + 4 + 2 + 2 + 2 + 4 + 8 + 4;
 
     pub fn keyframe(&self) -> bool {
         self.flags & FLAG_KEYFRAME != 0
@@ -45,6 +50,7 @@ impl FragmentHeader {
         out.push(self.flags);
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&self.frame.to_le_bytes());
+        out.extend_from_slice(&self.refs.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
         out.extend_from_slice(&self.data.to_le_bytes());
@@ -65,12 +71,13 @@ impl FragmentHeader {
             flags: h[0],
             epoch: u16_at(1),
             frame: u32_at(3),
-            index: u16_at(7),
-            count: u16_at(9),
-            data: u16_at(11),
-            len: u32_at(13),
-            capture_us: u64::from_le_bytes(h[17..25].try_into().unwrap()),
-            encode_us: u32_at(25),
+            refs: u32_at(7),
+            index: u16_at(11),
+            count: u16_at(13),
+            data: u16_at(15),
+            len: u32_at(17),
+            capture_us: u64::from_le_bytes(h[21..29].try_into().unwrap()),
+            encode_us: u32_at(29),
         };
         if header.data == 0 || header.data > header.count || header.index >= header.count {
             return None;
@@ -81,6 +88,11 @@ impl FragmentHeader {
         }
         Some((header, payload))
     }
+}
+
+/// Frame `a` comes before frame `b`, across wrap-around.
+pub fn before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
 }
 
 /// The smallest shard size for a frame of `len` bytes in `data` shards:
@@ -100,6 +112,7 @@ mod tests {
             flags: FLAG_KEYFRAME,
             epoch: 3,
             frame: 0xdead_beef,
+            refs: 0xdead_beee,
             index: 7,
             count: 9,
             data: 8,
@@ -118,7 +131,18 @@ mod tests {
 
     #[test]
     fn rejects_bad_shards() {
-        let h = FragmentHeader { flags: 0, epoch: 0, frame: 0, index: 2, count: 2, data: 1, len: 4, capture_us: 0, encode_us: 0 };
+        let h = FragmentHeader {
+            flags: 0,
+            epoch: 0,
+            frame: 0,
+            refs: 0,
+            index: 2,
+            count: 2,
+            data: 1,
+            len: 4,
+            capture_us: 0,
+            encode_us: 0,
+        };
         let mut buf = Vec::new();
         h.write(&mut buf);
         assert!(FragmentHeader::read(&buf).is_none());
@@ -132,6 +156,12 @@ mod tests {
         assert!(FragmentHeader::read(&buf).is_none());
         buf.push(0);
         assert!(FragmentHeader::read(&buf).is_some());
+    }
+
+    #[test]
+    fn frame_order_wraps() {
+        assert!(before(1, 2) && !before(2, 1) && !before(2, 2));
+        assert!(before(u32::MAX, 0));
     }
 
     #[test]

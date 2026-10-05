@@ -105,6 +105,56 @@ pub struct Picture {
     pub strides: Vec<usize>,
 }
 
+impl Picture {
+    /// MD5 of the picture's planes, packed, as FFmpeg's `framemd5` muxer
+    /// hashes it: for checking decoded frames against a reference decode.
+    pub fn md5(&self) -> String {
+        let mut packed = Vec::new();
+        for (i, (plane, stride)) in self.planes.iter().zip(&self.strides).enumerate() {
+            let (bytes, rows) = self.format.plane_size(i, self.width as usize, self.height as usize);
+            for row in 0..rows {
+                packed.extend_from_slice(&plane[row * stride..][..bytes]);
+            }
+        }
+        let mut digest = [0u8; 16];
+        // SAFETY: `digest` holds the 16 bytes written; `packed` is read.
+        unsafe { ff::av_md5_sum(digest.as_mut_ptr(), packed.as_ptr(), packed.len()) };
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Pictures the decoder found damaged, or concealed part of, so far: a
+/// reference was missing or the stream was corrupt. The core never hands
+/// over a frame whose references the decoder lacks (§2), so this should
+/// stay at zero. Software decoders notice; VA-API mostly doesn't.
+pub static CORRUPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Errors FFmpeg logged so far. A decoder short of a reference may drop
+/// the frame rather than show it damaged (HEVC does), and says so here.
+pub static ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts FFmpeg's errors in [`ERRORS`], and logs as before.
+pub fn count_errors() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the callback has the signature FFmpeg calls it with, and
+    // hands the arguments on untouched.
+    unsafe {
+        unsafe extern "C" fn log(
+            avcl: *mut libc::c_void,
+            level: libc::c_int,
+            fmt: *const libc::c_char,
+            args: *mut ff::__va_list_tag,
+        ) {
+            if level <= ff::AV_LOG_ERROR {
+                ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // SAFETY: the arguments FFmpeg gave us, used once.
+            unsafe { ff::av_log_default_callback(avcl, level, fmt, args) };
+        }
+        ff::av_log_set_callback(Some(log));
+    }
+}
+
 pub struct Decoder {
     ctx: *mut ff::AVCodecContext,
     device: *mut ff::AVBufferRef,
@@ -235,6 +285,10 @@ impl Decoder {
         // SAFETY: frame holds a decoded picture.
         unsafe {
             let mut f = self.frame;
+            if (*f).flags & ff::AV_FRAME_FLAG_CORRUPT != 0 || (*f).decode_error_flags != 0 {
+                CORRUPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(pts = (*f).pts, "the decoder found a picture damaged");
+            }
             if (*f).format == ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
                 ff::av_frame_unref(self.sw_frame);
                 check(ff::av_hwframe_transfer_data(self.sw_frame, f, 0), "reading the decoded surface")?;

@@ -3,11 +3,13 @@
 //!
 //! [`Client::connect`] runs on a tokio runtime and reports to the app
 //! through a callback: video epochs, whole frames ready to decode, cursor
-//! changes and the end of the connection. Frames are handed over in order
-//! and only from a keyframe on: after a loss the core drops frames and asks
-//! for a keyframe (RFI comes in M4), so the decoder never sees a damaged
-//! stream (§2). Each epoch's `Epoch` event comes before its first frame,
-//! even when the frame overtook the announcement on the wire.
+//! changes and the end of the connection. Frames are rebuilt from parity
+//! where they can be, asked for again on a quick path (NACK), and handed
+//! over in order, and only those whose references the decoder has: after
+//! a loss the core drops frames and asks the server to predict from the
+//! last good one (RFI) or for a keyframe, so the decoder never sees a
+//! damaged stream (§2). Each epoch's `Epoch` event comes before its first
+//! frame, even when the frame overtook the announcement on the wire.
 //!
 //! Tiles (when the server has no hardware encoder) are handed over a
 //! datagram at a time, as each decodes on its own. When part of an update
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::Bytes;
-use farsight_net::packetize::Reassembler;
+use farsight_net::packetize::{Reassembler, Repair};
 use farsight_net::quinn::Connection;
 use farsight_net::{endpoint, quinn, stream};
 use farsight_proto::audio::{AudioCaps, AudioConfig};
@@ -40,15 +42,23 @@ use farsight_proto::datagram::{Datagram, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
 use farsight_proto::layout::Layout;
 use farsight_proto::tiles::{self, Rect, TilesHeader};
-use farsight_proto::video::FragmentHeader;
+use farsight_proto::video::{FragmentHeader, before};
 use tokio::sync::mpsc;
 
 /// A frame missing fragments this long after its first one is lost. Long
 /// enough for a paced keyframe to arrive.
 const FRAME_TIMEOUT_US: u64 = 250_000;
 
-/// Keyframe requests are repeated this often until one arrives.
-const KEYFRAME_RETRY: Duration = Duration::from_millis(100);
+/// An RFI or keyframe request is repeated this long, plus two round trips,
+/// after the last until the decoder can go on.
+const ASK_RETRY: Duration = Duration::from_millis(50);
+
+/// Missing shards are asked for again (NACK) on a path whose round trip
+/// is under a frame.
+const NACK_MAX_RTT_US: u64 = 16_000;
+
+/// A NACK's answer is given this long beyond a round trip.
+const NACK_SLACK_US: u64 = 4_000;
 
 /// How often the clock offset to the server is measured.
 const PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -141,8 +151,12 @@ pub struct TilesPacket {
 pub struct Stats {
     pub frames: u64,
     pub lost: u64,
-    /// Frames rebuilt from parity (FEC).
+    /// Frames rebuilt from parity (FEC), and completed by shards asked for
+    /// again (NACK).
     pub recovered: u64,
+    pub repaired: u64,
+    /// Asked to predict from the last good frame (RFI), and for keyframes.
+    pub rfi_requests: u64,
     pub keyframe_requests: u64,
     /// The shortest recent ping round trip, in µs.
     pub rtt_us: u64,
@@ -165,7 +179,8 @@ struct Shared {
     offset_known: AtomicBool,
     rtt_us: AtomicU64,
     rtt_max_us: AtomicU64,
-    want_keyframe: AtomicBool,
+    /// The decoder lost its state: only a keyframe will do.
+    reset_chain: AtomicBool,
     stats: Mutex<Stats>,
     /// Set once the server announces its audio.
     audio: Mutex<Option<audio::Player>>,
@@ -244,7 +259,7 @@ impl Client {
             offset_known: AtomicBool::new(false),
             rtt_us: AtomicU64::new(0),
             rtt_max_us: AtomicU64::new(0),
-            want_keyframe: AtomicBool::new(true),
+            reset_chain: AtomicBool::new(false),
             stats: Mutex::default(),
             audio: Mutex::default(),
             clipboard: Mutex::default(),
@@ -272,9 +287,7 @@ impl Client {
 
     /// The decoder failed: drop frames until the next keyframe.
     pub fn request_keyframe(&self) {
-        self.shared.want_keyframe.store(true, Ordering::Relaxed);
-        self.shared.stats.lock().unwrap().keyframe_requests += 1;
-        let _ = self.control.send(ClientMessage::RequestKeyframe);
+        self.shared.reset_chain.store(true, Ordering::Relaxed);
     }
 
     /// The window's size or scale changed (§5).
@@ -289,7 +302,7 @@ impl Client {
     /// The decoder for `format` can't be used; the server moves on to its
     /// next choice, in a new epoch.
     pub fn decoder_failed(&self, format: Format) {
-        self.shared.want_keyframe.store(true, Ordering::Relaxed);
+        self.shared.reset_chain.store(true, Ordering::Relaxed);
         let _ = self.control.send(ClientMessage::DecoderFailed(format));
     }
 
@@ -439,54 +452,21 @@ async fn run(
     };
     let datagrams = async {
         let mut rx = Reassembler::new(FRAME_TIMEOUT_US);
+        let mut chain = Chain::default();
         let mut tracker = TileTracker::default();
         let mut samples: Vec<(u64, i64)> = Vec::new();
-        let mut last_request: Option<Instant> = None;
-        let request = |last: &mut Option<Instant>| {
-            if last.is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY) {
-                *last = Some(Instant::now());
-                shared.stats.lock().unwrap().keyframe_requests += 1;
-                let _ = control.send(ClientMessage::RequestKeyframe);
-            }
-        };
         let err = loop {
-            let d = match tokio::time::timeout(Duration::from_millis(50), conn.read_datagram()).await {
+            // Quick ticks while a frame is waiting on shards: NACKs and
+            // giving up are a matter of milliseconds.
+            let wait = Duration::from_millis(if rx.pending() { 2 } else { 50 });
+            let d = match tokio::time::timeout(wait, conn.read_datagram()).await {
                 Ok(Ok(d)) => Some(d),
                 Ok(Err(err)) => break err,
                 Err(_) => None,
             };
             let now = shared.now_us();
             match d.as_deref().and_then(Datagram::decode) {
-                Some(Datagram::Video(h, payload)) => {
-                    if let Some(f) = rx.push(h, payload, now) {
-                        // Frames lost before a keyframe don't matter: it
-                        // starts afresh.
-                        let lost = rx.take_lost();
-                        let mut stats = shared.stats.lock().unwrap();
-                        stats.frames += 1;
-                        stats.lost += lost as u64;
-                        drop(stats);
-                        if f.header.keyframe() {
-                            shared.want_keyframe.store(false, Ordering::Relaxed);
-                        } else if lost > 0 {
-                            tracing::debug!(lost, "frames lost; waiting for a keyframe");
-                            shared.want_keyframe.store(true, Ordering::Relaxed);
-                        }
-                        if shared.want_keyframe.load(Ordering::Relaxed) {
-                            request(&mut last_request);
-                        } else {
-                            let f = VideoFrame {
-                                header: f.header,
-                                data: f.data,
-                                first_us: f.first_us,
-                                complete_us: f.complete_us,
-                            };
-                            if let Some(m) = gate.lock().unwrap().admit(Media::Frame(f)) {
-                                on_event(m.into_event());
-                            }
-                        }
-                    }
-                }
+                Some(Datagram::Video(h, payload)) => rx.push(h, payload, now),
                 Some(Datagram::Tiles(header, body)) => {
                     tracker.receive(&header, body, now);
                     let packet = TilesPacket { header, body: body.to_vec(), received_us: now };
@@ -520,17 +500,55 @@ async fn run(
                 tracing::debug!(?refresh, "tiles lost; asking again");
                 let _ = control.send(ClientMessage::RequestRefresh(refresh));
             }
-            rx.expire(now);
-            let recovered = rx.take_recovered();
-            if recovered > 0 {
-                shared.stats.lock().unwrap().recovered += recovered as u64;
+
+            // Video: frames in order, NACKs on a quick path.
+            let rtt = shared.offset_known.load(Ordering::Relaxed).then(|| shared.rtt_us.load(Ordering::Relaxed));
+            let repair = match rtt {
+                Some(rtt) if rtt < NACK_MAX_RTT_US => Repair { nack: true, wait_us: 2 * rtt + NACK_SLACK_US },
+                _ => Repair::NONE,
+            };
+            let (frames, nacks) = rx.poll(now, repair);
+            for nack in nacks {
+                let _ = conn.send_datagram(Bytes::from(Datagram::Nack(nack).to_vec()));
+            }
+            if shared.reset_chain.swap(false, Ordering::Relaxed) {
+                chain.reset();
             }
             let lost = rx.take_lost();
-            if lost > 0 {
-                shared.stats.lock().unwrap().lost += lost as u64;
-                tracing::debug!(lost, "frames lost; waiting for a keyframe");
-                shared.want_keyframe.store(true, Ordering::Relaxed);
-                request(&mut last_request);
+            if let Some(lost) = lost {
+                tracing::debug!(count = lost.count, newest = lost.newest, "frames lost");
+                chain.lost(lost.newest);
+            }
+            {
+                let mut stats = shared.stats.lock().unwrap();
+                stats.frames += frames.len() as u64;
+                stats.lost += lost.map_or(0, |l| l.count) as u64;
+                stats.recovered += rx.take_recovered() as u64;
+                stats.repaired += rx.take_repaired() as u64;
+            }
+            for f in frames {
+                if !chain.admit(&f.header) {
+                    tracing::trace!(frame = f.header.frame, refs = f.header.refs, "can't decode; dropped");
+                    continue;
+                }
+                let f = VideoFrame { header: f.header, data: f.data, first_us: f.first_us, complete_us: f.complete_us };
+                if let Some(m) = gate.lock().unwrap().admit(Media::Frame(f)) {
+                    on_event(m.into_event());
+                }
+            }
+            let retry = ASK_RETRY + Duration::from_micros(2 * rtt.unwrap_or(0));
+            match chain.ask(Instant::now(), retry) {
+                Some(Ask::Rfi { lost, good }) => {
+                    tracing::debug!(lost, good, "asking to predict from the last good frame");
+                    shared.stats.lock().unwrap().rfi_requests += 1;
+                    let _ = control.send(ClientMessage::Rfi { lost, good });
+                }
+                Some(Ask::Keyframe) => {
+                    tracing::debug!("asking for a keyframe");
+                    shared.stats.lock().unwrap().keyframe_requests += 1;
+                    let _ = control.send(ClientMessage::RequestKeyframe);
+                }
+                None => {}
             }
         };
         Err::<(), _>(anyhow::Error::from(err))
@@ -592,6 +610,76 @@ fn unauthorized(conn: &Connection) -> bool {
         conn.close_reason(),
         Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == close::UNAUTHORIZED.into()
     )
+}
+
+/// Which frames the decoder can take (§2): a keyframe, or a frame whose
+/// newest reference is no newer than the last frame decoded, back to the
+/// keyframe the chain started from. Anything else is dropped, and the
+/// server is asked to predict from the last good frame (RFI), or, with no
+/// good frame, for a keyframe.
+#[derive(Debug, Default)]
+struct Chain {
+    /// The last frame decoded, and the keyframe its chain started from.
+    decoded: Option<(u32, u32)>,
+    /// The newest frame the decoder couldn't have.
+    broken: Option<u32>,
+    asked: Option<Instant>,
+}
+
+/// What [`Chain::ask`] wants sent.
+#[derive(Debug, PartialEq, Eq)]
+enum Ask {
+    Rfi { lost: u32, good: u32 },
+    Keyframe,
+}
+
+impl Chain {
+    /// Whether frame `h` can be decoded; if so, it is taken as decoded.
+    fn admit(&mut self, h: &FragmentHeader) -> bool {
+        let ok = h.keyframe()
+            || self.decoded.is_some_and(|(last, key)| !before(last, h.refs) && !before(h.refs, key));
+        if !ok {
+            self.lost(h.frame);
+            return false;
+        }
+        let key = if h.keyframe() { h.frame } else { self.decoded.map_or(h.frame, |(_, k)| k) };
+        self.decoded = Some((h.frame, key));
+        // Everything lost so far was older: the chain is whole again.
+        if self.broken.is_some_and(|b| before(b, h.frame)) {
+            self.broken = None;
+            self.asked = None;
+        }
+        true
+    }
+
+    /// Frame `n` won't reach the decoder.
+    fn lost(&mut self, n: u32) {
+        if self.decoded.is_some_and(|(last, _)| !before(last, n)) {
+            return; // older than what was decoded since
+        }
+        self.broken = Some(self.broken.map_or(n, |b| if before(b, n) { n } else { b }));
+    }
+
+    /// The decoder lost its state.
+    fn reset(&mut self) {
+        let newest = self.decoded.map(|(last, _)| last);
+        self.decoded = None;
+        self.broken = Some(self.broken.or(newest).unwrap_or(0));
+        self.asked = None;
+    }
+
+    /// What to ask the server for now, at most once per `retry`.
+    fn ask(&mut self, now: Instant, retry: Duration) -> Option<Ask> {
+        let lost = self.broken?;
+        if self.asked.is_some_and(|t| now.duration_since(t) < retry) {
+            return None;
+        }
+        self.asked = Some(now);
+        Some(match self.decoded {
+            Some((good, _)) => Ask::Rfi { lost, good },
+            None => Ask::Keyframe,
+        })
+    }
 }
 
 /// Holds frames back until their epoch is announced, so the app always
@@ -732,9 +820,61 @@ impl TileTracker {
 mod tests {
     use super::*;
 
+    fn header(n: u32, refs: u32, keyframe: bool) -> FragmentHeader {
+        FragmentHeader {
+            flags: if keyframe { farsight_proto::video::FLAG_KEYFRAME } else { 0 },
+            epoch: 1,
+            frame: n,
+            refs,
+            index: 0,
+            count: 1,
+            data: 1,
+            len: 0,
+            capture_us: 0,
+            encode_us: 0,
+        }
+    }
+
+    #[test]
+    fn the_chain_takes_what_it_can_decode_and_asks_for_the_rest() {
+        let t = Instant::now();
+        let retry = Duration::from_millis(50);
+        let mut c = Chain::default();
+        // Nothing until a keyframe.
+        assert!(!c.admit(&header(4, 3, false)));
+        assert_eq!(c.ask(t, retry), Some(Ask::Keyframe));
+        assert!(c.admit(&header(5, 5, true)));
+        assert!(c.admit(&header(6, 5, false)));
+        assert_eq!(c.ask(t, retry), None);
+        // 7 is lost: 8 and 9 can't be decoded; ask once per retry.
+        c.lost(7);
+        assert!(!c.admit(&header(8, 7, false)));
+        assert_eq!(c.ask(t, retry), Some(Ask::Rfi { lost: 8, good: 6 }));
+        assert!(!c.admit(&header(9, 8, false)));
+        assert_eq!(c.ask(t + retry / 2, retry), None);
+        assert_eq!(c.ask(t + retry, retry), Some(Ask::Rfi { lost: 9, good: 6 }));
+        // The server predicts 10 from 6.
+        assert!(c.admit(&header(10, 6, false)));
+        assert!(c.admit(&header(11, 10, false)));
+        assert_eq!(c.ask(t + 2 * retry, retry), None);
+        // A late loss report for an older frame changes nothing.
+        c.lost(9);
+        assert_eq!(c.ask(t + 3 * retry, retry), None);
+        // Nothing before the chain's keyframe will do.
+        assert!(!c.admit(&header(12, 4, false)));
+    }
+
+    #[test]
+    fn a_reset_wants_a_keyframe() {
+        let mut c = Chain::default();
+        assert!(c.admit(&header(1, 1, true)));
+        c.reset();
+        assert!(!c.admit(&header(2, 1, false)));
+        assert_eq!(c.ask(Instant::now(), Duration::ZERO), Some(Ask::Keyframe));
+    }
+
     fn frame(epoch: u16, n: u32) -> VideoFrame {
-        let header =
-            FragmentHeader { flags: 0, epoch, frame: n, index: 0, count: 1, data: 1, len: 0, capture_us: 0, encode_us: 0 };
+        let header = FragmentHeader { epoch, ..header(n, n.wrapping_sub(1), false) };
         VideoFrame { header, data: Vec::new(), first_us: 0, complete_us: 0 }
     }
 

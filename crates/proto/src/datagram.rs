@@ -14,6 +14,7 @@ const TAG_PING: u8 = 3;
 const TAG_PONG: u8 = 4;
 const TAG_TILES: u8 = 5;
 const TAG_AUDIO: u8 = 6;
+const TAG_NACK: u8 = 7;
 
 /// Bytes in front of a video fragment's payload.
 pub const VIDEO_OVERHEAD: usize = 1 + FragmentHeader::LEN;
@@ -35,6 +36,15 @@ pub struct Pong {
     pub server_us: u64,
 }
 
+/// The client asks for shards of a frame again (§2, on a path quicker
+/// than a frame): the ones listed, or with none listed, a frame it has no
+/// shard of at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nack {
+    pub frame: u32,
+    pub shards: Vec<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datagram<'a> {
     Video(FragmentHeader, &'a [u8]),
@@ -43,6 +53,7 @@ pub enum Datagram<'a> {
     Input(InputPacket),
     Ping(Ping),
     Pong(Pong),
+    Nack(Nack),
 }
 
 impl<'a> Datagram<'a> {
@@ -63,6 +74,7 @@ impl<'a> Datagram<'a> {
             TAG_INPUT => Datagram::Input(postcard::from_bytes(body).ok()?),
             TAG_PING => Datagram::Ping(postcard::from_bytes(body).ok()?),
             TAG_PONG => Datagram::Pong(postcard::from_bytes(body).ok()?),
+            TAG_NACK => Datagram::Nack(postcard::from_bytes(body).ok()?),
             _ => return None,
         })
     }
@@ -78,6 +90,7 @@ impl<'a> Datagram<'a> {
             Datagram::Input(p) => tagged(TAG_INPUT, p, out),
             Datagram::Ping(p) => tagged(TAG_PING, p, out),
             Datagram::Pong(p) => tagged(TAG_PONG, p, out),
+            Datagram::Nack(n) => tagged(TAG_NACK, n, out),
         }
     }
 
@@ -115,7 +128,18 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let h = FragmentHeader { flags: 1, epoch: 1, frame: 2, index: 0, count: 1, data: 1, len: 3, capture_us: 3, encode_us: 4 };
+        let h = FragmentHeader {
+            flags: 1,
+            epoch: 1,
+            frame: 2,
+            refs: 1,
+            index: 0,
+            count: 1,
+            data: 1,
+            len: 3,
+            capture_us: 3,
+            encode_us: 4,
+        };
         let input = InputPacket {
             seq: 9,
             events: vec![InputEvent::Key { code: 30, pressed: true }],
@@ -139,6 +163,7 @@ mod tests {
             Datagram::Input(input),
             Datagram::Ping(Ping { client_us: 5 }),
             Datagram::Pong(Pong { client_us: 5, server_us: 6 }),
+            Datagram::Nack(Nack { frame: 7, shards: vec![1, 4] }),
         ] {
             assert_eq!(Datagram::decode(&d.to_vec()), Some(d));
         }

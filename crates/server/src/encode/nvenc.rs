@@ -41,6 +41,10 @@ const LOCK_INPUT_VER: u32 = struct_version(1);
 const RECONFIGURE_VER: u32 = struct_version(1) | 1 << 31;
 const INFINITE_GOP: u32 = 0xffff_ffff;
 
+/// Frames kept for reference (each frame references only the newest): how
+/// far back reference frame invalidation can reach.
+const DPB: u32 = 8;
+
 const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
     GUID { Data1: d1, Data2: d2, Data3: d3, Data4: d4 }
 }
@@ -287,6 +291,9 @@ pub struct Nvenc {
     height: u32,
     /// `init` points at it.
     config: Box<NV_ENC_CONFIG>,
+    /// Reference frame invalidation works: the driver has it, and more
+    /// than one reference frame.
+    rfi: bool,
     /// The ordinary and refinement QPs, on this codec's scale, the most it
     /// takes, and the one set now.
     qp: u32,
@@ -334,6 +341,19 @@ impl Nvenc {
         };
         config.rcParams.constQP = NV_ENC_QP { qpInterP: qp, qpInterB: qp, qpIntra: qp };
         let chroma_idc = if format.chroma == Chroma::Yuv444 { 3 } else { 1 };
+        let invalidation = session.caps(&codec, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0;
+        let multiple_refs = session.caps(&codec, NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES) != 0;
+        tracing::debug!(
+            invalidation,
+            multiple_refs,
+            ltr = session.caps(&codec, NV_ENC_CAPS_NUM_MAX_LTR_FRAMES),
+            intra_refresh = session.caps(&codec, NV_ENC_CAPS_SUPPORT_INTRA_REFRESH),
+            "NVENC loss recovery"
+        );
+        // A frame references only the one before it, so a GPU without
+        // multiple references per frame (Maxwell) still keeps a DPB to fall
+        // back on.
+        let rfi = format.codec != Codec::Av1 && invalidation;
         // SAFETY: each union member is the one for this codec.
         unsafe {
             match format.codec {
@@ -342,6 +362,10 @@ impl Nvenc {
                     h.idrPeriod = INFINITE_GOP;
                     h.set_repeatSPSPPS(1);
                     h.chromaFormatIDC = chroma_idc;
+                    if rfi {
+                        h.maxNumRefFrames = DPB;
+                        h.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
+                    }
                     config.profileGUID = if chroma_idc == 3 { H264_HIGH_444 } else { H264_HIGH };
                 }
                 Codec::Hevc => {
@@ -349,6 +373,10 @@ impl Nvenc {
                     h.idrPeriod = INFINITE_GOP;
                     h.set_repeatSPSPPS(1);
                     h.set_chromaFormatIDC(chroma_idc);
+                    if rfi {
+                        h.maxNumRefFramesInDPB = DPB;
+                        h.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
+                    }
                     config.profileGUID = if chroma_idc == 3 { HEVC_FREXT } else { HEVC_MAIN };
                 }
                 Codec::Av1 => {
@@ -384,6 +412,7 @@ impl Nvenc {
             width,
             height,
             config,
+            rfi,
             qp,
             max_qp: if format.codec == Codec::Av1 { 255 } else { 51 },
             current_qp: qp,
@@ -412,7 +441,7 @@ impl Nvenc {
             enc.output = output.bitstreamBuffer;
             anyhow::Ok(())
         })?;
-        tracing::info!(width, height, %format, qp, "encoder ready (NVENC, P1 ultra-low-latency, CQP)");
+        tracing::info!(width, height, %format, qp, rfi, "encoder ready (NVENC, P1 ultra-low-latency, CQP)");
         Ok(enc)
     }
 
@@ -430,11 +459,13 @@ impl Nvenc {
         self.session.with(|| unsafe { check(nv!(api, nvEncReconfigureEncoder(encoder, &mut params)), "changing the QP") })
     }
 
-    /// Encodes `frame`, `qp_offset` above its QP (on H.264's scale).
+    /// Encodes `frame`, frame `number`, `qp_offset` above its QP (on
+    /// H.264's scale). The number is NVENC's timestamp for the frame, which
+    /// [`Nvenc::invalidate`] names it by.
     pub fn encode(
         &mut self,
         frame: MemFrame,
-        pts_us: i64,
+        number: u32,
         kind: FrameKind,
         qp_offset: u32,
         out: &mut Vec<u8>,
@@ -445,10 +476,29 @@ impl Nvenc {
             self.set_qp(qp)?;
             self.current_qp = qp;
         }
-        self.encode_frame(frame, pts_us, kind, out)
+        self.encode_frame(frame, number as u64, kind, out)
     }
 
-    fn encode_frame(&mut self, frame: MemFrame, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+    /// Reference frame invalidation: frames `from..=to` are no longer
+    /// referenced, so the next frame is predicted from `from - 1`, if it is
+    /// still in the DPB.
+    pub fn invalidate(&mut self, from: u32, to: u32) -> bool {
+        let span = to.wrapping_sub(from).wrapping_add(1);
+        if !self.rfi || span >= DPB {
+            return false;
+        }
+        let (api, encoder) = (self.session.api, self.session.encoder);
+        // SAFETY: invalidating frames of our own session by the timestamps
+        // they were encoded with.
+        self.session.with(|| unsafe {
+            (0..span).all(|i| {
+                let ts = from.wrapping_add(i) as u64;
+                nv!(api, nvEncInvalidateRefFrames(encoder, ts)) == NV_ENC_SUCCESS
+            })
+        })
+    }
+
+    fn encode_frame(&mut self, frame: MemFrame, timestamp: u64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
         let api = self.session.api;
         let encoder = self.session.encoder;
         let (input, output) = (self.input, self.output);
@@ -480,7 +530,7 @@ impl Nvenc {
                 outputBitstream: output,
                 bufferFmt: buffer_format,
                 pictureStruct: NV_ENC_PIC_STRUCT_FRAME,
-                inputTimeStamp: pts_us as u64,
+                inputTimeStamp: timestamp,
                 ..Default::default()
             };
             if kind == FrameKind::Keyframe {

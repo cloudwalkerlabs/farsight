@@ -71,6 +71,10 @@ impl Latency {
             rtt_max_ms = format!("{:.2}", stats.rtt_max_us as f64 / 1000.0),
             lost = stats.lost - self.last.lost,
             recovered = stats.recovered - self.last.recovered,
+            repaired = stats.repaired - self.last.repaired,
+            rfi = stats.rfi_requests - self.last.rfi_requests,
+            corrupt = crate::decode::CORRUPT.load(std::sync::atomic::Ordering::Relaxed),
+            decode_errors = crate::decode::ERRORS.load(std::sync::atomic::Ordering::Relaxed),
             keyframe_requests = stats.keyframe_requests - self.last.keyframe_requests,
             "latency ms, median/p95: {}",
             summary.join(", ")

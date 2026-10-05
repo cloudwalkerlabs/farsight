@@ -7,13 +7,14 @@
 //! connection alike, encoded once; replies go to the connection they answer.
 //! The session itself outlives them all.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
-use farsight_net::packetize::{EncodedFrame, Packetizer};
+use farsight_net::packetize::{self, EncodedFrame};
 use farsight_net::cc;
 use farsight_net::path::{self, PathState};
 use farsight_net::quinn::{self, Connection};
@@ -21,7 +22,7 @@ use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{auth, endpoint, stream};
 use farsight_proto::audio::AudioConfig;
 use farsight_proto::control::{ClientMessage, ClipboardRequest, Hello, MAX_CLIPBOARD, ServerMessage, close};
-use farsight_proto::datagram::{self, Datagram, Pong};
+use farsight_proto::datagram::{self, Datagram, Nack, Pong};
 use farsight_proto::tiles::TilesHeader;
 use farsight_proto::input::InputPacket;
 use smithay::reexports::calloop::channel::Sender as HostSender;
@@ -68,6 +69,9 @@ pub struct Frame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub epoch: u16,
+    /// Its number, and the newest frame it references (RFI, §2).
+    pub number: u32,
+    pub refs: u32,
     pub capture_us: u64,
     pub encode_us: u32,
 }
@@ -156,12 +160,31 @@ struct Shared {
     opts: Options,
     host: HostSender<ToHost>,
     conns: Mutex<Vec<Conn>>,
+    /// The last frames sent, for NACKs: number, data shards, datagrams.
+    history: Mutex<VecDeque<(u32, u16, Vec<Bytes>)>>,
 }
+
+/// Frames kept for NACKs. They come only on paths quicker than a frame,
+/// so this is plenty.
+const HISTORY: usize = 32;
 
 impl Shared {
     /// The speaker encodes while anyone listens.
     fn update_listening(&self, conns: &[Conn]) {
         self.opts.audio.listening.store(conns.iter().any(|c| c.audio), Ordering::Relaxed);
+    }
+
+    /// The shards a NACK asks for, as far as they are still at hand.
+    fn repair(&self, nack: &Nack) -> Vec<Bytes> {
+        let history = self.history.lock().unwrap();
+        let Some((_, data, datagrams)) = history.iter().find(|(n, _, _)| *n == nack.frame) else {
+            return Vec::new();
+        };
+        match nack.shards.is_empty() {
+            // A frame the client has none of: its data shards.
+            true => datagrams[..*data as usize].to_vec(),
+            false => nack.shards.iter().filter_map(|&i| datagrams.get(i as usize).cloned()).collect(),
+        }
     }
 
     /// Notes when the slowest connection's video queue will have drained.
@@ -196,7 +219,7 @@ fn encoder_target(p: &PathState) -> u64 {
 }
 
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
-    let shared = Arc::new(Shared { opts, host, conns: Mutex::default() });
+    let shared = Arc::new(Shared { opts, host, conns: Mutex::default(), history: Mutex::default() });
     tokio::spawn(dispatch(rx, shared.clone()));
     let mut next_id: ConnId = 0;
     while let Some(incoming) = endpoint.accept().await {
@@ -218,7 +241,6 @@ async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>,
 
 /// Routes the host's output to the connections.
 async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
-    let mut packetizer = Packetizer::new();
     let mut next_update: u32 = 0;
     while let Some(msg) = rx.recv().await {
         let conns = shared.conns.lock().unwrap();
@@ -237,14 +259,25 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     data: &f.data,
                     keyframe: f.keyframe,
                     epoch: f.epoch,
+                    frame: f.number,
+                    refs: f.refs,
                     capture_us: f.capture_us,
                     encode_us: f.encode_us,
                 };
-                let datagrams = packetizer.packetize(&frame, max, loss);
+                let datagrams = packetize::packetize(&frame, max, loss);
                 for c in conns.iter() {
                     c.sched.send_frame(datagrams.clone(), f.keyframe);
                 }
                 shared.note_backlog(&conns);
+                let data = match Datagram::decode(&datagrams[0]) {
+                    Some(Datagram::Video(h, _)) => h.data,
+                    _ => 0,
+                };
+                let mut history = shared.history.lock().unwrap();
+                if history.len() == HISTORY {
+                    history.pop_front();
+                }
+                history.push_back((f.number, data, datagrams));
             }
             ToNet::Tiles(t) => {
                 let count = t.update.bodies.len();
@@ -412,6 +445,11 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
                 Some(Datagram::Ping(p)) => {
                     let pong = Pong { client_us: p.client_us, server_us: start.elapsed().as_micros() as u64 };
                     sched.send(Priority::Input, Bytes::from(Datagram::Pong(pong).to_vec()));
+                }
+                Some(Datagram::Nack(nack)) => {
+                    let repair = shared.repair(&nack);
+                    tracing::debug!(id, frame = nack.frame, asked = nack.shards.len(), sent = repair.len(), "NACK");
+                    sched.send_repair(repair);
                 }
                 _ => {}
             }

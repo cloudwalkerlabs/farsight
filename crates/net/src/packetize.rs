@@ -1,15 +1,21 @@
 //! Frames to datagrams and back (`docs/design.md` §2, "Packetization and
-//! loss"). Each frame is split into equal shards and protected by
-//! Reed-Solomon parity sized from the measured loss ([`parity`]): any
-//! `data` of its shards rebuild it. A frame that still can't be rebuilt is
-//! lost, and the client asks for a keyframe.
+//! loss").
+//!
+//! Each frame is split into equal shards and protected by Reed-Solomon
+//! parity sized from the measured loss ([`parity`]): any `data` of its
+//! shards rebuild it. On a path quicker than a frame, the client also asks
+//! for what is still missing (a NACK) and the server sends it again. A
+//! frame that can be neither rebuilt nor repaired is lost, and the client
+//! asks for reference frame invalidation.
 
 use bytes::Bytes;
-use farsight_proto::datagram::{self, VIDEO_OVERHEAD};
-use farsight_proto::video::{FLAG_KEYFRAME, FragmentHeader, shard_size};
+use farsight_proto::datagram::{self, Nack, VIDEO_OVERHEAD};
+use farsight_proto::video::{FLAG_KEYFRAME, FragmentHeader, before, shard_size};
+use std::collections::VecDeque;
 
-/// Partial frames still waiting for fragments. Older ones are given up.
-const MAX_PARTIAL: usize = 8;
+/// Frames tracked at once, from the oldest not yet delivered. Older ones
+/// are given up.
+const MAX_SLOTS: usize = 64;
 
 /// How often a frame may still be lost after FEC: ordinary frames, and
 /// keyframes, which cost far more to send again.
@@ -23,6 +29,13 @@ const BURST_MARGIN: f64 = 1.5;
 /// Parity is sized for at least this loss, so a frame survives the odd
 /// loss that the measurement hasn't caught.
 const MIN_LOSS: f64 = 0.0005;
+
+/// The newest frame counts as stalled this long after its last shard, if
+/// no later frame shows that it was all sent.
+const STALL_US: u64 = 10_000;
+
+/// A frame is asked for again at most this many times.
+const MAX_NACKS: u8 = 2;
 
 /// How many parity shards protect `data` data shards at packet loss rate
 /// `loss` (0–1): the fewest that leave the frame unrecoverable no more
@@ -53,72 +66,62 @@ pub struct EncodedFrame<'a> {
     pub data: &'a [u8],
     pub keyframe: bool,
     pub epoch: u16,
+    pub frame: u32,
+    /// The newest frame it references ([`FragmentHeader::refs`]).
+    pub refs: u32,
     pub capture_us: u64,
     pub encode_us: u32,
 }
 
-/// Server side: numbers frames and splits them into datagrams.
-#[derive(Debug, Default)]
-pub struct Packetizer {
-    next_frame: u32,
-}
-
-impl Packetizer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The datagrams for `frame`, each at most `max_datagram` bytes: its
-    /// data shards in order, then parity for packet loss rate `loss`.
-    pub fn packetize(&mut self, frame: &EncodedFrame, max_datagram: usize, loss: f64) -> Vec<Bytes> {
-        let len = frame.data.len();
-        let chunk = (max_datagram.saturating_sub(VIDEO_OVERHEAD) & !1).max(2);
-        let data = len.div_ceil(chunk).max(1);
-        assert!(data < u16::MAX as usize && len <= u32::MAX as usize, "frame of {len} bytes is too large");
-        let parity = parity(data, loss, frame.keyframe);
-        // Past half a datagram, no two shards share a packet (and a loss).
-        let size = match data + parity {
-            1 => shard_size(len, data),
-            _ => shard_size(len, data).max((chunk / 2 + 2) & !1).min(chunk),
-        };
-        let number = self.next_frame;
-        self.next_frame = self.next_frame.wrapping_add(1);
-        let mut header = FragmentHeader {
-            flags: if frame.keyframe { FLAG_KEYFRAME } else { 0 },
-            epoch: frame.epoch,
-            frame: number,
-            index: 0,
-            count: (data + parity) as u16,
-            data: data as u16,
-            len: len as u32,
-            capture_us: frame.capture_us,
-            encode_us: frame.encode_us,
-        };
-        // Every shard is `size` long; the frame ends with padding.
-        let shards: Vec<Vec<u8>> = (0..data)
-            .map(|i| {
-                let mut s = frame.data[(i * size).min(len)..((i + 1) * size).min(len)].to_vec();
-                s.resize(size, 0);
-                s
-            })
-            .collect();
-        let recovery = if parity == 0 {
-            Vec::new()
-        } else {
-            reed_solomon_simd::encode(data, parity, &shards).expect("shard counts and sizes are in range")
-        };
-        shards
-            .iter()
-            .chain(&recovery)
-            .enumerate()
-            .map(|(i, payload)| {
-                header.index = i as u16;
-                let mut out = Vec::with_capacity(VIDEO_OVERHEAD + payload.len());
-                datagram::encode_video(&header, payload, &mut out);
-                Bytes::from(out)
-            })
-            .collect()
-    }
+/// The datagrams for `frame`, each at most `max_datagram` bytes: its data
+/// shards in order, then parity for packet loss rate `loss`.
+pub fn packetize(frame: &EncodedFrame, max_datagram: usize, loss: f64) -> Vec<Bytes> {
+    let len = frame.data.len();
+    let chunk = (max_datagram.saturating_sub(VIDEO_OVERHEAD) & !1).max(2);
+    let data = len.div_ceil(chunk).max(1);
+    assert!(data < u16::MAX as usize && len <= u32::MAX as usize, "frame of {len} bytes is too large");
+    let parity = parity(data, loss, frame.keyframe);
+    // Past half a datagram, no two shards share a packet (and a loss).
+    let size = match data + parity {
+        1 => shard_size(len, data),
+        _ => shard_size(len, data).max((chunk / 2 + 2) & !1).min(chunk),
+    };
+    let mut header = FragmentHeader {
+        flags: if frame.keyframe { FLAG_KEYFRAME } else { 0 },
+        epoch: frame.epoch,
+        frame: frame.frame,
+        refs: frame.refs,
+        index: 0,
+        count: (data + parity) as u16,
+        data: data as u16,
+        len: len as u32,
+        capture_us: frame.capture_us,
+        encode_us: frame.encode_us,
+    };
+    // Every shard is `size` long; the frame ends with padding.
+    let shards: Vec<Vec<u8>> = (0..data)
+        .map(|i| {
+            let mut s = frame.data[(i * size).min(len)..((i + 1) * size).min(len)].to_vec();
+            s.resize(size, 0);
+            s
+        })
+        .collect();
+    let recovery = if parity == 0 {
+        Vec::new()
+    } else {
+        reed_solomon_simd::encode(data, parity, &shards).expect("shard counts and sizes are in range")
+    };
+    shards
+        .iter()
+        .chain(&recovery)
+        .enumerate()
+        .map(|(i, payload)| {
+            header.index = i as u16;
+            let mut out = Vec::with_capacity(VIDEO_OVERHEAD + payload.len());
+            datagram::encode_video(&header, payload, &mut out);
+            Bytes::from(out)
+        })
+        .collect()
 }
 
 /// A whole frame, put back together.
@@ -133,19 +136,63 @@ pub struct Frame {
     pub complete_us: u64,
 }
 
-/// Client side: collects fragments into frames. Frames are delivered in
-/// order and only when whole, rebuilt from parity if need be; anything
-/// older than a delivered frame is dropped, and gaps are counted as losses.
+/// Whether, and how patiently, to ask for missing shards again.
+#[derive(Debug, Clone, Copy)]
+pub struct Repair {
+    /// The path is quick enough for a NACK to beat giving up.
+    pub nack: bool,
+    /// How long to wait for an answer before asking again, or giving up.
+    pub wait_us: u64,
+}
+
+impl Repair {
+    pub const NONE: Repair = Repair { nack: false, wait_us: 0 };
+}
+
+/// Client side: collects shards into frames, rebuilds them from parity,
+/// and hands them over in order and only when whole. A frame still missing
+/// shards holds the ones after it back while it can still be repaired; once
+/// it can't, it is lost.
 #[derive(Debug)]
 pub struct Reassembler {
-    /// Oldest first. Short, so scans are cheap.
-    partial: Vec<Partial>,
+    /// One per frame number after `mark`, oldest first.
+    slots: VecDeque<Slot>,
     /// The newest frame accounted for, delivered or given up. Anything up
     /// to it is stale.
     mark: Option<u32>,
     timeout_us: u64,
-    lost: u32,
+    lost: Option<Lost>,
     recovered: u32,
+    repaired: u32,
+}
+
+/// Frames given up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lost {
+    pub count: u32,
+    pub newest: u32,
+}
+
+#[derive(Debug)]
+struct Slot {
+    frame: u32,
+    state: State,
+    /// When the first and last of its shards arrived, or when a later
+    /// frame showed it missing.
+    first_us: u64,
+    last_us: u64,
+    nacked_us: Option<u64>,
+    nacks: u8,
+}
+
+#[derive(Debug)]
+enum State {
+    /// Not one shard yet.
+    Missing,
+    Partial(Partial),
+    Ready(Frame),
+    /// Couldn't be rebuilt.
+    Dead,
 }
 
 #[derive(Debug)]
@@ -153,7 +200,6 @@ struct Partial {
     header: FragmentHeader,
     shards: Vec<Option<Vec<u8>>>,
     have: usize,
-    first_us: u64,
 }
 
 impl Partial {
@@ -176,80 +222,141 @@ impl Partial {
         out.truncate(len);
         Ok(out)
     }
-}
 
-/// `a` is before `b`, across wrap-around.
-fn before(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) < 0
+    /// Shards to ask for: as many as are needed, data first.
+    fn wanted(&self) -> Vec<u16> {
+        let need = self.header.data as usize - self.have;
+        let missing = self.shards.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i as u16);
+        missing.take(need).collect()
+    }
 }
 
 impl Reassembler {
-    /// A partial frame is given up `timeout_us` after its first fragment.
+    /// A frame is given up `timeout_us` after its first fragment.
     pub fn new(timeout_us: u64) -> Self {
-        Self { partial: Vec::new(), mark: None, timeout_us, lost: 0, recovered: 0 }
+        Self { slots: VecDeque::new(), mark: None, timeout_us, lost: None, recovered: 0, repaired: 0 }
     }
 
-    pub fn push(&mut self, header: FragmentHeader, payload: &[u8], now_us: u64) -> Option<Frame> {
-        if self.mark.is_some_and(|mark| !before(mark, header.frame)) {
-            return None;
+    /// Frames are waiting: [`Reassembler::poll`] has something to decide.
+    pub fn pending(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
+    /// Takes one shard; [`Reassembler::poll`] hands over what it completes.
+    pub fn push(&mut self, header: FragmentHeader, payload: &[u8], now_us: u64) {
+        let mark = *self.mark.get_or_insert(header.frame.wrapping_sub(1));
+        if !before(mark, header.frame) {
+            return;
         }
-        let i = match self.partial.iter().position(|p| !before(p.header.frame, header.frame)) {
-            Some(i) if self.partial[i].header.frame == header.frame => i,
-            at => {
-                let i = at.unwrap_or(self.partial.len());
-                let partial =
-                    Partial { header, shards: vec![None; header.count as usize], have: 0, first_us: now_us };
-                self.partial.insert(i, partial);
-                i
-            }
-        };
-        let partial = &mut self.partial[i];
-        let h = &partial.header;
-        let size = partial.shards.iter().flatten().next().map_or(payload.len(), Vec::len);
+        // A slot for every frame up to this one: those in between are gaps.
+        while self.newest().is_none_or(|n| before(n, header.frame)) {
+            let frame = self.newest().unwrap_or(mark).wrapping_add(1);
+            self.slots.push_back(Slot {
+                frame,
+                state: State::Missing,
+                first_us: now_us,
+                last_us: now_us,
+                nacked_us: None,
+                nacks: 0,
+            });
+        }
+        while self.slots.len() > MAX_SLOTS {
+            self.give_up_front();
+        }
+        let Some(slot) = self.slots.iter_mut().find(|s| s.frame == header.frame) else { return };
+        if let State::Missing = slot.state {
+            slot.state = State::Partial(Partial { header, shards: vec![None; header.count as usize], have: 0 });
+            slot.first_us = now_us;
+        }
+        let State::Partial(p) = &mut slot.state else { return };
+        let h = &p.header;
+        let size = p.shards.iter().flatten().next().map_or(payload.len(), Vec::len);
         if (h.count, h.data, h.len, size) != (header.count, header.data, header.len, payload.len()) {
-            return None; // corrupt; let it time out
+            return; // corrupt; let it time out
         }
-        let slot = &mut partial.shards[header.index as usize];
-        if slot.is_some() {
-            return None;
+        let shard = &mut p.shards[header.index as usize];
+        if shard.is_some() {
+            return;
         }
-        *slot = Some(payload.to_vec());
-        partial.have += 1;
-        if partial.have < header.data as usize {
-            if self.partial.len() > MAX_PARTIAL {
-                self.give_up_through(0);
-            }
-            return None;
+        *shard = Some(payload.to_vec());
+        p.have += 1;
+        slot.last_us = now_us;
+        if p.have < header.data as usize {
+            return;
         }
-        // Everything older is superseded.
-        let partial = self.partial.drain(..=i).next_back().unwrap();
-        self.account(header.frame, i as u32);
-        let (header, first_us) = (partial.header, partial.first_us);
-        let rebuilt = partial.shards[..header.data as usize].iter().any(Option::is_none);
-        match partial.rebuild() {
+        let State::Partial(p) = std::mem::replace(&mut slot.state, State::Dead) else { unreachable!() };
+        let header = p.header;
+        let rebuilt = p.shards[..header.data as usize].iter().any(Option::is_none);
+        match p.rebuild() {
             Ok(data) => {
                 self.recovered += rebuilt as u32;
-                Some(Frame { header, data, first_us, complete_us: now_us })
+                self.repaired += (slot.nacks > 0) as u32;
+                slot.state = State::Ready(Frame { header, data, first_us: slot.first_us, complete_us: now_us });
             }
-            Err(err) => {
-                tracing::debug!(frame = header.frame, %err, "rebuilding a frame");
-                self.lost += 1;
-                None
-            }
+            Err(err) => tracing::debug!(frame = header.frame, %err, "rebuilding a frame"),
         }
     }
 
-    /// Gives up partial frames that have waited too long, and any older.
-    pub fn expire(&mut self, now_us: u64) {
-        let timeout = self.timeout_us;
-        if let Some(i) = self.partial.iter().rposition(|p| now_us.saturating_sub(p.first_us) >= timeout) {
-            self.give_up_through(i);
+    /// The frames ready to decode, in order, and the shards to ask for
+    /// again.
+    pub fn poll(&mut self, now_us: u64, repair: Repair) -> (Vec<Frame>, Vec<Nack>) {
+        let mut nacks = Vec::new();
+        if repair.nack {
+            let newest = self.newest();
+            for slot in &mut self.slots {
+                let stalled = Some(slot.frame) != newest || now_us.saturating_sub(slot.last_us) >= STALL_US;
+                let due = slot.nacked_us.is_none_or(|t| now_us.saturating_sub(t) >= repair.wait_us);
+                let shards = match &slot.state {
+                    State::Missing => Vec::new(),
+                    State::Partial(p) => p.wanted(),
+                    State::Ready(_) | State::Dead => continue,
+                };
+                if stalled && due && slot.nacks < MAX_NACKS {
+                    nacks.push(Nack { frame: slot.frame, shards });
+                    slot.nacked_us = Some(now_us);
+                    slot.nacks += 1;
+                }
+            }
         }
+        let mut out = Vec::new();
+        while let Some(front) = self.slots.front() {
+            let give_up = match &front.state {
+                State::Ready(_) => {
+                    let Some(Slot { frame, state: State::Ready(f), .. }) = self.slots.pop_front() else {
+                        unreachable!()
+                    };
+                    self.mark = Some(frame);
+                    out.push(f);
+                    continue;
+                }
+                State::Dead => true,
+                State::Missing | State::Partial(_) => {
+                    // A later frame that is whole: any, or a keyframe.
+                    let later_ready = |keyframe: bool| {
+                        self.slots
+                            .iter()
+                            .skip(1)
+                            .any(|s| matches!(&s.state, State::Ready(f) if f.header.keyframe() || !keyframe))
+                    };
+                    let exhausted = front.nacks >= MAX_NACKS
+                        && front.nacked_us.is_some_and(|t| now_us.saturating_sub(t) >= repair.wait_us);
+                    now_us.saturating_sub(front.first_us) >= self.timeout_us
+                        || later_ready(true)
+                        || (!repair.nack && later_ready(false))
+                        || (repair.nack && exhausted)
+                }
+            };
+            if !give_up {
+                break;
+            }
+            self.give_up_front();
+        }
+        (out, nacks)
     }
 
     /// Frames lost since the last call.
-    pub fn take_lost(&mut self) -> u32 {
-        std::mem::take(&mut self.lost)
+    pub fn take_lost(&mut self) -> Option<Lost> {
+        self.lost.take()
     }
 
     /// Frames rebuilt from parity since the last call.
@@ -257,25 +364,22 @@ impl Reassembler {
         std::mem::take(&mut self.recovered)
     }
 
-    fn give_up_through(&mut self, i: usize) {
-        let frame = self.partial[i].header.frame;
-        self.partial.drain(..=i);
-        self.account(frame, i as u32);
-        self.lost += 1;
+    /// Frames completed by shards sent again since the last call.
+    pub fn take_repaired(&mut self) -> u32 {
+        std::mem::take(&mut self.repaired)
     }
 
-    /// Moves the mark to `frame`, counting the frames skipped on the way.
-    /// With no mark yet, only the `dropped` partials are known to be lost.
-    fn account(&mut self, frame: u32, dropped: u32) {
-        let lost = match self.mark {
-            Some(mark) => frame.wrapping_sub(mark).wrapping_sub(1),
-            None => dropped,
-        };
-        if lost > 0 {
-            tracing::debug!(before = frame, lost, "frames lost");
+    fn newest(&self) -> Option<u32> {
+        self.slots.back().map(|s| s.frame)
+    }
+
+    fn give_up_front(&mut self) {
+        if let Some(slot) = self.slots.pop_front() {
+            tracing::debug!(frame = slot.frame, nacks = slot.nacks, "frame lost");
+            self.mark = Some(slot.frame);
+            let count = self.lost.map_or(0, |l| l.count) + 1;
+            self.lost = Some(Lost { count, newest: slot.frame });
         }
-        self.lost += lost;
-        self.mark = Some(frame);
     }
 }
 
@@ -284,8 +388,8 @@ mod tests {
     use super::*;
     use farsight_proto::datagram::Datagram;
 
-    fn frame(data: &[u8], keyframe: bool) -> EncodedFrame<'_> {
-        EncodedFrame { data, keyframe, epoch: 1, capture_us: 10, encode_us: 2 }
+    fn frame(data: &[u8], keyframe: bool, n: u32) -> EncodedFrame<'_> {
+        EncodedFrame { data, keyframe, epoch: 1, frame: n, refs: n.wrapping_sub(1), capture_us: 10, encode_us: 2 }
     }
 
     fn split(d: &Bytes) -> (FragmentHeader, Vec<u8>) {
@@ -295,81 +399,50 @@ mod tests {
         }
     }
 
+    /// Pushes `dgrams` at `now` and polls without repair.
+    fn feed(rx: &mut Reassembler, dgrams: &[Bytes], now: u64) -> Vec<Frame> {
+        push(rx, dgrams, now);
+        rx.poll(now, Repair::NONE).0
+    }
+
+    fn push(rx: &mut Reassembler, dgrams: &[Bytes], now: u64) {
+        for d in dgrams {
+            let (h, p) = split(d);
+            rx.push(h, &p, now);
+        }
+    }
+
+    fn lost(rx: &mut Reassembler) -> u32 {
+        rx.take_lost().map_or(0, |l| l.count)
+    }
+
+    fn numbers(frames: &[Frame]) -> Vec<u32> {
+        frames.iter().map(|f| f.header.frame).collect()
+    }
+
     #[test]
     fn splits_to_the_datagram_size() {
         let data: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
-        let dgrams = Packetizer::new().packetize(&frame(&data, true), 1200, 0.0);
+        let dgrams = packetize(&frame(&data, true, 0), 1200, 0.0);
         // Three data shards, and a keyframe gets parity even on a clean link.
         assert_eq!(split(&dgrams[0]).0.data, 3);
         assert_eq!(dgrams.len(), 4);
         assert!(dgrams.iter().all(|d| d.len() <= 1200));
         let mut rx = Reassembler::new(50_000);
-        let mut out = None;
         // Out of order is fine, and any three of the four will do.
-        for d in dgrams.iter().rev() {
-            let (h, p) = split(d);
-            out = out.or(rx.push(h, &p, 5));
-        }
-        let out = out.unwrap();
-        assert_eq!(out.data, data);
-        assert!(out.header.keyframe());
-        assert_eq!(rx.take_lost(), 0);
+        let out = feed(&mut rx, &[dgrams[3].clone(), dgrams[2].clone(), dgrams[1].clone()], 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, data);
+        assert!(out[0].header.keyframe());
+        assert!(feed(&mut rx, &dgrams[..1], 6).is_empty());
+        assert_eq!((lost(&mut rx), rx.take_recovered()), (0, 1));
     }
 
     #[test]
     fn empty_frame_is_one_fragment() {
-        let dgrams = Packetizer::new().packetize(&frame(&[], false), 1200, 0.0);
+        let dgrams = packetize(&frame(&[], false, 0), 1200, 0.0);
         assert_eq!(dgrams.len(), 1);
-        let (h, p) = split(&dgrams[0]);
-        assert_eq!(Reassembler::new(1).push(h, &p, 0).unwrap().data, b"");
-    }
-
-    #[test]
-    fn incomplete_frame_is_superseded_and_counted() {
-        let mut tx = Packetizer::new();
-        let mut rx = Reassembler::new(50_000);
-        let f0 = tx.packetize(&frame(&[0; 3000], true), 1200, 0.0);
-        let f1 = tx.packetize(&frame(&[1; 100], false), 1200, 0.0);
-        let (h, p) = split(&f0[0]);
-        assert!(rx.push(h, &p, 0).is_none());
-        let (h, p) = split(&f1[0]);
-        assert_eq!(rx.push(h, &p, 1).unwrap().header.frame, 1);
-        assert_eq!(rx.take_lost(), 1);
-        // The rest of frame 0 arriving late is ignored.
-        let (h, p) = split(&f0[1]);
-        assert!(rx.push(h, &p, 2).is_none());
-        assert_eq!(rx.take_lost(), 0);
-    }
-
-    #[test]
-    fn wholly_missing_frames_are_counted() {
-        let mut tx = Packetizer::new();
-        let mut rx = Reassembler::new(50_000);
-        let all: Vec<_> = (0..4).map(|_| tx.packetize(&frame(&[7; 10], false), 1200, 0.0)).collect();
-        for i in [0, 3] {
-            let (h, p) = split(&all[i][0]);
-            assert!(rx.push(h, &p, 0).is_some());
-        }
-        assert_eq!(rx.take_lost(), 2);
-    }
-
-    #[test]
-    fn partial_frames_time_out() {
-        let mut tx = Packetizer::new();
-        let mut rx = Reassembler::new(50_000);
-        let f = tx.packetize(&frame(&[0; 3000], true), 1200, 0.0);
-        let (h, p) = split(&f[0]);
-        rx.push(h, &p, 0);
-        rx.expire(10_000);
-        assert_eq!(rx.take_lost(), 0);
-        rx.expire(60_000);
-        assert_eq!(rx.take_lost(), 1);
-        // Its late fragments are stale, and the next frame isn't a gap.
-        let (h, p) = split(&f[1]);
-        assert!(rx.push(h, &p, 60_001).is_none());
-        let (h, p) = split(&tx.packetize(&frame(&[1], false), 1200, 0.0)[0]);
-        assert!(rx.push(h, &p, 60_002).is_some());
-        assert_eq!(rx.take_lost(), 0);
+        assert_eq!(feed(&mut Reassembler::new(1), &dgrams, 0)[0].data, b"");
     }
 
     #[test]
@@ -388,61 +461,132 @@ mod tests {
     #[test]
     fn lost_shards_are_rebuilt() {
         let data: Vec<u8> = (0..20_000u32).map(|i| (i * 7) as u8).collect();
-        let dgrams = Packetizer::new().packetize(&frame(&data, false), 1200, 0.05);
+        let dgrams = packetize(&frame(&data, false, 0), 1200, 0.05);
         let (h, _) = split(&dgrams[0]);
         let parity = (h.count - h.data) as usize;
         assert!(parity >= 2);
+        // Lose the padded last data shard and as many more as there is parity.
+        let dropped: Vec<usize> = (0..parity - 1).chain([h.data as usize - 1]).collect();
+        let kept: Vec<Bytes> =
+            dgrams.iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, d)| d.clone()).collect();
         let mut rx = Reassembler::new(50_000);
-        let mut out = None;
-        // Lose the short last data shard and as many more as there is parity.
-        let lost: Vec<usize> = (0..parity - 1).chain([h.data as usize - 1]).collect();
-        for (i, d) in dgrams.iter().enumerate().filter(|(i, _)| !lost.contains(i)) {
-            let (h, p) = split(d);
-            if let Some(f) = rx.push(h, &p, i as u64) {
-                out = Some(f);
-            }
-        }
-        assert_eq!(out.unwrap().data, data);
-        assert_eq!((rx.take_recovered(), rx.take_lost()), (1, 0));
+        assert_eq!(feed(&mut rx, &kept, 0)[0].data, data);
+        assert_eq!((rx.take_recovered(), lost(&mut rx)), (1, 0));
     }
 
     #[test]
     fn shards_of_a_small_frame_never_share_a_packet() {
-        let dgrams = Packetizer::new().packetize(&frame(&[3; 200], false), 1200, 0.05);
+        let dgrams = packetize(&frame(&[3; 200], false, 0), 1200, 0.05);
         assert!(dgrams.len() >= 3);
         // QUIC would pack datagrams this small together; padded, no two fit.
         assert!(dgrams.iter().all(|d| 2 * d.len() > 1200), "{:?}", dgrams.iter().map(Bytes::len).collect::<Vec<_>>());
         let mut rx = Reassembler::new(50_000);
-        let (h, p) = split(dgrams.last().unwrap());
-        assert_eq!(rx.push(h, &p, 0).unwrap().data, [3; 200]);
+        assert_eq!(feed(&mut rx, &dgrams[dgrams.len() - 1..], 0)[0].data, [3; 200]);
         // Alone, a frame isn't padded.
-        let dgrams = Packetizer::new().packetize(&frame(&[3; 200], false), 1200, 0.0);
+        let dgrams = packetize(&frame(&[3; 200], false, 0), 1200, 0.0);
         assert_eq!(dgrams.len(), 1);
         assert_eq!(dgrams[0].len(), VIDEO_OVERHEAD + 200);
     }
 
     #[test]
-    fn too_much_loss_loses_the_frame() {
-        let mut tx = Packetizer::new();
-        let dgrams = tx.packetize(&frame(&[9; 5000], false), 1200, 0.05);
-        let (h, _) = split(&dgrams[0]);
+    fn without_repair_a_later_frame_supersedes() {
         let mut rx = Reassembler::new(50_000);
-        for d in &dgrams[(h.count - h.data + 1) as usize..] {
-            let (h, p) = split(d);
-            assert!(rx.push(h, &p, 0).is_none());
-        }
-        rx.expire(50_000);
-        assert_eq!(rx.take_lost(), 1);
+        let f0 = packetize(&frame(&[0; 3000], false, 0), 1200, 0.0);
+        let f1 = packetize(&frame(&[1; 100], false, 1), 1200, 0.0);
+        assert!(feed(&mut rx, &f0[..1], 0).is_empty());
+        assert_eq!(numbers(&feed(&mut rx, &f1, 1)), [1]);
+        assert_eq!(lost(&mut rx), 1);
+        // The rest of frame 0 arriving late is ignored.
+        assert!(feed(&mut rx, &f0[1..], 2).is_empty());
+        assert_eq!(lost(&mut rx), 0);
+    }
+
+    #[test]
+    fn wholly_missing_frames_are_counted() {
+        let mut rx = Reassembler::new(50_000);
+        let all: Vec<_> = (0..4).map(|n| packetize(&frame(&[7; 10], false, n), 1200, 0.0)).collect();
+        assert_eq!(numbers(&feed(&mut rx, &all[0], 0)), [0]);
+        assert_eq!(numbers(&feed(&mut rx, &all[3], 0)), [3]);
+        assert_eq!(rx.take_lost(), Some(Lost { count: 2, newest: 2 }));
+    }
+
+    #[test]
+    fn partial_frames_time_out() {
+        let mut rx = Reassembler::new(50_000);
+        let f = packetize(&frame(&[0; 3000], true, 0), 1200, 0.0);
+        feed(&mut rx, &f[..1], 0);
+        rx.poll(10_000, Repair::NONE);
+        assert_eq!(lost(&mut rx), 0);
+        rx.poll(60_000, Repair::NONE);
+        assert_eq!(lost(&mut rx), 1);
+        // Its late fragments are stale, and the next frame isn't a gap.
+        assert!(feed(&mut rx, &f[1..2], 60_001).is_empty());
+        assert_eq!(numbers(&feed(&mut rx, &packetize(&frame(&[1], false, 1), 1200, 0.0), 60_002)), [1]);
+        assert_eq!(lost(&mut rx), 0);
     }
 
     #[test]
     fn frame_numbers_wrap() {
-        let mut tx = Packetizer { next_frame: u32::MAX };
         let mut rx = Reassembler::new(50_000);
-        for expect in [u32::MAX, 0, 1] {
-            let (h, p) = split(&tx.packetize(&frame(&[1], false), 1200, 0.0)[0]);
-            assert_eq!(rx.push(h, &p, 0).unwrap().header.frame, expect);
+        for n in [u32::MAX, 0, 1] {
+            assert_eq!(numbers(&feed(&mut rx, &packetize(&frame(&[1], false, n), 1200, 0.0), 0)), [n]);
         }
-        assert_eq!(rx.take_lost(), 0);
+        assert_eq!(lost(&mut rx), 0);
+    }
+
+    const REPAIR: Repair = Repair { nack: true, wait_us: 5_000 };
+
+    #[test]
+    fn a_stalled_frame_is_nacked_and_holds_the_next_back() {
+        let mut rx = Reassembler::new(250_000);
+        let f0 = packetize(&frame(&[0; 3000], false, 0), 1200, 0.0);
+        let f1 = packetize(&frame(&[1; 100], false, 1), 1200, 0.0);
+        push(&mut rx, &f0[..1], 0);
+        // Still arriving: nothing to ask for yet.
+        assert!(rx.poll(1_000, REPAIR).1.is_empty());
+        push(&mut rx, &f1, 2_000);
+        // Frame 1 is whole but waits; frame 0 is asked for.
+        let (out, nacks) = rx.poll(2_000, REPAIR);
+        assert!(out.is_empty());
+        assert_eq!(nacks, [Nack { frame: 0, shards: vec![1, 2] }]);
+        // Not again until the answer is due.
+        assert!(rx.poll(3_000, REPAIR).1.is_empty());
+        push(&mut rx, &f0[1..], 4_000);
+        let (out, _) = rx.poll(4_000, REPAIR);
+        assert_eq!(numbers(&out), [0, 1]);
+        assert_eq!((rx.take_repaired(), lost(&mut rx)), (1, 0));
+    }
+
+    #[test]
+    fn the_last_frame_is_nacked_once_it_stalls() {
+        let mut rx = Reassembler::new(250_000);
+        let f0 = packetize(&frame(&[0; 3000], false, 0), 1200, 0.0);
+        push(&mut rx, &f0[..2], 0);
+        assert!(rx.poll(STALL_US - 1, REPAIR).1.is_empty());
+        assert_eq!(rx.poll(STALL_US, REPAIR).1, [Nack { frame: 0, shards: vec![2] }]);
+    }
+
+    #[test]
+    fn a_missing_frame_is_nacked_whole_then_given_up() {
+        let mut rx = Reassembler::new(250_000);
+        feed(&mut rx, &packetize(&frame(&[0], false, 0), 1200, 0.0), 0);
+        push(&mut rx, &packetize(&frame(&[2], false, 2), 1200, 0.0), 1_000);
+        let (out, nacks) = rx.poll(1_000, REPAIR);
+        assert!(out.is_empty());
+        assert_eq!(nacks, [Nack { frame: 1, shards: vec![] }]);
+        assert_eq!(rx.poll(6_000, REPAIR).1.len(), 1, "asked twice");
+        let (out, nacks) = rx.poll(11_000, REPAIR);
+        assert!(nacks.is_empty());
+        assert_eq!(numbers(&out), [2]);
+        assert_eq!(lost(&mut rx), 1);
+    }
+
+    #[test]
+    fn a_keyframe_goes_at_once() {
+        let mut rx = Reassembler::new(250_000);
+        push(&mut rx, &packetize(&frame(&[0; 3000], false, 0), 1200, 0.0)[..1], 0);
+        push(&mut rx, &packetize(&frame(&[1; 10], true, 1), 1200, 0.0), 1);
+        assert_eq!(numbers(&rx.poll(1, REPAIR).0), [1]);
+        assert_eq!(lost(&mut rx), 1);
     }
 }
