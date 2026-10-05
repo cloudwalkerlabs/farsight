@@ -107,6 +107,12 @@ make -j"$jobs"
 make install
 cd ..
 msvc_names
+# FFmpeg's MSVC toolchain writes -L and -lfoo into its .pc files as
+# -libpath: and foo.lib, which the pkg-config crate doesn't understand.
+if [ "$os" = windows ]; then
+    sed -i -E 's/-libpath:/-L/g; s/ ([A-Za-z0-9_]+)\.lib\b/ -l\1/g' "$prefix"/lib/pkgconfig/libav*.pc
+    cat "$prefix"/lib/pkgconfig/libav*.pc
+fi
 
 
 mkdir -p "$prefix/notice"
