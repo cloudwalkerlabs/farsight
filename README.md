@@ -39,6 +39,12 @@ android/           Android app (Gradle, Compose)
 dist/              example systemd unit
 ```
 
+## Downloads
+
+Each [release](https://github.com/simophin/farsight/releases) has the Linux
+server and desktop client, the desktop client for macOS (it needs
+`brew install ffmpeg`) and Windows, and the Android app.
+
 ## Building
 
 ```sh
