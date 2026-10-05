@@ -36,8 +36,8 @@ const GAIN: f64 = 0.3e-6;
 const MAX_ADJUST: f64 = 0.005;
 
 /// More than this past the target, and whole frames are dropped to catch
-/// up: the network stalled and everything arrived at once.
-const OVERFLOW_US: u64 = 80_000;
+/// up: the network or the output stalled, and everything arrived at once.
+const OVERFLOW_US: u64 = 40_000;
 
 #[derive(Debug)]
 struct Slot {
@@ -263,7 +263,16 @@ impl Player {
         self.stats.target_us = self.us(target);
         if !self.started {
             if level >= target && self.next_seq.is_some() {
+                // Start at the target, not with whatever piled up while
+                // the output was opening.
+                let mut level = level;
+                while level >= target + self.frame_samples && self.slots.len() > 1 {
+                    self.slots.pop_front();
+                    self.next_seq = self.next_seq.map(|s| s.wrapping_add(1));
+                    level -= self.frame_samples;
+                }
                 self.started = true;
+                return self.pull(out, now_local_us, output_delay_us, offset_us);
             } else {
                 out.fill(0.0);
                 return;

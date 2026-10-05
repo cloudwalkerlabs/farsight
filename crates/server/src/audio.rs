@@ -100,7 +100,18 @@ fn pipewire_thread(
     let stream = pw::stream::StreamBox::new(&core, "farsight-speaker", props)?;
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .state_changed(|_, _, old, new| tracing::debug!(?old, ?new, "speaker state"))
+        .state_changed({
+            let tx = tx.clone();
+            move |_, _, old, new| {
+                tracing::debug!(?old, ?new, "speaker state");
+                // Nothing plays any more: say so, rather than let the client
+                // conceal the silence as loss.
+                if matches!(old, pw::stream::StreamState::Streaming) {
+                    let capture_us = start.elapsed().as_micros() as u64;
+                    let _ = tx.try_send(Cycle { capture_us, frames: 0, samples: Box::new([0.0; MAX_CYCLE * CHANNELS]) });
+                }
+            }
+        })
         .process(move |stream, _| {
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
             let datas = buffer.datas_mut();
@@ -196,8 +207,23 @@ impl Packer {
     }
 
     /// Takes one cycle, and calls `send` with each datagram it completes.
+    /// An empty cycle means the node stopped: one silent frame ends the
+    /// stream.
     fn push(&mut self, cycle: &Cycle, mut send: impl FnMut(Vec<u8>)) {
         let frame_samples = CONFIG.frame_samples();
+        if cycle.frames == 0 {
+            if self.silent_run < SILENT_FRAMES {
+                let silence = vec![0.0; frame_samples * CHANNELS];
+                let capture_us = self.next_us.unwrap_or(cycle.capture_us);
+                if let Some(d) = self.frame(&silence, capture_us) {
+                    send(d);
+                }
+            }
+            self.pending.clear();
+            self.next_us = None;
+            self.discontinuity = true;
+            return;
+        }
         let cycle_us = cycle.frames as u64 * 1_000_000 / SAMPLE_RATE as u64;
         // The node paused and resumed: what follows is a new stream.
         if self.next_us.is_some_and(|n| cycle.capture_us > n + 2 * CONFIG.frame_us as u64) {
@@ -328,6 +354,20 @@ mod tests {
         assert_eq!(out.len(), SILENT_FRAMES as usize);
         p.push(&cycle(200_000, 0.1), |d| out.push(d));
         let Some(Datagram::Audio(again)) = Datagram::decode(out.last().unwrap()) else { panic!() };
+        assert!(again.discontinuity());
+    }
+
+    #[test]
+    fn a_stop_ends_in_silence() {
+        let mut p = Packer::new().unwrap();
+        let mut out = Vec::new();
+        p.push(&cycle(0, 0.1), |d| out.push(d));
+        p.push(&Cycle { capture_us: 9000, frames: 0, samples: Box::new([0.0; MAX_CYCLE * CHANNELS]) }, |d| out.push(d));
+        let Some(Datagram::Audio(last)) = Datagram::decode(&out[1]) else { panic!() };
+        assert!(last.silence());
+        assert_eq!(last.capture_us, 5000);
+        p.push(&cycle(50_000, 0.1), |d| out.push(d));
+        let Some(Datagram::Audio(again)) = Datagram::decode(&out[2]) else { panic!() };
         assert!(again.discontinuity());
     }
 
