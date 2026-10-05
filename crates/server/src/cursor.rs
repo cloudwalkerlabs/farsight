@@ -28,7 +28,7 @@ pub struct Cursor {
     /// The cursor as it is now, and the image it names, if any.
     shape: Option<CursorShape>,
     image: Option<CursorImage>,
-    /// Images the current client has.
+    /// Images every client has.
     sent: HashSet<u64>,
 }
 
@@ -75,7 +75,8 @@ pub fn surface_committed(host: &mut Host, surface: &WlSurface) {
     );
 }
 
-/// A new client has no images yet; send it the cursor as it is.
+/// A new client has no images yet; send the cursor as it is (to everyone:
+/// the others get a repeat, which costs little).
 pub fn client_connected(host: &mut Host) {
     host.cursor.sent.clear();
     if let Some(shape) = host.cursor.shape.clone() {
@@ -91,14 +92,16 @@ fn set_shape(host: &mut Host, shape: CursorShape) {
 }
 
 fn send_shape(host: &mut Host, shape: CursorShape) {
-    let Some(client) = host.client else { return };
+    if host.clients.is_empty() {
+        return;
+    }
     if let CursorShape::Image(id) = shape
         && host.cursor.sent.insert(id)
         && let Some(image) = host.cursor.image.clone().filter(|i| i.id == id)
     {
-        let _ = host.net.send(ToNet::Message(client, ServerMessage::CursorImage(image)));
+        let _ = host.net.send(ToNet::Broadcast(ServerMessage::CursorImage(image)));
     }
-    let _ = host.net.send(ToNet::Message(client, ServerMessage::Cursor(shape)));
+    let _ = host.net.send(ToNet::Broadcast(ServerMessage::Cursor(shape)));
 }
 
 /// The cursor surface's pixels, as premultiplied BGRA with the hotspot in

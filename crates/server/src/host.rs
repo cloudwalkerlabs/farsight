@@ -81,12 +81,13 @@ pub struct Host {
     pub renderer: GlesRenderer,
     pub pipeline: Pipeline,
     pub running: bool,
-    /// The connected client, if any.
+    /// The client in control, if any: its input and layout apply.
     pub client: Option<ConnId>,
+    /// Every connected client, the controlling one included, with what it
+    /// can decode. The stream is in a format they all share (§3, §6).
+    pub clients: Vec<(ConnId, Vec<farsight_proto::codec::DecoderCaps>)>,
     pub input: farsight_proto::input::InputReceiver,
-    /// What the client can decode and the mode it wants, for negotiating
-    /// again mid-session (§3).
-    pub decoders: Vec<farsight_proto::codec::DecoderCaps>,
+    /// The mode the controlling client wants.
     pub mode: farsight_proto::codec::Mode,
     pub cursor: Cursor,
     /// The host's connection to the nested compositor, for its output
@@ -162,8 +163,8 @@ impl Host {
             pipeline,
             running: true,
             client: None,
+            clients: Vec::new(),
             input: Default::default(),
-            decoders: Vec::new(),
             mode: Default::default(),
             cursor: Cursor::default(),
             outputs: None,

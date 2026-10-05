@@ -296,65 +296,99 @@ fn config_dir() -> Option<PathBuf> {
 fn on_net(host: &mut Host, msg: ToHost) {
     match msg {
         ToHost::Connected(id, hello) => {
-            if host.client.is_some() {
-                input::release_all(host);
+            host.clients.push((id, hello.decoders));
+            if hello.view_only {
+                tracing::info!(id, "a client joins view-only");
+            } else {
+                // Taking over: whatever the last client held is let go.
+                if host.client.is_some() {
+                    input::release_all(host);
+                }
+                host.client = Some(id);
+                host.input = Default::default();
+                host.mode = hello.mode;
             }
-            let choices = pipeline::negotiate(host.pipeline.encoders(), &hello.decoders, hello.mode);
-            host.client = Some(id);
-            host.input = Default::default();
-            host.decoders = hello.decoders;
-            host.mode = hello.mode;
-            host.pipeline.set_choices(choices, hello.mode);
+            renegotiate(host);
             let encodings = host.pipeline.encodings();
-            tracing::info!(id, mode = ?hello.mode, encodings = ?encodings.iter().map(|e| e.to_string()).collect::<Vec<_>>(), "negotiated");
             let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(Welcome { encodings })));
-            let resized = set_layout(host, hello.layout);
+            let resized = !hello.view_only && set_layout(host, hello.layout);
             cursor::client_connected(host);
-            host.pipeline.set_client(Some(id));
+            host.pipeline.set_watched(true);
             // After a resize the desktop's next frame, at the new size, is the
             // first keyframe; otherwise send what is on screen now.
             if !resized {
                 pipeline::refresh(host);
             }
         }
-        ToHost::Message(id, msg) if host.client == Some(id) => match msg {
-            ClientMessage::RequestKeyframe => {
-                tracing::debug!("keyframe requested");
-                pipeline::refresh(host);
+        ToHost::Message(id, msg) if host.clients.iter().any(|(c, _)| *c == id) => {
+            let controls = host.client == Some(id);
+            match msg {
+                ClientMessage::RequestKeyframe => {
+                    tracing::debug!(id, "keyframe requested");
+                    pipeline::refresh(host);
+                }
+                ClientMessage::RequestRefresh(rects) => {
+                    tracing::debug!(?rects, "refresh requested");
+                    pipeline::repaint(host, &rects);
+                }
+                ClientMessage::DecoderFailed(format) => {
+                    tracing::warn!(id, %format, "a client's decoder failed");
+                    if let Some((_, decoders)) = host.clients.iter_mut().find(|(c, _)| *c == id) {
+                        decoders.retain(|d| d.format != format);
+                    }
+                    host.pipeline.drop_format(format);
+                    renegotiate(host);
+                    pipeline::refresh(host);
+                }
+                ClientMessage::SetLayout(layout) if controls => {
+                    set_layout(host, layout);
+                }
+                ClientMessage::SetMode(mode) if controls => {
+                    host.mode = mode;
+                    // Tiles change their JPEG subsampling; video may change
+                    // format.
+                    renegotiate(host);
+                    pipeline::refresh(host);
+                }
+                ClientMessage::SetLayout(_) | ClientMessage::SetMode(_) => {
+                    tracing::debug!(id, "ignored from a view-only client");
+                }
+                ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
+                ClientMessage::SetAudio { .. } => {} // the network thread's
             }
-            ClientMessage::SetLayout(layout) => {
-                set_layout(host, layout);
-            }
-            ClientMessage::RequestRefresh(rects) => {
-                tracing::debug!(?rects, "refresh requested");
-                pipeline::repaint(host, &rects);
-            }
-            ClientMessage::SetMode(mode) => {
-                host.mode = mode;
-                let choices = pipeline::negotiate(host.pipeline.encoders(), &host.decoders, mode);
-                tracing::info!(?mode, formats = ?choices.iter().map(|c| c.format.to_string()).collect::<Vec<_>>(), "mode changed");
-                // Tiles change their JPEG subsampling; video may change format.
-                host.pipeline.set_choices(choices, mode);
-                pipeline::refresh(host);
-            }
-            ClientMessage::DecoderFailed(format) => {
-                tracing::warn!(%format, "the client's decoder failed");
-                host.decoders.retain(|d| d.format != format);
-                host.pipeline.drop_format(format);
-                pipeline::refresh(host);
-            }
-            ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
-            ClientMessage::SetAudio { .. } => {} // the network thread's
-        },
-        ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
-        ToHost::Disconnected(id) if host.client == Some(id) => {
-            input::release_all(host);
-            host.client = None;
-            host.pipeline.set_client(None);
         }
-        _ => {} // from a connection that has been taken over
+        ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
+        ToHost::Disconnected(id) => {
+            host.clients.retain(|(c, _)| *c != id);
+            if host.client == Some(id) {
+                input::release_all(host);
+                host.client = None;
+            }
+            if host.clients.is_empty() {
+                host.pipeline.set_watched(false);
+            } else {
+                // A viewer that limited the format may have gone.
+                renegotiate(host);
+                pipeline::refresh(host);
+            }
+        }
+        _ => {} // from a connection that has gone, or a viewer's input
     }
     let _ = host.display.flush_clients();
+}
+
+/// Picks the formats every client can decode, best first, in the
+/// controlling client's mode (§3). The next frame starts a new epoch.
+fn renegotiate(host: &mut Host) {
+    let lists: Vec<&[farsight_proto::codec::DecoderCaps]> = host.clients.iter().map(|(_, d)| d.as_slice()).collect();
+    let decoders = farsight_proto::codec::shared(&lists);
+    let choices = pipeline::negotiate(host.pipeline.encoders(), &decoders, host.mode);
+    host.pipeline.set_choices(choices, host.mode);
+    let encodings = host.pipeline.encodings();
+    tracing::info!(
+        clients = host.clients.len(), mode = ?host.mode,
+        encodings = ?encodings.iter().map(|e| e.to_string()).collect::<Vec<_>>(), "negotiated"
+    );
 }
 
 /// Applies the client's layout, within what the encoder allows. Returns

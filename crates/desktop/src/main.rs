@@ -80,6 +80,10 @@ struct Args {
     /// Don't play the session's audio; the server doesn't send it.
     #[arg(long)]
     no_audio: bool,
+    /// Watch only, next to whoever controls the session, instead of taking
+    /// it over. Input and the window's size aren't sent.
+    #[arg(long)]
+    view_only: bool,
     /// Plaintext mode, for a server started with --no-tls on a tailnet or
     /// WireGuard tunnel. A server once reached over TLS is refused in
     /// plaintext until its known_hosts line is removed.
@@ -143,7 +147,8 @@ fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
 /// From the other threads to the window.
 enum UserEvent {
     Connected(Arc<Client>),
-    Failed(String),
+    /// Connecting failed; `refused` if trying again won't help.
+    Failed { error: String, refused: bool },
     Net(Event),
     Decoded(Decoded),
 }
@@ -196,6 +201,16 @@ struct App {
     /// Audio announced before the connection was ready.
     audio_pending: Option<farsight_proto::audio::AudioConfig>,
     audio: Option<audio::Output>,
+    /// The connection was lost; connect again at this time.
+    reconnect_at: Option<Instant>,
+    /// Failed attempts since the connection was lost; `None` while
+    /// connected, or before the first connection.
+    reconnects: Option<u32>,
+}
+
+/// The wait before reconnecting: 0.5 s, doubling to 5 s.
+fn reconnect_delay(attempts: u32) -> Duration {
+    Duration::from_millis((500u64 << attempts.min(4)).min(5000))
 }
 
 /// At most one `SetLayout` this often during a drag-resize (§5).
@@ -244,6 +259,8 @@ fn main() -> anyhow::Result<()> {
         layout_pending: None,
         audio_pending: None,
         audio: None,
+        reconnect_at: None,
+        reconnects: None,
     };
     event_loop.run_app(&mut app)?;
     let App { client, runtime, decode_thread, exit, .. } = app;
@@ -306,6 +323,12 @@ impl App {
     fn connect(&mut self) {
         let Some(layout) = self.window_layout() else { return };
         self.layout_sent = Some((layout, Instant::now()));
+        // A new connection gets a decoder thread of its own; the last one
+        // has ended with its connection. One VA context at a time.
+        if let Some(t) = self.decode_thread.take() {
+            let _ = t.join();
+        }
+        self.client_cell = Arc::default();
         let (decode_tx, decode_rx) = mpsc::channel::<ToDecoder>();
         let mut decoders = decode::offered(!self.args.software);
         if !self.args.codec.is_empty() {
@@ -333,6 +356,7 @@ impl App {
             decoders,
             mode: self.args.mode,
             audio,
+            view_only: self.args.view_only,
         };
         let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
         let events = self.proxy.clone();
@@ -360,7 +384,8 @@ impl App {
                     let _ = proxy.send_event(UserEvent::Connected(client));
                 }
                 Err(err) => {
-                    let _ = proxy.send_event(UserEvent::Failed(format!("{err:#}")));
+                    let refused = err.is::<farsight_client::Refused>();
+                    let _ = proxy.send_event(UserEvent::Failed { error: format!("{err:#}"), refused });
                 }
             }
         });
@@ -396,6 +421,9 @@ impl App {
     /// Sends the pending layout if the throttle allows; returns when it
     /// will, otherwise.
     fn send_layout(&mut self) -> Option<Instant> {
+        if self.args.view_only {
+            return None; // the controlling client's window sets the layout
+        }
         let layout = self.layout_pending?;
         let client = self.client.as_ref()?;
         if let Some((_, at)) = self.layout_sent
@@ -425,7 +453,16 @@ impl App {
         }
     }
 
+    fn set_title(&self, suffix: &str) {
+        if let Some(gfx) = &self.gfx {
+            gfx.window.set_title(&format!("farsight — {}{suffix}", self.server_name));
+        }
+    }
+
     fn input(&self, event: InputEvent) {
+        if self.args.view_only {
+            return;
+        }
         if let Some(c) = &self.client {
             c.input(event);
         }
@@ -525,7 +562,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.send_layout() {
+        if self.reconnect_at.is_some_and(|at| Instant::now() >= at) {
+            self.reconnect_at = None;
+            self.connect();
+        }
+        let wake = [self.send_layout(), self.reconnect_at].into_iter().flatten().min();
+        match wake {
             Some(at) => event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
         }
@@ -545,13 +587,25 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Connected(client) => {
                 self.client = Some(client);
+                if self.reconnects.take().is_some() {
+                    tracing::info!("reconnected");
+                    self.set_title("");
+                }
                 if let Some(config) = self.audio_pending.take() {
                     self.start_audio(config);
                 }
                 // The window may have changed while connecting.
                 self.layout_changed();
             }
-            UserEvent::Failed(err) => self.fail(event_loop, anyhow::anyhow!(err)),
+            UserEvent::Failed { error, refused } => match self.reconnects {
+                // Lost, and not back yet: keep trying, unless refused.
+                Some(n) if !refused => {
+                    tracing::info!(attempt = n + 1, "reconnecting failed: {error}");
+                    self.reconnects = Some(n + 1);
+                    self.reconnect_at = Some(Instant::now() + reconnect_delay(n + 1));
+                }
+                _ => self.fail(event_loop, anyhow::anyhow!(error)),
+            },
             UserEvent::Decoded(d) => {
                 if let Some(gfx) = &self.gfx {
                     gfx.window.request_redraw();
@@ -567,9 +621,21 @@ impl ApplicationHandler<UserEvent> for App {
                 Some(_) => self.start_audio(config),
                 None => self.audio_pending = Some(config),
             },
-            UserEvent::Net(Event::Closed(reason)) => {
+            UserEvent::Net(Event::Closed { reason, retry }) => {
                 tracing::info!(%reason, "disconnected");
-                event_loop.exit();
+                self.client = None;
+                self.audio = None;
+                self.audio_pending = None;
+                if retry {
+                    // The session lives on at the server; the picture stays
+                    // until it's back.
+                    self.reconnects = Some(0);
+                    self.reconnect_at = Some(Instant::now() + reconnect_delay(0));
+                    self.set_title(" (reconnecting…)");
+                } else {
+                    println!("{reason}");
+                    event_loop.exit();
+                }
             }
             UserEvent::Net(_) => {}
         }

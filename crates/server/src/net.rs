@@ -1,10 +1,11 @@
 //! The server's network side: a tokio thread that owns the QUIC endpoint
 //! and talks to the host's event loop through two channels.
 //!
-//! One client is served at a time. A new connection takes over from the
-//! current one, which is closed; the session itself carries on (§6).
-//! Messages are tagged with the connection they belong to, so nothing meant
-//! for an old connection reaches a new one.
+//! One client controls the session at a time: a new controlling client
+//! takes over, and the previous one is closed. Any number of others may
+//! watch, view-only (§6). Video, tiles, cursor and audio go to every
+//! connection alike, encoded once; replies go to the connection they answer.
+//! The session itself outlives them all.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -17,7 +18,7 @@ use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{auth, endpoint, stream};
 use farsight_proto::audio::AudioConfig;
-use farsight_proto::control::{ClientMessage, Hello, ServerMessage};
+use farsight_proto::control::{ClientMessage, Hello, ServerMessage, close};
 use farsight_proto::datagram::{self, Datagram, Pong};
 use farsight_proto::tiles::TilesHeader;
 use farsight_proto::input::InputPacket;
@@ -41,9 +42,13 @@ pub enum ToHost {
 /// From the host (or the encode thread) to the network.
 #[derive(Debug)]
 pub enum ToNet {
-    Frame(ConnId, Frame),
-    Tiles(ConnId, Tiles),
+    /// Video and tiles, for every connection.
+    Frame(Frame),
+    Tiles(Tiles),
+    /// For one connection.
     Message(ConnId, ServerMessage),
+    /// For every connection.
+    Broadcast(ServerMessage),
     /// An audio datagram, for whichever client listens.
     Audio(Bytes),
     /// The session is ending: close every connection with this reason.
@@ -77,9 +82,6 @@ pub struct Audio {
     pub listening: AtomicBool,
 }
 
-/// The application close code for a client whose key isn't authorized.
-pub const CLOSE_UNAUTHORIZED: u32 = 3;
-
 pub struct Options {
     pub listen: Option<std::net::IpAddr>,
     /// Plaintext mode (§1); needs `listen`.
@@ -96,14 +98,15 @@ pub struct Options {
     pub audio: Arc<Audio>,
 }
 
-/// The current connection, if any.
-struct Current {
+/// A client that said hello.
+struct Conn {
     id: ConnId,
     conn: Connection,
     sched: Scheduler,
     control: mpsc::UnboundedSender<ServerMessage>,
     /// The client plays audio and hasn't muted it.
     audio: bool,
+    view_only: bool,
 }
 
 /// Starts the network thread and returns where to send it frames and
@@ -137,11 +140,18 @@ pub fn spawn(opts: Options, host: HostSender<ToHost>) -> anyhow::Result<mpsc::Un
 struct Shared {
     opts: Options,
     host: HostSender<ToHost>,
-    current: Mutex<Option<Current>>,
+    conns: Mutex<Vec<Conn>>,
+}
+
+impl Shared {
+    /// The speaker encodes while anyone listens.
+    fn update_listening(&self, conns: &[Conn]) {
+        self.opts.audio.listening.store(conns.iter().any(|c| c.audio), Ordering::Relaxed);
+    }
 }
 
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
-    let shared = Arc::new(Shared { opts, host, current: Mutex::default() });
+    let shared = Arc::new(Shared { opts, host, conns: Mutex::default() });
     tokio::spawn(dispatch(rx, shared.clone()));
     let mut next_id: ConnId = 0;
     while let Some(incoming) = endpoint.accept().await {
@@ -153,29 +163,29 @@ async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>,
                 Ok(()) => tracing::info!(id, %addr, "client gone"),
                 Err(err) => tracing::info!(id, %addr, "client gone: {err:#}"),
             }
-            let mut cur = shared.current.lock().unwrap();
-            if cur.as_ref().is_some_and(|c| c.id == id) {
-                *cur = None;
-                shared.opts.audio.listening.store(false, Ordering::Relaxed);
-            }
+            let mut conns = shared.conns.lock().unwrap();
+            conns.retain(|c| c.id != id);
+            shared.update_listening(&conns);
             let _ = shared.host.send(ToHost::Disconnected(id));
         });
     }
 }
 
-/// Routes the host's output to the current connection.
+/// Routes the host's output to the connections.
 async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
     let mut packetizer = Packetizer::new();
     let mut next_update: u32 = 0;
     while let Some(msg) = rx.recv().await {
-        let cur = shared.current.lock().unwrap();
-        let Some(c) = cur.as_ref() else { continue };
+        let conns = shared.conns.lock().unwrap();
         match msg {
             ToNet::Shutdown(reason) => {
-                c.conn.close(2u32.into(), reason.as_bytes());
+                for c in conns.iter() {
+                    c.conn.close(close::SESSION_ENDED.into(), reason.as_bytes());
+                }
             }
-            ToNet::Frame(id, f) if id == c.id => {
-                let Some(max) = c.conn.max_datagram_size() else { continue };
+            ToNet::Frame(f) => {
+                // One packetization fits every connection's path.
+                let Some(max) = conns.iter().filter_map(|c| c.conn.max_datagram_size()).min() else { continue };
                 let frame = EncodedFrame {
                     data: &f.data,
                     keyframe: f.keyframe,
@@ -183,11 +193,14 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     capture_us: f.capture_us,
                     encode_us: f.encode_us,
                 };
-                c.sched.send_frame(packetizer.packetize(&frame, max), f.keyframe);
+                let datagrams = packetizer.packetize(&frame, max);
+                for c in conns.iter() {
+                    c.sched.send_frame(datagrams.clone(), f.keyframe);
+                }
             }
-            ToNet::Tiles(id, t) if id == c.id => {
+            ToNet::Tiles(t) => {
                 let count = t.update.bodies.len();
-                if count == 0 {
+                if count == 0 || conns.is_empty() {
                     continue;
                 }
                 let mut header = TilesHeader {
@@ -200,7 +213,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     bounds: t.update.bounds,
                 };
                 next_update = next_update.wrapping_add(1);
-                let datagrams = t
+                let datagrams: Vec<Bytes> = t
                     .update
                     .bodies
                     .iter()
@@ -214,19 +227,31 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     })
                     .collect();
                 // Never superseded: each update carries only what changed.
-                c.sched.send_frame(datagrams, false);
+                for c in conns.iter() {
+                    c.sched.send_frame(datagrams.clone(), false);
+                }
             }
-            ToNet::Message(id, m) if id == c.id => {
-                let _ = c.control.send(m);
+            ToNet::Message(id, m) => {
+                if let Some(c) = conns.iter().find(|c| c.id == id) {
+                    let _ = c.control.send(m);
+                }
             }
-            ToNet::Audio(d) if c.audio => c.sched.send(Priority::Audio, d),
-            _ => {} // for a connection that has gone
+            ToNet::Broadcast(m) => {
+                for c in conns.iter() {
+                    let _ = c.control.send(m.clone());
+                }
+            }
+            ToNet::Audio(d) => {
+                for c in conns.iter().filter(|c| c.audio) {
+                    c.sched.send(Priority::Audio, d.clone());
+                }
+            }
         }
     }
 }
 
 async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow::Result<()> {
-    let (host, current, audio) = (&shared.host, &shared.current, &shared.opts.audio);
+    let (host, audio) = (&shared.host, &shared.opts.audio);
     let (authorized_keys, rate_bps, start) = (&shared.opts.authorized_keys, shared.opts.rate_bps, shared.opts.start);
     let conn = incoming.await.context("handshake")?;
     tracing::info!(id, addr = %conn.remote_address(), "client connected");
@@ -236,7 +261,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
     };
     let key = hello.auth.key;
     let refuse = |why: &str| {
-        conn.close(CLOSE_UNAUTHORIZED.into(), why.as_bytes());
+        conn.close(close::UNAUTHORIZED.into(), why.as_bytes());
         anyhow::anyhow!("refused: {why}")
     };
     if !auth::verify(&conn, &key, &hello.auth.signature) {
@@ -256,20 +281,30 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
             return Err(refuse("the server can't read its authorized keys"));
         }
     }
-    tracing::info!(id, layout = ?hello.layout, decoders = hello.decoders.len(), "hello");
+    let view_only = hello.view_only;
+    tracing::info!(id, layout = ?hello.layout, decoders = hello.decoders.len(), view_only, "hello");
 
     let sched = Scheduler::spawn(conn.clone(), rate_bps, endpoint::DATAGRAM_BUFFER);
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // Audio goes to a client that plays it, from a session that has it.
     let audio_config = hello.audio.and(audio.config.get().copied());
-    let next = Current { id, conn: conn.clone(), sched: sched.clone(), control: control_tx, audio: audio_config.is_some() };
-    let previous = current.lock().unwrap().replace(next);
-    audio.listening.store(audio_config.is_some(), Ordering::Relaxed);
-    if let Some(prev) = previous {
-        tracing::info!(id, previous = prev.id, "taking over the session");
-        prev.conn.close(1u32.into(), b"another client took over");
+    let next =
+        Conn { id, conn: conn.clone(), sched: sched.clone(), control: control_tx, audio: audio_config.is_some(), view_only };
+    {
+        let mut conns = shared.conns.lock().unwrap();
+        if !view_only {
+            for prev in conns.iter().filter(|c| !c.view_only) {
+                tracing::info!(id, previous = prev.id, "taking over the session");
+                prev.conn.close(close::TAKEN_OVER.into(), b"another client took over");
+            }
+            conns.retain(|c| c.view_only);
+        }
+        conns.push(next);
+        shared.update_listening(&conns);
+        // Under the lock, so the host hears of connections in the order
+        // they took over.
+        let _ = host.send(ToHost::Connected(id, hello));
     }
-    let _ = host.send(ToHost::Connected(id, hello));
 
     let writer = async {
         while let Some(msg) = control_rx.recv().await {
@@ -284,12 +319,12 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
     let reader = async {
         while let Some(msg) = stream::recv::<ClientMessage>(&mut recv).await? {
             if let ClientMessage::SetAudio { play } = msg {
-                let mut cur = current.lock().unwrap();
-                if let Some(c) = cur.as_mut().filter(|c| c.id == id) {
+                let mut conns = shared.conns.lock().unwrap();
+                if let Some(c) = conns.iter_mut().find(|c| c.id == id) {
                     c.audio = play && audio_config.is_some();
-                    audio.listening.store(c.audio, Ordering::Relaxed);
                     tracing::info!(id, play, "audio");
                 }
+                shared.update_listening(&conns);
                 continue;
             }
             let _ = host.send(ToHost::Message(id, msg));

@@ -42,7 +42,7 @@ use smithay::backend::renderer::utils::CommitCounter;
 
 use crate::encode::{self, Encoder, EncoderInfo, FrameKind, Frames, Input, Output, Settings, Shaders};
 use crate::host::Host;
-use crate::net::{self, ConnId, ToNet};
+use crate::net::{self, ToNet};
 
 /// A layout change in progress. M0 found the change is not one step: frames
 /// at the new size arrive with old content, and the scale may land before
@@ -80,7 +80,7 @@ fn changed(host: &mut Host) {
 
 fn idle_tick(host: &mut Host) -> TimeoutAction {
     let p = &mut host.pipeline;
-    if p.idle.refined || p.client.is_none() {
+    if p.idle.refined || !p.watched {
         p.idle.timer = false;
         return TimeoutAction::Drop;
     }
@@ -192,9 +192,9 @@ pub struct Pipeline {
     last_buffer: Option<(Fourcc, u64, (i32, i32))>,
     frame_count: u64,
     epoch: u16,
-    /// The client frames go to. With none (and no `--out`), nothing is
+    /// Someone is connected. With no one (and no `--out`), nothing is
     /// converted or encoded.
-    client: Option<ConnId>,
+    watched: bool,
     force_keyframe: bool,
     /// When frame callbacks last went out, in host µs.
     last_callback_us: u64,
@@ -212,7 +212,8 @@ enum Job {
 struct EncodeJob {
     input: Input,
     sync: SyncPoint,
-    client: Option<ConnId>,
+    /// To the network, as well as to `--out`.
+    send: bool,
     kind: FrameKind,
     epoch: u16,
     n: u64,
@@ -262,7 +263,7 @@ impl Pipeline {
             last_buffer: None,
             frame_count: 0,
             epoch: 0,
-            client: None,
+            watched: false,
             force_keyframe: false,
             last_callback_us: 0,
             callback_timer: false,
@@ -291,9 +292,10 @@ impl Pipeline {
         self.hold = None;
     }
 
-    /// Frames go to `client` from now on, starting with a keyframe.
-    pub fn set_client(&mut self, client: Option<ConnId>) {
-        self.client = client;
+    /// Whether anyone is connected; frames go to them, starting with a
+    /// keyframe.
+    pub fn set_watched(&mut self, watched: bool) {
+        self.watched = watched;
         self.force_keyframe = true;
     }
 
@@ -337,7 +339,7 @@ impl Pipeline {
     }
 
     fn encoding(&self) -> bool {
-        self.client.is_some() || self.opts.out.is_some()
+        self.watched || self.opts.out.is_some()
     }
 
     fn send(&self, job: Job) -> Result<(), TrySendError<Job>> {
@@ -509,9 +511,9 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
     p.epoch = p.epoch.wrapping_add(1);
     p.force_keyframe = true;
     tracing::info!(epoch = p.epoch, w, h, %encoding, "new video epoch");
-    if let Some(client) = p.client {
+    if p.watched {
         let epoch = Epoch { epoch: p.epoch, encoding, layout };
-        let _ = host.net.send(ToNet::Message(client, ServerMessage::Epoch(epoch)));
+        let _ = host.net.send(ToNet::Broadcast(ServerMessage::Epoch(epoch)));
     }
     Ok(())
 }
@@ -571,7 +573,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
     let job = EncodeJob {
         input,
         sync,
-        client: p.client,
+        send: p.watched,
         kind,
         epoch: p.epoch,
         n: p.frame_count,
@@ -695,18 +697,18 @@ fn encode_thread(
                     out = None;
                 }
                 let bytes = data.len();
-                if let Some(client) = job.client {
+                if job.send {
                     let frame = net::Frame { data, keyframe, epoch: job.epoch, capture_us: job.t_commit, encode_us };
-                    let _ = net.send(ToNet::Frame(client, frame));
+                    let _ = net.send(ToNet::Frame(frame));
                 }
                 (bytes, keyframe)
             }
             Output::Tiles(mut update) => {
                 let bytes = update.bodies.iter().map(Vec::len).sum();
                 lossy.lock().unwrap().append(&mut update.lossy);
-                if let Some(client) = job.client {
+                if job.send {
                     let tiles = net::Tiles { update, epoch: job.epoch, capture_us: job.t_commit, encode_us };
-                    let _ = net.send(ToNet::Tiles(client, tiles));
+                    let _ = net.send(ToNet::Tiles(tiles));
                 }
                 (bytes, kind == FrameKind::Keyframe)
             }

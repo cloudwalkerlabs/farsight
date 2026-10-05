@@ -9,6 +9,16 @@ use crate::audio::{AudioCaps, AudioConfig};
 use crate::codec::{DecoderCaps, Encoding, Format, Mode};
 use crate::layout::Layout;
 
+/// Application close codes, with a reason for people alongside.
+pub mod close {
+    /// Another client took control of the session.
+    pub const TAKEN_OVER: u32 = 1;
+    /// The session ended: the desktop exited, or the server stopped.
+    pub const SESSION_ENDED: u32 = 2;
+    /// The client's key isn't in the server's `authorized_keys`.
+    pub const UNAUTHORIZED: u32 = 3;
+}
+
 /// The largest control message accepted, in bytes. A 256×256 cursor image
 /// is the biggest thing sent today.
 pub const MAX_MESSAGE: usize = 1 << 20;
@@ -42,6 +52,9 @@ pub struct Hello {
     /// `None` if the client plays no audio.
     pub audio: Option<AudioCaps>,
     pub auth: ClientAuth,
+    /// Join view-only, next to whoever controls the session, rather than
+    /// take it over (§6).
+    pub view_only: bool,
 }
 
 /// The client's key, and its proof (§6): an Ed25519 signature over a value
@@ -172,6 +185,7 @@ use crate::codec::{Chroma, Codec};
             mode: Mode::Text,
             audio: Some(AudioCaps { max_channels: 2 }),
             auth: ClientAuth { key: [1; 32], signature: vec![2; 64] },
+            view_only: false,
         });
         let bytes = encode_framed(&msg);
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

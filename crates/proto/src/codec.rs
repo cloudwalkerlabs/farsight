@@ -163,9 +163,42 @@ pub fn rank(encoders: &[EncoderCaps], decoders: &[DecoderCaps], mode: Mode) -> V
     choices
 }
 
+/// What every one of several clients can decode (§6: viewers share the
+/// controlling client's stream): the formats all of them list, within the
+/// smallest of their limits, in hardware only if every one decodes it in
+/// hardware.
+pub fn shared(clients: &[&[DecoderCaps]]) -> Vec<DecoderCaps> {
+    let Some((first, rest)) = clients.split_first() else { return Vec::new() };
+    first
+        .iter()
+        .filter_map(|d| {
+            let mut d = d.clone();
+            for other in rest {
+                // The best of this client's decoders for the format.
+                let o = other.iter().filter(|o| o.format == d.format).max_by_key(|o| (o.hardware, o.max_width))?;
+                d.max_width = d.max_width.min(o.max_width);
+                d.max_height = d.max_height.min(o.max_height);
+                d.hardware &= o.hardware;
+                d.partial_decode &= o.partial_decode;
+            }
+            Some(d)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_keeps_what_everyone_decodes() {
+        let caps = |format, max, hardware| DecoderCaps { format, max_width: max, max_height: max, hardware, partial_decode: false };
+        let a = [caps(H264, 4096, true), caps(HEVC, 8192, true)];
+        let b = [caps(H264, 1920, false), caps(AV1, 4096, true)];
+        assert_eq!(shared(&[&a, &b]), [caps(H264, 1920, false)]);
+        assert_eq!(shared(&[&a]), a);
+        assert!(shared(&[]).is_empty());
+    }
 
     const fn fmt(codec: Codec, chroma: Chroma) -> Format {
         Format { codec, chroma, bit_depth: 8 }

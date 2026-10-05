@@ -33,7 +33,7 @@ use farsight_proto::audio::{AudioCaps, AudioConfig};
 use farsight_proto::codec::{DecoderCaps, Format, Mode};
 use farsight_net::auth::{ClientKey, KnownHosts, Pin};
 use farsight_proto::control::{
-    ClientAuth, ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome,
+    ClientAuth, ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome, close,
 };
 use farsight_proto::datagram::{Datagram, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
@@ -58,6 +58,19 @@ const PING_SAMPLES: usize = 16;
 /// Frames held while their epoch's announcement is on its way.
 const MAX_HELD: usize = 64;
 
+/// A connection the server or the user's records refused: connecting
+/// again won't help until something changes (a key, a pin).
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// The client core's version.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -77,6 +90,8 @@ pub struct Config {
     pub mode: Mode,
     /// `None`: no audio.
     pub audio: Option<AudioCaps>,
+    /// Watch only, next to the client in control (§6).
+    pub view_only: bool,
 }
 
 #[derive(Debug)]
@@ -93,8 +108,9 @@ pub enum Event {
     /// The session's audio starts, in this format: open the output and
     /// call [`Client::fill_audio`] from it.
     AudioConfig(AudioConfig),
-    /// The connection ended; the reason.
-    Closed(String),
+    /// The connection ended. `retry`: it was lost rather than ended, so
+    /// connecting again resumes the session.
+    Closed { reason: String, retry: bool },
 }
 
 #[derive(Debug)]
@@ -175,18 +191,28 @@ impl Client {
         // Nothing goes to a server that isn't the one we know.
         if let Err(err) = cfg.known_hosts.check(&cfg.server_name, &pin) {
             conn.close(0u32.into(), b"unknown server");
-            return Err(err);
+            return Err(Refused(format!("{err:#}")).into());
         }
         let (mut send, mut recv) = conn.open_bi().await.context("opening the control stream")?;
         let auth = ClientAuth { key: cfg.key.public(), signature: cfg.key.sign(&conn)? };
-        let hello = Hello { decoders: cfg.decoders, layout: cfg.layout, mode: cfg.mode, audio: cfg.audio, auth };
+        let hello = Hello {
+            decoders: cfg.decoders,
+            layout: cfg.layout,
+            mode: cfg.mode,
+            audio: cfg.audio,
+            auth,
+            view_only: cfg.view_only,
+        };
         stream::send(&mut send, &ClientMessage::Hello(hello)).await?;
         let welcome = match stream::recv(&mut recv).await {
             Ok(m) => m,
-            Err(_) if unauthorized(&conn) => anyhow::bail!(
-                "the server doesn't know this client's key. On the server, add this line to its authorized_keys:\n  {}",
-                cfg.key.authorized_line("")
-            ),
+            Err(_) if unauthorized(&conn) => {
+                return Err(Refused(format!(
+                    "the server doesn't know this client's key. On the server, add this line to its authorized_keys:\n  {}",
+                    cfg.key.authorized_line("")
+                ))
+                .into());
+            }
             Err(err) => return Err(err),
         };
         let welcome = match welcome {
@@ -458,20 +484,28 @@ async fn run(
         r = datagrams => r,
         () = ticks => Ok(()),
     };
-    let reason = match result {
-        Ok(()) => "the server closed the connection".to_string(),
-        Err(err) => format!("{err:#}"),
+    let (reason, retry) = match conn.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(c)) => {
+            (String::from_utf8_lossy(&c.reason).into_owned(), false)
+        }
+        Some(quinn::ConnectionError::LocallyClosed) => ("closed".to_string(), false),
+        Some(other) => (other.to_string(), true),
+        None => match result {
+            Ok(()) => ("the server closed the control stream".to_string(), false),
+            Err(err) => (format!("{err:#}"), true),
+        },
     };
-    tracing::info!(%reason, "disconnected");
+    tracing::info!(%reason, retry, "disconnected");
     conn.close(0u32.into(), b"");
-    on_event(Event::Closed(reason));
+    on_event(Event::Closed { reason, retry });
 }
 
 /// The server closed the connection for want of an authorized key.
 fn unauthorized(conn: &Connection) -> bool {
-    /// As the server's `CLOSE_UNAUTHORIZED`.
-    const CODE: u32 = 3;
-    matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == CODE.into())
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == close::UNAUTHORIZED.into()
+    )
 }
 
 /// Holds frames back until their epoch is announced, so the app always
