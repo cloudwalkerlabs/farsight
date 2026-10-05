@@ -1,7 +1,8 @@
 //! Audio datagrams (`docs/design.md` §8). Desktop audio is Opus in fixed
-//! frames (5 ms by default, set by `AudioConfig`); each datagram carries the
-//! newest frame and repeats the ones before it, so a lost datagram costs
-//! nothing. Hand-encoded, like video fragments: 200 of them go every second.
+//! frames (5 ms, or 10 ms on a slow path, as `AudioConfig` says); each
+//! datagram carries the newest frame and repeats the ones before it, more
+//! of them as loss rises, so a lost datagram costs nothing. Hand-encoded,
+//! like video fragments: 200 of them go every second.
 //!
 //! ```text
 //! flags u8 | seq u32 | capture_us u64 | count u8 | count × (len u16, opus)
@@ -18,8 +19,11 @@ pub const FLAG_SILENCE: u8 = 1 << 0;
 /// decoder and the jitter buffer.
 pub const FLAG_DISCONTINUITY: u8 = 1 << 1;
 
-/// Frames carried in each datagram: the newest and two repeats.
+/// Frames carried in each datagram, at least: the newest and two repeats.
 pub const REDUNDANCY: usize = 3;
+
+/// And at most, on a lossy path.
+pub const MAX_REDUNDANCY: usize = 6;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 

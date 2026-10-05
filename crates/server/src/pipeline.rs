@@ -88,7 +88,7 @@ fn idle_tick(host: &mut Host) -> TimeoutAction {
     if still < IDLE {
         return TimeoutAction::ToDuration(IDLE - still);
     }
-    if p.in_flight.load(Ordering::Acquire) > 0 {
+    if p.shared.in_flight.load(Ordering::Acquire) > 0 {
         return TimeoutAction::ToDuration(Duration::from_millis(10));
     }
     p.idle.timer = false;
@@ -164,6 +164,9 @@ pub struct Options {
     pub video_drain_at: Arc<AtomicU64>,
 }
 
+/// No RFI answered yet, in [`Shared::answered`].
+const NONE: u64 = u64::MAX;
+
 /// A new frame isn't encoded while the network would still hold more than
 /// this much video by the time it is ready. Skipping a frame before it is
 /// encoded costs nothing; dropping one after would break the stream.
@@ -190,11 +193,8 @@ pub struct Pipeline {
     hold: Option<Hold>,
     /// When the picture last changed, for idle refinement (§2).
     idle: Idle,
-    /// Tiles sent lossy since the last refinement, from the encode thread.
-    lossy: Arc<Mutex<Vec<Rect>>>,
-    /// Jobs queued or being encoded: refinement waits for them, so it sees
-    /// every lossy tile.
-    in_flight: Arc<AtomicUsize>,
+    /// What the encode thread shares with this one.
+    shared: Arc<Shared>,
     /// To the encode thread; `None` only while shutting down.
     jobs: Option<SyncSender<Job>>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
@@ -216,6 +216,20 @@ pub struct Pipeline {
     skipped: Option<bool>,
     clock: Clock<Monotonic>,
     presented: u64,
+}
+
+/// What the main thread and the encode thread share.
+struct Shared {
+    /// Tiles sent lossy since the last refinement, from the encode thread.
+    lossy: Mutex<Vec<Rect>>,
+    /// Jobs queued or being encoded: refinement waits for them, so it sees
+    /// every lossy tile.
+    in_flight: AtomicUsize,
+    /// The last frame before the latest RFI answer, from the encode thread
+    /// ([`NONE`] before any): an RFI for no frame after it is a repeat.
+    answered: AtomicU64,
+    /// The bitrate to keep video within.
+    video_target: Arc<AtomicU64>,
 }
 
 enum Job {
@@ -254,14 +268,17 @@ impl Pipeline {
             None => None,
         };
         let (jobs, rx) = mpsc::sync_channel(ENCODE_QUEUE);
-        let lossy: Arc<Mutex<Vec<Rect>>> = Arc::default();
-        let thread_lossy = lossy.clone();
-        let in_flight: Arc<AtomicUsize> = Arc::default();
-        let thread_in_flight = in_flight.clone();
-        let rate = (opts.video_target.clone(), encode::rate::QpControl::new(51u32.saturating_sub(opts.qp)));
+        let shared = Arc::new(Shared {
+            lossy: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            answered: AtomicU64::new(NONE),
+            video_target: opts.video_target.clone(),
+        });
+        let thread_shared = shared.clone();
+        let qp = encode::rate::QpControl::new(51u32.saturating_sub(opts.qp));
         let thread = std::thread::Builder::new()
             .name("farsight-encode".into())
-            .spawn(move || encode_thread(rx, out, start, net, thread_lossy, thread_in_flight, rate))?;
+            .spawn(move || encode_thread(rx, out, start, net, thread_shared, qp))?;
         Ok(Self {
             opts,
             encoders,
@@ -273,8 +290,7 @@ impl Pipeline {
             mode: Mode::default(),
             hold: None,
             idle: Idle { last_change: Instant::now(), refined: true, timer: false },
-            lossy,
-            in_flight,
+            shared,
             jobs: Some(jobs),
             encode_thread: Some(thread),
             last_buffer: None,
@@ -464,6 +480,10 @@ pub fn refresh(host: &mut Host) {
 pub fn recover(host: &mut Host, lost: u32, good: u32) {
     use farsight_proto::video::before;
     let p = &mut host.pipeline;
+    let answered = p.shared.answered.load(Ordering::Relaxed);
+    if answered != NONE && !before(answered as u32, lost) {
+        return; // a repeat; its answer is on the way
+    }
     p.rfi = Some(match p.rfi {
         Some((l, g)) => (if before(l, lost) { lost } else { l }, if before(good, g) { good } else { g }),
         None => (lost, good),
@@ -570,7 +590,7 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
     let jobs = p.jobs.as_ref().expect("pipeline running");
     jobs.send(Job::Start(encoder)).map_err(|_| anyhow::anyhow!("encode thread gone"))?;
     p.frames = Some((frames, encoding));
-    p.lossy.lock().unwrap().clear();
+    p.shared.lossy.lock().unwrap().clear();
     p.epoch = p.epoch.wrapping_add(1);
     p.force_keyframe = true;
     tracing::info!(epoch = p.epoch, w, h, %encoding, "new video epoch");
@@ -615,7 +635,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
     let damage = match (*encoding, kind) {
         (Encoding::Tiles, FrameKind::Keyframe) => vec![Rect::new(0, 0, w as u16, h as u16)],
         (Encoding::Tiles, FrameKind::Refine) => {
-            encode::tiles::align(&std::mem::take(&mut *p.lossy.lock().unwrap()), w, h)
+            encode::tiles::align(&std::mem::take(&mut *p.shared.lossy.lock().unwrap()), w, h)
         }
         (Encoding::Tiles, FrameKind::Normal) => encode::tiles::align(&p.damage, w, h),
         (Encoding::Video(_), _) => Vec::new(),
@@ -651,7 +671,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
         t_probe,
         t_surface,
     };
-    p.in_flight.fetch_add(1, Ordering::AcqRel);
+    p.shared.in_flight.fetch_add(1, Ordering::AcqRel);
     match p.send(Job::Encode(Box::new(job))) {
         Ok(()) => {
             p.force_keyframe = false;
@@ -661,11 +681,11 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
             }
         }
         Err(TrySendError::Full(_)) => {
-            p.in_flight.fetch_sub(1, Ordering::AcqRel);
+            p.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!("encoder busy; frame dropped");
             // Tiles must still send what changed.
             match kind {
-                FrameKind::Refine => p.lossy.lock().unwrap().extend_from_slice(&damage),
+                FrameKind::Refine => p.shared.lossy.lock().unwrap().extend_from_slice(&damage),
                 _ => p.damage.extend_from_slice(&damage),
             }
         }
@@ -754,9 +774,8 @@ fn encode_thread(
     mut out: Option<File>,
     start: Instant,
     net: UnboundedSender<ToNet>,
-    lossy: Arc<Mutex<Vec<Rect>>>,
-    in_flight: Arc<AtomicUsize>,
-    (target, mut qp): (Arc<AtomicU64>, encode::rate::QpControl),
+    shared: Arc<Shared>,
+    mut qp: encode::rate::QpControl,
 ) {
     let now = || start.elapsed().as_micros() as u64;
     let mut codec = None;
@@ -788,7 +807,7 @@ fn encode_thread(
                 self.0.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        let _done = Done(&in_flight);
+        let _done = Done(&shared.in_flight);
         let Some(codec) = codec.as_mut() else { continue };
         // The conversion pass must have finished writing the surface.
         let _ = job.sync.wait();
@@ -796,12 +815,14 @@ fn encode_thread(
         let number = next_frame;
         let (kind, mut refs) = match job.rfi {
             Some((lost, good)) if codec.is_video() => {
-                rfi_answer(codec, job.kind, number, epoch_first, &mut answered, lost, good)
+                let answer = rfi_answer(codec, job.kind, number, epoch_first, &mut answered, lost, good);
+                shared.answered.store(answered.map_or(NONE, u64::from), Ordering::Relaxed);
+                answer
             }
             _ => (job.kind, number.wrapping_sub(1)),
         };
         let qp_offset = match codec.is_video() && job.send {
-            true => qp.next(Instant::now(), target.load(Ordering::Relaxed)),
+            true => qp.next(Instant::now(), shared.video_target.load(Ordering::Relaxed)),
             false => 0,
         };
         let output = match codec.encode(job.input, job.t_commit as i64, number, kind, qp_offset) {
@@ -843,7 +864,7 @@ fn encode_thread(
             }
             Output::Tiles(mut update) => {
                 let bytes = update.bodies.iter().map(Vec::len).sum();
-                lossy.lock().unwrap().append(&mut update.lossy);
+                shared.lossy.lock().unwrap().append(&mut update.lossy);
                 if job.send {
                     let tiles = net::Tiles { update, epoch: job.epoch, capture_us: job.t_commit, encode_us };
                     let _ = net.send(ToNet::Tiles(tiles));

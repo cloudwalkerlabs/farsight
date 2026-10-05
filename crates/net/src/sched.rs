@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use farsight_proto::datagram::Datagram;
 use quinn::Connection;
 use tokio::sync::Notify;
 
@@ -46,6 +47,10 @@ const MIN_BURST: usize = 4 * 1500;
 /// when it drains.
 const BUFFER_POLL: Duration = Duration::from_millis(1);
 
+/// Video frames dropped, remembered so a NACK for one is ignored: it went
+/// for want of room, and sending it again would make less.
+const DROPPED: usize = 64;
+
 #[derive(Debug)]
 struct VideoFrame {
     fragments: VecDeque<Bytes>,
@@ -68,8 +73,10 @@ pub struct Queues {
     input: VecDeque<Bytes>,
     audio: VecDeque<Bytes>,
     repair: VecDeque<Bytes>,
+    repair_bytes: usize,
     video: VecDeque<VideoFrame>,
     video_bytes: usize,
+    dropped: VecDeque<u32>,
     rate_bps: u64,
     /// Bytes of video that may go now.
     tokens: f64,
@@ -83,8 +90,10 @@ impl Queues {
             input: VecDeque::new(),
             audio: VecDeque::new(),
             repair: VecDeque::new(),
+            repair_bytes: 0,
             video: VecDeque::new(),
             video_bytes: 0,
+            dropped: VecDeque::new(),
             rate_bps: 1,
             tokens: 0.0,
             refilled: now,
@@ -113,7 +122,13 @@ impl Queues {
 
     /// Queues shards sent again, ahead of new video.
     pub fn push_repair(&mut self, datagrams: Vec<Bytes>) {
+        self.repair_bytes += datagrams.iter().map(Bytes::len).sum::<usize>();
         self.repair.extend(datagrams);
+    }
+
+    /// Video frame `frame` was dropped here, unsent.
+    pub fn was_dropped(&self, frame: u32) -> bool {
+        self.dropped.contains(&frame)
     }
 
     /// Queues one video frame's datagrams, in order.
@@ -129,6 +144,12 @@ impl Queues {
             let frame = self.video.remove(i).unwrap();
             self.video_bytes -= frame.fragments.iter().map(Bytes::len).sum::<usize>();
             self.dropped_frames += 1;
+            if let Some(Datagram::Video(h, _)) = frame.fragments.front().and_then(|d| Datagram::decode(d)) {
+                if self.dropped.len() == DROPPED {
+                    self.dropped.pop_front();
+                }
+                self.dropped.push_back(h.frame);
+            }
         }
         self.video_bytes += bytes;
         self.video.push_back(VideoFrame { fragments: fragments.into(), started: false });
@@ -154,6 +175,7 @@ impl Queues {
         }
         self.tokens -= len as f64;
         if let Some(d) = self.repair.pop_front() {
+            self.repair_bytes -= d.len();
             return Next::Send(d);
         }
         let frame = self.video.front_mut().unwrap();
@@ -171,9 +193,10 @@ impl Queues {
         self.dropped_frames
     }
 
-    /// How long the video queued now takes to send at the pacing rate.
+    /// How long the video queued now, repairs included, takes to send at
+    /// the pacing rate.
     pub fn backlog(&self) -> Duration {
-        Duration::from_secs_f64(self.video_bytes as f64 * 8.0 / self.rate_bps as f64)
+        Duration::from_secs_f64((self.video_bytes + self.repair_bytes) as f64 * 8.0 / self.rate_bps as f64)
     }
 
     fn refill(&mut self, now: Instant) {
@@ -239,6 +262,10 @@ impl Scheduler {
 
     pub fn backlog(&self) -> Duration {
         self.shared.queues.lock().unwrap().backlog()
+    }
+
+    pub fn was_dropped(&self, frame: u32) -> bool {
+        self.shared.queues.lock().unwrap().was_dropped(frame)
     }
 }
 

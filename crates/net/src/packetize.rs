@@ -31,8 +31,10 @@ const BURST_MARGIN: f64 = 1.5;
 const MIN_LOSS: f64 = 0.0005;
 
 /// The newest frame counts as stalled this long after its last shard, if
-/// no later frame shows that it was all sent.
+/// no later frame shows that it was all sent, or four times the usual gap
+/// between shards, on a slow path.
 const STALL_US: u64 = 10_000;
+const STALL_GAPS: u64 = 4;
 
 /// A frame is asked for again at most this many times.
 const MAX_NACKS: u8 = 2;
@@ -164,6 +166,10 @@ pub struct Reassembler {
     lost: Option<Lost>,
     recovered: u32,
     repaired: u32,
+    /// The usual time between two shards of a frame, smoothed, and the
+    /// last shard's frame and arrival.
+    gap_us: u64,
+    last_shard: Option<(u32, u64)>,
 }
 
 /// Frames given up.
@@ -232,9 +238,29 @@ impl Partial {
 }
 
 impl Reassembler {
-    /// A frame is given up `timeout_us` after its first fragment.
+    /// A frame is given up once nothing of it has arrived for `timeout_us`.
     pub fn new(timeout_us: u64) -> Self {
-        Self { slots: VecDeque::new(), mark: None, timeout_us, lost: None, recovered: 0, repaired: 0 }
+        Self {
+            slots: VecDeque::new(),
+            mark: None,
+            timeout_us,
+            lost: None,
+            recovered: 0,
+            repaired: 0,
+            gap_us: 0,
+            last_shard: None,
+        }
+    }
+
+    /// The usual time between two shards of a frame: how fast the path
+    /// delivers.
+    pub fn shard_gap_us(&self) -> u64 {
+        self.gap_us
+    }
+
+    /// How long without a shard before a frame is stalled.
+    fn stall_us(&self) -> u64 {
+        STALL_US.max(STALL_GAPS * self.gap_us)
     }
 
     /// Frames are waiting: [`Reassembler::poll`] has something to decide.
@@ -244,6 +270,13 @@ impl Reassembler {
 
     /// Takes one shard; [`Reassembler::poll`] hands over what it completes.
     pub fn push(&mut self, header: FragmentHeader, payload: &[u8], now_us: u64) {
+        if let Some((frame, at)) = self.last_shard
+            && frame == header.frame
+        {
+            let gap = now_us.saturating_sub(at);
+            self.gap_us = if self.gap_us == 0 { gap } else { (self.gap_us * 7 + gap) / 8 };
+        }
+        self.last_shard = Some((header.frame, now_us));
         let mark = *self.mark.get_or_insert(header.frame.wrapping_sub(1));
         if !before(mark, header.frame) {
             return;
@@ -301,10 +334,12 @@ impl Reassembler {
     /// again.
     pub fn poll(&mut self, now_us: u64, repair: Repair) -> (Vec<Frame>, Vec<Nack>) {
         let mut nacks = Vec::new();
+        let stall_us = self.stall_us();
         if repair.nack {
             let newest = self.newest();
             for slot in &mut self.slots {
-                let stalled = Some(slot.frame) != newest || now_us.saturating_sub(slot.last_us) >= STALL_US;
+                let quiet = now_us.saturating_sub(slot.last_us) >= stall_us;
+                let stalled = Some(slot.frame) != newest || quiet;
                 let due = slot.nacked_us.is_none_or(|t| now_us.saturating_sub(t) >= repair.wait_us);
                 let shards = match &slot.state {
                     State::Missing => Vec::new(),
@@ -338,9 +373,12 @@ impl Reassembler {
                             .skip(1)
                             .any(|s| matches!(&s.state, State::Ready(f) if f.header.keyframe() || !keyframe))
                     };
+                    // Asked enough, answered nothing for long enough, and
+                    // nothing arriving either.
                     let exhausted = front.nacks >= MAX_NACKS
-                        && front.nacked_us.is_some_and(|t| now_us.saturating_sub(t) >= repair.wait_us);
-                    now_us.saturating_sub(front.first_us) >= self.timeout_us
+                        && front.nacked_us.is_some_and(|t| now_us.saturating_sub(t) >= repair.wait_us)
+                        && now_us.saturating_sub(front.last_us) >= stall_us;
+                    now_us.saturating_sub(front.last_us) >= self.timeout_us
                         || later_ready(true)
                         || (!repair.nack && later_ready(false))
                         || (repair.nack && exhausted)
@@ -564,6 +602,31 @@ mod tests {
         push(&mut rx, &f0[..2], 0);
         assert!(rx.poll(STALL_US - 1, REPAIR).1.is_empty());
         assert_eq!(rx.poll(STALL_US, REPAIR).1, [Nack { frame: 0, shards: vec![2] }]);
+    }
+
+    #[test]
+    fn a_slow_frame_is_not_given_up_while_it_arrives() {
+        let mut rx = Reassembler::new(250_000);
+        // A shard every 20 ms: a slow path.
+        let mut t = 0;
+        for d in &packetize(&frame(&[0; 3000], true, 0), 1200, 0.0)[..3] {
+            push(&mut rx, std::slice::from_ref(d), t);
+            t += 20_000;
+        }
+        assert_eq!(numbers(&rx.poll(t, REPAIR).0), [0]);
+        assert_eq!(rx.shard_gap_us(), 20_000);
+        let f1 = packetize(&frame(&[1; 6000], false, 1), 1200, 0.0);
+        for d in &f1[..4] {
+            push(&mut rx, std::slice::from_ref(d), t);
+            assert!(rx.poll(t + 15_000, REPAIR).1.is_empty());
+            t += 20_000;
+        }
+        // Stalled only after four gaps; then the rest arrives, and it is
+        // whole after all.
+        assert!(!rx.poll(t + 4 * 20_000, REPAIR).1.is_empty());
+        push(&mut rx, &f1[4..], t + 100_000);
+        assert_eq!(numbers(&rx.poll(t + 100_000, REPAIR).0), [1]);
+        assert_eq!(lost(&mut rx), 0);
     }
 
     #[test]

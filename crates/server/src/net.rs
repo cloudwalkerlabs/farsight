@@ -8,8 +8,8 @@
 //! The session itself outlives them all.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -57,6 +57,8 @@ pub enum ToNet {
     Broadcast(ServerMessage),
     /// An audio datagram, for whichever client listens.
     Audio(Bytes),
+    /// The audio format changed, for every client that plays audio.
+    AudioConfig(AudioConfig),
     /// An app in the session pastes: fetch the client's clipboard into the
     /// pipe.
     FetchClipboard(ConnId, crate::clipboard::Send),
@@ -86,12 +88,41 @@ pub struct Tiles {
 }
 
 /// The session's audio, shared with the speaker's threads.
-#[derive(Default)]
 pub struct Audio {
-    /// Set once the speaker is up.
-    pub config: OnceLock<AudioConfig>,
+    /// The stream's format: set once the speaker is up, and again when it
+    /// changes.
+    pub config: Mutex<Option<AudioConfig>>,
     /// A client is listening: the speaker encodes and sends.
     pub listening: AtomicBool,
+    /// Frames per datagram, for the lossiest listener's path (§8).
+    pub redundancy: AtomicUsize,
+    /// The slowest listener's path is slow: 10 ms frames, at a lower
+    /// bitrate.
+    pub slow: AtomicBool,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self {
+            config: Mutex::default(),
+            listening: AtomicBool::new(false),
+            redundancy: AtomicUsize::new(farsight_proto::audio::REDUNDANCY),
+            slow: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Audio goes to 10 ms frames when a listener's path is slower than this,
+/// and back when they all are faster than the second.
+const AUDIO_SLOW: u64 = 1_500_000;
+const AUDIO_FAST: u64 = 3_000_000;
+
+/// The fewest frames per datagram that leave a frame lost (as many
+/// datagrams lost in a row) under one in ten thousand, at packet loss
+/// rate `loss`.
+fn redundancy(loss: f64) -> usize {
+    use farsight_proto::audio::{MAX_REDUNDANCY, REDUNDANCY};
+    (REDUNDANCY..MAX_REDUNDANCY).find(|&d| loss.powi(d as i32) <= 1e-4).unwrap_or(MAX_REDUNDANCY)
 }
 
 pub struct Options {
@@ -125,6 +156,8 @@ struct Conn {
     control: mpsc::UnboundedSender<ServerMessage>,
     /// The client plays audio and hasn't muted it.
     audio: bool,
+    /// The client plays audio, muted or not.
+    plays: bool,
     view_only: bool,
 }
 
@@ -194,11 +227,22 @@ impl Shared {
         self.opts.video_drain_at.store(at.as_micros() as u64, Ordering::Relaxed);
     }
 
-    /// Video is encoded once for everyone, so for the slowest path.
-    fn update_target(&self) {
+    /// Video and audio are encoded once for everyone, so for the slowest
+    /// path, and the lossiest.
+    fn update_paths(&self) {
         let conns = self.conns.lock().unwrap();
         if let Some(target) = conns.iter().map(|c| encoder_target(&c.path)).min() {
             self.opts.video_target.store(target, Ordering::Relaxed);
+        }
+        let audio = &self.opts.audio;
+        let listeners = || conns.iter().filter(|c| c.audio).map(|c| &c.path);
+        let loss = listeners().map(|p| p.loss()).fold(0.0, f64::max);
+        audio.redundancy.store(redundancy(loss), Ordering::Relaxed);
+        if let Some(rate) = listeners().map(|p| p.rate_bps()).min() {
+            let slow = audio.slow.load(Ordering::Relaxed);
+            if !slow && rate < AUDIO_SLOW || slow && rate > AUDIO_FAST {
+                audio.slow.store(!slow, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -323,6 +367,11 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     let _ = c.control.send(m.clone());
                 }
             }
+            ToNet::AudioConfig(config) => {
+                for c in conns.iter().filter(|c| c.plays) {
+                    let _ = c.control.send(ServerMessage::AudioConfig(config));
+                }
+            }
             ToNet::Audio(d) => {
                 for c in conns.iter().filter(|c| c.audio) {
                     c.sched.send(Priority::Audio, d.clone());
@@ -376,19 +425,20 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
         let (sched, shared) = (sched.clone(), shared.clone());
         path::monitor(conn.clone(), rate_bps, move |p| {
             sched.set_rate(p.rate_bps().saturating_sub(AUDIO_RESERVE).max(cc::MIN_RATE / 2));
-            shared.update_target();
+            shared.update_paths();
         })
     };
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // Audio goes to a client that plays it, from a session that has it.
-    let audio_config = hello.audio.and(audio.config.get().copied());
+    let plays = hello.audio.is_some() && audio.config.lock().unwrap().is_some();
     let next = Conn {
         id,
         conn: conn.clone(),
         sched: sched.clone(),
         path,
         control: control_tx,
-        audio: audio_config.is_some(),
+        audio: plays,
+        plays,
         view_only,
     };
     {
@@ -411,7 +461,8 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
         while let Some(msg) = control_rx.recv().await {
             stream::send(&mut send, &msg).await?;
             // The audio format follows the welcome, which comes first.
-            if let (ServerMessage::Welcome(_), Some(config)) = (&msg, audio_config) {
+            let config = *audio.config.lock().unwrap();
+            if let (ServerMessage::Welcome(_), Some(config), true) = (&msg, config, plays) {
                 stream::send(&mut send, &ServerMessage::AudioConfig(config)).await?;
             }
         }
@@ -422,7 +473,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
             if let ClientMessage::SetAudio { play } = msg {
                 let mut conns = shared.conns.lock().unwrap();
                 if let Some(c) = conns.iter_mut().find(|c| c.id == id) {
-                    c.audio = play && audio_config.is_some();
+                    c.audio = play && plays;
                     tracing::info!(id, play, "audio");
                 }
                 shared.update_listening(&conns);
@@ -446,7 +497,8 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
                     let pong = Pong { client_us: p.client_us, server_us: start.elapsed().as_micros() as u64 };
                     sched.send(Priority::Input, Bytes::from(Datagram::Pong(pong).to_vec()));
                 }
-                Some(Datagram::Nack(nack)) => {
+                // A frame dropped here went for want of room.
+                Some(Datagram::Nack(nack)) if !sched.was_dropped(nack.frame) => {
                     let repair = shared.repair(&nack);
                     tracing::debug!(id, frame = nack.frame, asked = nack.shards.len(), sent = repair.len(), "NACK");
                     sched.send_repair(repair);
@@ -507,5 +559,16 @@ async fn fetch_clipboard(conn: Connection, paste: crate::clipboard::Send) {
             .await;
         }
         Err(err) => tracing::debug!(mime = paste.mime, "fetching the client's clipboard: {err:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn audio_redundancy_follows_loss() {
+        assert_eq!(super::redundancy(0.0), 3);
+        assert_eq!(super::redundancy(0.05), 4);
+        assert_eq!(super::redundancy(0.1), 5);
+        assert_eq!(super::redundancy(0.2), 6);
     }
 }

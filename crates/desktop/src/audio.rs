@@ -80,7 +80,7 @@ pub async fn report(client: Arc<Client>) {
         s.latency_us.sort_unstable();
         let pct = |p: usize| s.latency_us[(s.latency_us.len() * p / 100).min(s.latency_us.len() - 1)] as f64 / 1000.0;
         tracing::info!(
-            "audio: capture→speaker ms p50 {:.1} p95 {:.1} (output {:.1}); buffer {:.1} ms (target {:.1}); speed {:+.3}%; concealed {} silent {} underruns {} skipped {}",
+            "audio: capture→speaker ms p50 {:.1} p95 {:.1} (output {:.1}); buffer {:.1} ms (target {:.1}); speed {:+.3}%; concealed {} (late {}) silent {} underruns {} skipped {}",
             pct(50),
             pct(95),
             s.output_delay_us as f64 / 1000.0,
@@ -88,6 +88,7 @@ pub async fn report(client: Arc<Client>) {
             s.target_us as f64 / 1000.0,
             s.adjust * 100.0,
             s.concealed,
+            s.late,
             s.silent,
             s.underruns,
             s.skipped,

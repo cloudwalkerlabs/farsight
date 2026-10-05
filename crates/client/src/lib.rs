@@ -53,8 +53,8 @@ const FRAME_TIMEOUT_US: u64 = 250_000;
 /// after the last until the decoder can go on.
 const ASK_RETRY: Duration = Duration::from_millis(50);
 
-/// Missing shards are asked for again (NACK) on a path whose round trip
-/// is under a frame.
+/// Missing shards are asked for again (NACK) when the answer can come
+/// within a frame: a round trip, and a couple of shards' time on the path.
 const NACK_MAX_RTT_US: u64 = 16_000;
 
 /// A NACK's answer is given this long beyond a round trip.
@@ -422,8 +422,15 @@ async fn run(
                     tracing::info!(?config, "audio");
                     match audio::Player::new(config) {
                         Ok(player) => {
-                            *shared.audio.lock().unwrap() = Some(player);
-                            on_event(Event::AudioConfig(config));
+                            // Another frame size on the same output (a slow
+                            // path) needs only a new player.
+                            let same_output = shared.audio.lock().unwrap().replace(player).is_some_and(|p| {
+                                let old = p.config();
+                                (old.channels, old.sample_rate) == (config.channels, config.sample_rate)
+                            });
+                            if !same_output {
+                                on_event(Event::AudioConfig(config));
+                            }
                         }
                         Err(err) => tracing::warn!("audio: {err:#}"),
                     }
@@ -503,8 +510,11 @@ async fn run(
 
             // Video: frames in order, NACKs on a quick path.
             let rtt = shared.offset_known.load(Ordering::Relaxed).then(|| shared.rtt_us.load(Ordering::Relaxed));
+            let gap = rx.shard_gap_us();
             let repair = match rtt {
-                Some(rtt) if rtt < NACK_MAX_RTT_US => Repair { nack: true, wait_us: 2 * rtt + NACK_SLACK_US },
+                Some(rtt) if rtt + 2 * gap < NACK_MAX_RTT_US => {
+                    Repair { nack: true, wait_us: 2 * rtt + 4 * gap + NACK_SLACK_US }
+                }
                 _ => Repair::NONE,
             };
             let (frames, nacks) = rx.poll(now, repair);

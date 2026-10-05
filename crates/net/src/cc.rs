@@ -54,9 +54,12 @@ const GROWTH: f64 = 1.05;
 const MIN_STEP: f64 = 50_000.0;
 
 /// A cut takes the rate to this share of what is delivered, but never
-/// below this share of what it was.
+/// below this share of what it was, unless far more is being sent than
+/// delivered ([`OVERSENT`]): then delivery is the path's measure, not the
+/// stream's.
 const BACKOFF: f64 = 0.9;
 const MAX_CUT: f64 = 0.7;
+const OVERSENT: f64 = 1.5;
 
 /// After a cut, the rate holds for this many round trips (and at least
 /// [`MIN_HOLD`]) so the queue can drain before it is judged again.
@@ -234,7 +237,8 @@ impl RateControl {
 
         let holding = self.hold_until.is_some_and(|t| now < t);
         if (queue > QUEUE_HIGH || loss > LOSS_HIGH) && !holding {
-            let mut rate = (self.rate.min(delivered) * BACKOFF).max(self.rate * MAX_CUT);
+            let floor = if sending > delivered * OVERSENT { 0.0 } else { self.rate * MAX_CUT };
+            let mut rate = (self.rate.min(delivered) * BACKOFF).max(floor);
             if loss > LOSS_HIGH {
                 rate = rate.min(self.rate * (1.0 - loss / 2.0));
             }
@@ -304,9 +308,9 @@ mod tests {
             t += DT;
             rc.update(t, DT, sample(5.0, 1e6, 1e6), 0.0);
         }
-        // A 10 Mbit/s bottleneck: sending 20, delivering 10, and a queue.
+        // A 10 Mbit/s bottleneck: sending 12, delivering 10, and a queue.
         t += DT;
-        let (r, s) = rc.update(t, DT, sample(30.0, 20e6, 10e6), 0.0);
+        let (r, s) = rc.update(t, DT, sample(30.0, 12e6, 10e6), 0.0);
         assert_eq!(s.queue, Some(Duration::from_millis(25)));
         assert_eq!(r, 14_000_000, "no more than 30% at once");
         t += DT;
@@ -319,6 +323,17 @@ mod tests {
         t += MIN_HOLD;
         let (r2, _) = rc.update(t, DT, sample(5.0, 9.8e6, 9.8e6), 0.0);
         assert_eq!(r2 as f64, (r as f64 * GROWTH).round());
+    }
+
+    #[test]
+    fn far_more_sent_than_delivered_cuts_to_delivery() {
+        let mut t = Instant::now();
+        let mut rc = RateControl::new(100_000_000);
+        t += DT;
+        rc.update(t, DT, sample(5.0, 1e6, 1e6), 0.0);
+        t += DT;
+        let (r, _) = rc.update(t, DT, sample(200.0, 20e6, 1e6), 0.0);
+        assert_eq!(r, 900_000);
     }
 
     #[test]

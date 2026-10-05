@@ -3,9 +3,11 @@
 //!
 //! Unlike video, audio can't pause between packets, so it is buffered: just
 //! enough to cover the jitter seen recently, plus what the output takes
-//! per callback. Each datagram repeats the two frames before its own, so a
+//! per callback. Each datagram repeats the frames before its own, so a
 //! lost datagram usually costs nothing; a frame that never arrives is
-//! concealed by Opus. The server's clock and the sound card's drift apart
+//! concealed by Opus. A frame that came only as a repeat came a frame or
+//! more late, so the buffer also holds as many frames as repeats have
+//! recently been needed from. The server's clock and the sound card's drift apart
 //! by tens of ppm, so the buffer is kept at its target by playing slightly
 //! faster or slower (at most 0.5%, after a burst), never by dropping
 //! samples.
@@ -27,6 +29,10 @@ const MAX_CONCEALED: u32 = 4;
 /// Arrivals kept for the jitter estimate: two seconds at 5 ms.
 const JITTER_SAMPLES: usize = 400;
 
+/// Frames remembered for how deep in a datagram each came from: ten
+/// seconds at 5 ms. The buffer covers all but one in a thousand.
+const DEPTH_SAMPLES: usize = 2000;
+
 /// Within this of its target, the buffer is left alone (in µs).
 const DEADBAND_US: f64 = 1500.0;
 
@@ -45,6 +51,9 @@ struct Slot {
     capture_us: u64,
     /// Opus; empty for digital silence.
     data: Vec<u8>,
+    /// Where in its datagram it came: 0 as the newest frame, 1 as the
+    /// first repeat, and so on.
+    depth: u8,
 }
 
 /// Running statistics, reset by [`Player::take_stats`].
@@ -57,6 +66,8 @@ pub struct AudioStats {
     pub buffered_us: u64,
     pub target_us: u64,
     pub concealed: u64,
+    /// Of those, frames that arrived after all, too late: jitter, not loss.
+    pub late: u64,
     /// Frames the server sent as digital silence.
     pub silent: u64,
     pub underruns: u64,
@@ -85,6 +96,12 @@ pub struct Player {
     frac: f64,
     last_silent: bool,
     concealed_run: u32,
+    /// The latest frames concealed, to tell late frames from lost ones.
+    concealed_seqs: VecDeque<u32>,
+    /// How deep each recent frame came from, and the depth the buffer
+    /// covers (all but one in a thousand).
+    depths: VecDeque<u8>,
+    depth_cover: u8,
     /// Arrival minus capture, for the newest frame of recent datagrams.
     transit: VecDeque<i64>,
     jitter_us: u64,
@@ -115,6 +132,9 @@ impl Player {
             frac: 0.0,
             last_silent: false,
             concealed_run: 0,
+            concealed_seqs: VecDeque::new(),
+            depths: VecDeque::new(),
+            depth_cover: 0,
             transit: VecDeque::new(),
             jitter_us: 0,
             request: frame_samples,
@@ -141,7 +161,14 @@ impl Player {
             let seq = p.seq.wrapping_sub(i as u32);
             let ahead = seq.wrapping_sub(next) as i32;
             if ahead < 0 {
-                continue; // played, or concealed, already
+                // Played, or concealed, already.
+                if let Some(at) = self.concealed_seqs.iter().position(|&s| s == seq) {
+                    self.concealed_seqs.remove(at);
+                    self.stats.late += 1;
+                    // A buffer this much deeper would have had it.
+                    self.note_depth(i as u8);
+                }
+                continue;
             }
             let ahead = ahead as usize;
             if ahead >= WINDOW {
@@ -155,7 +182,7 @@ impl Player {
             let slot = &mut self.slots[ahead];
             if slot.is_none() {
                 let capture_us = p.capture_us.saturating_sub(i as u64 * self.config.frame_us as u64);
-                *slot = Some(Slot { capture_us, data: data.to_vec() });
+                *slot = Some(Slot { capture_us, data: data.to_vec(), depth: i as u8 });
             }
         }
         self.note_arrival(arrival_us as i64 - p.capture_us as i64);
@@ -172,6 +199,17 @@ impl Player {
         let mut d: Vec<u64> = self.transit.iter().map(|t| (t - base) as u64).collect();
         let k = (d.len() * 95 / 100).min(d.len() - 1);
         self.jitter_us = *d.select_nth_unstable(k).1;
+    }
+
+    /// Notes how deep in a datagram a frame came from.
+    fn note_depth(&mut self, depth: u8) {
+        if self.depths.len() == DEPTH_SAMPLES {
+            self.depths.pop_front();
+        }
+        self.depths.push_back(depth);
+        let mut d: Vec<u8> = self.depths.iter().copied().collect();
+        let k = (d.len() * 999 / 1000).min(d.len() - 1);
+        self.depth_cover = *d.select_nth_unstable(k).1;
     }
 
     fn restart(&mut self) {
@@ -193,10 +231,12 @@ impl Player {
     }
 
     /// What the buffer aims for, in samples per channel: one output
-    /// request, the jitter, and half a frame of margin.
+    /// request, the jitter, the frames repeats arrive late by, and half a
+    /// frame of margin.
     fn target(&self) -> usize {
         let jitter = (self.jitter_us * self.config.sample_rate as u64 / 1_000_000) as usize;
-        self.request + jitter.max(self.frame_samples) + self.frame_samples / 2
+        let repeats = self.depth_cover as usize * self.frame_samples;
+        self.request + jitter.max(self.frame_samples) + repeats + self.frame_samples / 2
     }
 
     /// Decodes the next frame into the fifo. False if there is nothing to
@@ -206,7 +246,8 @@ impl Player {
         let slot = self.slots.pop_front().flatten();
         let more = !self.slots.is_empty();
         let capture_us = match slot {
-            Some(Slot { capture_us, data }) => {
+            Some(Slot { capture_us, data, depth }) => {
+                self.note_depth(depth);
                 self.concealed_run = 0;
                 self.last_silent = data.is_empty();
                 if data.is_empty() {
@@ -233,6 +274,10 @@ impl Player {
                 }
                 self.concealed_run += 1;
                 self.stats.concealed += 1;
+                if self.concealed_seqs.len() == 16 {
+                    self.concealed_seqs.pop_front();
+                }
+                self.concealed_seqs.push_back(seq);
                 if self.decoder.decode_float(&[], &mut self.scratch, false).is_err() {
                     self.scratch.fill(0.0);
                 }
@@ -327,6 +372,7 @@ impl Player {
         let stats = self.stats.clone();
         self.stats.latency_us.clear();
         self.stats.concealed = 0;
+        self.stats.late = 0;
         self.stats.silent = 0;
         self.stats.underruns = 0;
         self.stats.skipped = 0;
@@ -390,6 +436,28 @@ mod tests {
 
     fn push(player: &mut Player, buf: &[u8], at: u64) {
         player.push(&AudioPacket::read(buf).unwrap(), at);
+    }
+
+    #[test]
+    fn pairs_lost_together_deepen_the_buffer() {
+        let mut server = Server::new();
+        let mut player = Player::new(CONFIG).unwrap();
+        let mut out = vec![0.0; 480];
+        for i in 0..600u64 {
+            let d = server.next();
+            // Two in a row: the first frame comes only from the third
+            // datagram, 10 ms late.
+            if i % 50 != 20 && i % 50 != 21 {
+                push(&mut player, &d, i * 5000 + 1000);
+            }
+            player.pull(&mut out, i * 5000 + 2000, 0, Some(0));
+            if i == 300 {
+                player.take_stats();
+            }
+        }
+        assert_eq!(player.depth_cover, 2);
+        let stats = player.take_stats();
+        assert_eq!((stats.concealed, stats.underruns), (0, 0));
     }
 
     #[test]

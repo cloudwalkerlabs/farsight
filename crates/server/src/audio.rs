@@ -1,8 +1,10 @@
 //! The session's speaker (docs/design.md §8): a PipeWire stream that is an
 //! `Audio/Sink` node, `farsight-speaker`. WirePlumber makes it the
 //! session's default sink, so every app plays into it. Each graph cycle is
-//! one 5 ms frame, which goes out as Opus with the two frames before it
-//! repeated.
+//! one 5 ms frame, which goes out as Opus with the frames before it
+//! repeated: two of them, or more on a lossy path. On a slow path two
+//! cycles make a 10 ms frame instead, at a lower bitrate, which halves the
+//! datagrams and what their headers cost.
 //!
 //! Two threads: PipeWire's (its realtime `process` callback only copies the
 //! cycle's samples into a bounded channel) and the encoder's. Nothing is
@@ -18,9 +20,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
-use farsight_proto::audio::{
-    AudioConfig, AudioPacket, FLAG_DISCONTINUITY, FLAG_SILENCE, REDUNDANCY, SAMPLE_RATE,
-};
+use farsight_proto::audio::{AudioConfig, AudioPacket, FLAG_DISCONTINUITY, FLAG_SILENCE, SAMPLE_RATE};
 use farsight_proto::datagram::Datagram;
 use pipewire as pw;
 use pw::spa;
@@ -30,11 +30,15 @@ use crate::net::{Audio, ToNet};
 
 pub const CHANNELS: usize = 2;
 
-/// The stream's format: stereo, 5 ms frames.
-pub const CONFIG: AudioConfig = AudioConfig { channels: CHANNELS as u8, sample_rate: SAMPLE_RATE, frame_us: 5000 };
+/// The stream's format: stereo, 5 ms frames, or 10 ms on a slow path.
+pub fn config(slow: bool) -> AudioConfig {
+    AudioConfig { channels: CHANNELS as u8, sample_rate: SAMPLE_RATE, frame_us: if slow { 10_000 } else { 5_000 } }
+}
 
-/// 128 kbit/s for stereo, as §8 plans.
-const BITRATE: i32 = 128_000;
+/// 128 kbit/s for stereo, as §8 plans; 64 on a slow path.
+fn bitrate(slow: bool) -> i32 {
+    if slow { 64_000 } else { 128_000 }
+}
 
 /// Silent frames still sent once sound stops, so the client hears the
 /// silence rather than concealing loss; then nothing until sound again.
@@ -69,7 +73,7 @@ pub fn spawn(socket: PathBuf, start: Instant, net: UnboundedSender<ToNet>, share
         }
     })?;
     ready_rx.recv().context("the PipeWire thread ended")??;
-    let _ = shared.config.set(CONFIG);
+    *shared.config.lock().unwrap() = Some(config(false));
     std::thread::Builder::new()
         .name("farsight-opus".into())
         .spawn(move || encode_thread(rx, free_tx, net, shared))?;
@@ -165,8 +169,9 @@ fn pipewire_thread(
     Ok(())
 }
 
-/// Turns cycles into 5 ms Opus frames and datagrams.
+/// Turns cycles into Opus frames and datagrams.
 struct Packer {
+    config: AudioConfig,
     encoder: opus::Encoder,
     /// Samples not yet framed, interleaved, and the capture time of the
     /// first.
@@ -185,8 +190,9 @@ struct Packer {
 impl Packer {
     fn new() -> anyhow::Result<Self> {
         let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::LowDelay)?;
-        encoder.set_bitrate(opus::Bitrate::Bits(BITRATE))?;
+        encoder.set_bitrate(opus::Bitrate::Bits(bitrate(false)))?;
         Ok(Self {
+            config: config(false),
             encoder,
             pending: Vec::new(),
             pending_us: 0,
@@ -198,6 +204,20 @@ impl Packer {
         })
     }
 
+    /// Follows the path's speed: the new format, if it changed. The stream
+    /// starts again in it.
+    fn set_slow(&mut self, slow: bool) -> Option<AudioConfig> {
+        if self.config == config(slow) {
+            return None;
+        }
+        self.config = config(slow);
+        if let Err(err) = self.encoder.set_bitrate(opus::Bitrate::Bits(bitrate(slow))) {
+            tracing::warn!(%err, "opus bitrate");
+        }
+        self.restart();
+        Some(self.config)
+    }
+
     fn restart(&mut self) {
         self.discontinuity = true;
         self.pending.clear();
@@ -206,16 +226,16 @@ impl Packer {
         let _ = self.encoder.reset_state();
     }
 
-    /// Takes one cycle, and calls `send` with each datagram it completes.
-    /// An empty cycle means the node stopped: one silent frame ends the
-    /// stream.
-    fn push(&mut self, cycle: &Cycle, mut send: impl FnMut(Vec<u8>)) {
-        let frame_samples = CONFIG.frame_samples();
+    /// Takes one cycle, and calls `send` with each datagram it completes,
+    /// `redundancy` frames each at most. An empty cycle means the node
+    /// stopped: one silent frame ends the stream.
+    fn push(&mut self, cycle: &Cycle, redundancy: usize, mut send: impl FnMut(Vec<u8>)) {
+        let frame_samples = self.config.frame_samples();
         if cycle.frames == 0 {
             if self.silent_run < SILENT_FRAMES {
                 let silence = vec![0.0; frame_samples * CHANNELS];
                 let capture_us = self.next_us.unwrap_or(cycle.capture_us);
-                if let Some(d) = self.frame(&silence, capture_us) {
+                if let Some(d) = self.frame(&silence, capture_us, redundancy) {
                     send(d);
                 }
             }
@@ -226,7 +246,7 @@ impl Packer {
         }
         let cycle_us = cycle.frames as u64 * 1_000_000 / SAMPLE_RATE as u64;
         // The node paused and resumed: what follows is a new stream.
-        if self.next_us.is_some_and(|n| cycle.capture_us > n + 2 * CONFIG.frame_us as u64) {
+        if self.next_us.is_some_and(|n| cycle.capture_us > n + 2 * self.config.frame_us as u64) {
             self.restart();
         }
         self.next_us = Some(cycle.capture_us + cycle_us);
@@ -237,14 +257,14 @@ impl Packer {
         while self.pending.len() >= frame_samples * CHANNELS {
             let frame: Vec<f32> = self.pending.drain(..frame_samples * CHANNELS).collect();
             let capture_us = self.pending_us;
-            self.pending_us += CONFIG.frame_us as u64;
-            if let Some(d) = self.frame(&frame, capture_us) {
+            self.pending_us += self.config.frame_us as u64;
+            if let Some(d) = self.frame(&frame, capture_us, redundancy) {
                 send(d);
             }
         }
     }
 
-    fn frame(&mut self, samples: &[f32], capture_us: u64) -> Option<Vec<u8>> {
+    fn frame(&mut self, samples: &[f32], capture_us: u64, redundancy: usize) -> Option<Vec<u8>> {
         let silent = samples.iter().all(|&s| s == 0.0);
         if silent {
             self.silent_run += 1;
@@ -276,7 +296,7 @@ impl Packer {
             self.recent.clear();
         }
         self.recent.insert(0, encoded);
-        self.recent.truncate(REDUNDANCY);
+        self.recent.truncate(redundancy.max(1));
         self.seq = self.seq.wrapping_add(1);
         let mut flags = 0;
         if silent {
@@ -315,8 +335,13 @@ fn encode_thread(
             packer.restart();
         }
         was_listening = now_listening;
+        if let Some(config) = packer.set_slow(shared.slow.load(Ordering::Relaxed)) {
+            tracing::info!(frame_us = config.frame_us, "the audio format follows the path");
+            *shared.config.lock().unwrap() = Some(config);
+            let _ = net.send(ToNet::AudioConfig(config));
+        }
         if now_listening {
-            packer.push(&cycle, |d| {
+            packer.push(&cycle, shared.redundancy.load(Ordering::Relaxed), |d| {
                 let _ = net.send(ToNet::Audio(Bytes::from(d)));
             });
         }
@@ -327,6 +352,7 @@ fn encode_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use farsight_proto::audio::REDUNDANCY;
 
     fn cycle(us: u64, value: f32) -> Cycle {
         Cycle { capture_us: us, frames: 240, samples: Box::new([value; MAX_CYCLE * CHANNELS]) }
@@ -337,7 +363,7 @@ mod tests {
         let mut p = Packer::new().unwrap();
         let mut out = Vec::new();
         for i in 0..4 {
-            p.push(&cycle(i * 5000, 0.1), |d| out.push(d));
+            p.push(&cycle(i * 5000, 0.1), REDUNDANCY, |d| out.push(d));
         }
         assert_eq!(out.len(), 4);
         let Some(Datagram::Audio(first)) = Datagram::decode(&out[0]) else { panic!() };
@@ -349,10 +375,10 @@ mod tests {
 
         out.clear();
         for i in 4..4 + SILENT_FRAMES as u64 + 10 {
-            p.push(&cycle(i * 5000, 0.0), |d| out.push(d));
+            p.push(&cycle(i * 5000, 0.0), REDUNDANCY, |d| out.push(d));
         }
         assert_eq!(out.len(), SILENT_FRAMES as usize);
-        p.push(&cycle(200_000, 0.1), |d| out.push(d));
+        p.push(&cycle(200_000, 0.1), REDUNDANCY, |d| out.push(d));
         let Some(Datagram::Audio(again)) = Datagram::decode(out.last().unwrap()) else { panic!() };
         assert!(again.discontinuity());
     }
@@ -361,23 +387,37 @@ mod tests {
     fn a_stop_ends_in_silence() {
         let mut p = Packer::new().unwrap();
         let mut out = Vec::new();
-        p.push(&cycle(0, 0.1), |d| out.push(d));
-        p.push(&Cycle { capture_us: 9000, frames: 0, samples: Box::new([0.0; MAX_CYCLE * CHANNELS]) }, |d| out.push(d));
+        p.push(&cycle(0, 0.1), REDUNDANCY, |d| out.push(d));
+        p.push(&Cycle { capture_us: 9000, frames: 0, samples: Box::new([0.0; MAX_CYCLE * CHANNELS]) }, REDUNDANCY, |d| out.push(d));
         let Some(Datagram::Audio(last)) = Datagram::decode(&out[1]) else { panic!() };
         assert!(last.silence());
         assert_eq!(last.capture_us, 5000);
-        p.push(&cycle(50_000, 0.1), |d| out.push(d));
+        p.push(&cycle(50_000, 0.1), REDUNDANCY, |d| out.push(d));
         let Some(Datagram::Audio(again)) = Datagram::decode(&out[2]) else { panic!() };
         assert!(again.discontinuity());
+    }
+
+    #[test]
+    fn a_slow_path_gets_10_ms_frames_and_deeper_repeats() {
+        let mut p = Packer::new().unwrap();
+        let mut out = Vec::new();
+        assert_eq!(p.set_slow(true).map(|c| c.frame_us), Some(10_000));
+        assert_eq!(p.set_slow(true), None);
+        for i in 0..12 {
+            p.push(&cycle(i * 5000, 0.1), 5, |d| out.push(d));
+        }
+        assert_eq!(out.len(), 6, "two cycles a frame");
+        let Some(Datagram::Audio(last)) = Datagram::decode(&out[5]) else { panic!() };
+        assert_eq!((last.frames.len(), last.capture_us), (5, 50_000));
     }
 
     #[test]
     fn a_gap_restarts_the_stream() {
         let mut p = Packer::new().unwrap();
         let mut out = Vec::new();
-        p.push(&cycle(0, 0.1), |d| out.push(d));
-        p.push(&cycle(5000, 0.1), |d| out.push(d));
-        p.push(&cycle(1_000_000, 0.1), |d| out.push(d));
+        p.push(&cycle(0, 0.1), REDUNDANCY, |d| out.push(d));
+        p.push(&cycle(5000, 0.1), REDUNDANCY, |d| out.push(d));
+        p.push(&cycle(1_000_000, 0.1), REDUNDANCY, |d| out.push(d));
         let Some(Datagram::Audio(d)) = Datagram::decode(&out[2]) else { panic!() };
         assert!(d.discontinuity());
         assert_eq!(d.frames.len(), 1);
