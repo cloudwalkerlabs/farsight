@@ -45,6 +45,18 @@ meson setup dav1d-build "dav1d-$DAV1D_VERSION" \
     -Ddefault_library=static -Denable_tools=false -Denable_tests=false
 ninja -C dav1d-build install
 
+# MSVC's linker takes `-ldav1d` (FFmpeg's configure) and `-l static=avcodec`
+# (rustc) as dav1d.lib and avcodec.lib, while meson's and FFmpeg's static
+# libraries are named libdav1d.a and libavcodec.a.
+msvc_names() {
+    [ "$os" = windows ] || return 0
+    for a in "$prefix"/lib/lib*.a; do
+        name=$(basename "$a" .a)
+        cp "$a" "$prefix/lib/${name#lib}.lib"
+    done
+}
+msvc_names
+
 decoders=h264,hevc,libdav1d
 parsers=h264,hevc,av1
 platform=()
@@ -89,19 +101,13 @@ else
 fi
 mkdir ffmpeg-build
 cd ffmpeg-build
-"../ffmpeg-$FFMPEG_VERSION/configure" --prefix="$native_prefix" "${configure[@]}"
+"../ffmpeg-$FFMPEG_VERSION/configure" --prefix="$native_prefix" "${configure[@]}" ||
+    { tail -n 40 ffbuild/config.log; exit 1; }
 make -j"$jobs"
 make install
 cd ..
+msvc_names
 
-# rustc on MSVC links `-l static=avcodec` as avcodec.lib, while FFmpeg's
-# and meson's static libraries are named libavcodec.a.
-if [ "$os" = windows ]; then
-    for a in "$prefix"/lib/lib*.a; do
-        name=$(basename "$a" .a)
-        cp "$a" "$prefix/lib/${name#lib}.lib"
-    done
-fi
 
 mkdir -p "$prefix/notice"
 cp "ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$prefix/notice/"
