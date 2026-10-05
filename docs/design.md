@@ -134,7 +134,7 @@ its DRM and libinput backends with a farsight backend.
 - **Pros:** it can share a physical desktop and works with GNOME.
 - **Cons:** no control over frame timing, no real touch, and an extra
   capture step.
-- **Status:** kept only as a possible later "mirror backend" (M6).
+- **Status:** rejected.
 
 Both [Wolf](https://games-on-whales.github.io/wolf/stable/dev/wayland.html)
 (Games on Whales) and [wado](https://github.com/sandptel/wado) have shown that
@@ -197,8 +197,7 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
   - **connection migration** (a phone moving from Wi-Fi to LTE keeps its
     session);
   - path MTU discovery (DPLPMTUD) and keepalives;
-  - one UDP port;
-  - a later browser client through WebTransport.
+  - one UDP port.
 - **Catch:** QUIC datagrams are congestion-controlled, and quinn's built-in
   controllers are built for bulk transfer: they halve their window on
   every loss, so a few percent of random loss, which FEC shrugs off, would
@@ -509,9 +508,6 @@ The client's window is the source of truth for the output
 - **Xwayland:** the nested compositor runs Xwayland, so X app scaling is
   its policy. X apps blur under fractional scaling in labwc as they do
   anywhere else.
-- **Multi-monitor (later):** one client window per output, each with its
-  own encoder stream. The nested compositor gets one host window per output
-  (the wlroots Wayland backend supports several).
 
 ## 6. The session
 
@@ -743,7 +739,6 @@ sent directly, with relative pointer capture when the server asks for it.
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured. **Done over loopback** ([results](m3-results.md)): 13–20 ms from the session's sink to the client's speaker; checked as a user service, not as root or with a user in `audio`; the client's keymap is still labwc's. |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss. **Done under netem on one machine** ([results](m4-results.md)): at 5% loss nothing lost after FEC, every decoded picture bit-exact, every typed line exact, no audio concealed; RFI through NVENC, keyframes through VA-API; a run between two machines is still to do. |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo. **Done on one phone over Tailscale** ([results](m5-results.md)): 29–31 ms capture to display with NVENC, audio 41–60 ms; a recorder in the session hears the phone's mic, its echo mostly cancelled; multi-finger gestures, IME typing and a real call are still to try by hand. |
-| M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
 
 ## Risks
 
