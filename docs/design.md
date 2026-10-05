@@ -198,9 +198,50 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
   (which supports L4S) or on WebRTC's GCC. Its bandwidth estimate drives the
   encoder's target bitrate directly. Prototype it early, because it shapes
   the whole latency profile.
+- **Plaintext mode** (`--no-tls`), for networks that already encrypt and
+  authenticate, such as Tailscale or WireGuard. See below.
 - **Not WebRTC:** its jitter buffer and pacing are tuned for video calls and
   add latency we can't remove, and libwebrtc is heavy. **Not raw UDP:** we
   would have to rebuild encryption, migration and NAT handling.
+
+### Plaintext mode
+
+When the server is only reachable over a tailnet or a WireGuard tunnel, the
+network already encrypts every packet and authenticates every peer, and
+encrypting again in QUIC is redundant. `--no-tls` turns QUIC's encryption
+off.
+
+- **Still QUIC.** Streams, retransmission, datagrams, migration and
+  congestion control all stay. Only the crypto layer changes: quinn's
+  crypto is pluggable (`quinn::crypto::{ClientConfig, ServerConfig,
+  Session}`), and plaintext mode plugs in a **null session**:
+  - the handshake carries only the transport parameters, one message each
+    way;
+  - packet keys and header protection do nothing, and the packet tag is
+    empty, so there is no integrity check beyond the UDP checksum.
+- **Its own ALPN-like identity, `farsight-plain/0`,** carried in the null
+  handshake. A TLS endpoint and a plaintext endpoint fail to connect
+  instead of misreading each other.
+- **Opt-in on both ends, never a fallback.**
+  - The server serves either TLS or plaintext on a port, not both.
+  - The client stores the mode per server in its address book and never
+    retries a failed TLS connection in plaintext, so no one can downgrade
+    it.
+- **Guard rails on the server:**
+  - `--no-tls` requires an explicit `--listen <addr>`: no wildcard bind.
+  - It warns unless that address is loopback, in Tailscale's range
+    (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), or on an interface named
+    `tailscale*` or `wg*`.
+- **Authentication:** client keys (§6) still apply, so other users on the
+  same tailnet can't connect. Without TLS there is no channel to bind the
+  key to, so the client signs a server nonce in the null handshake instead.
+  That proves who connected but protects nothing after it: the network
+  must stop on-path attackers, which Tailscale and WireGuard do.
+- **What it saves is small.** AES-GCM with AES-NI, or the ARMv8 crypto
+  extensions on phones, costs well under 1% of a core at 100 Mbit/s, and
+  adds microseconds per packet. The main gain is one less layer to debug
+  (packets are readable in Wireshark) and less CPU on weak clients.
+  Measure it before recommending it.
 
 ## 2. Video pipeline
 
@@ -383,6 +424,7 @@ port, with `User=` set). It doesn't need user systemd or lingering.
 ```
 farsight-server [--port 7740] [-- <desktop command>]    # default: labwc
 farsight-server --port 7741 -- labwc --session xfce4-session
+farsight-server --no-tls --listen 100.101.102.103    # tailnet only (§1)
 ```
 
 **Startup** builds an isolated environment and starts the session at once,
@@ -431,6 +473,9 @@ host restricts them, add the user to the `render` group.
 - **Authentication:** SSH-style Ed25519 client keys
   (`~/.config/farsight/authorized_keys`). The client pins the server's
   certificate on first use (TOFU).
+  In plaintext mode (§1) there is no certificate to pin; the client key
+  is checked with a signed nonce instead, and the network provides the
+  rest.
 - **Reconnection:** the session outlives disconnects. A reconnecting client
   negotiates codec and layout again, and its layout is applied (§5).
 - **More than one client:** a second client can either take over the
@@ -517,7 +562,7 @@ sent directly, with relative pointer capture when the server asks for it.
 | M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
-| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover | Runs as a system service; reconnect resumes the same session |
+| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`) | Runs as a system service; reconnect resumes the same session |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; `tc netem` test matrix | No stuck keys and no artifact spreading at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio, clipboard | Daily-usable from a phone or tablet |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
