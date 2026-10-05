@@ -31,7 +31,11 @@ jobs:
           key: ffmpeg-linux-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: tools/ffmpeg/build.sh ffmpeg-prefix
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-server -p farsight-desktop
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
@@ -64,7 +68,11 @@ jobs:
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: tools/ffmpeg/build.sh ffmpeg-prefix
       - uses: dtolnay/rust-toolchain@stable
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-desktop
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
@@ -114,7 +122,11 @@ jobs:
           rm -f /usr/bin/link.exe
           tools/ffmpeg/build.sh ffmpeg-prefix
       - uses: dtolnay/rust-toolchain@stable
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-desktop
         env:
           PKG_CONFIG: ${{ steps.msys2.outputs.msys2-location }}\mingw64\bin\pkgconf.exe
