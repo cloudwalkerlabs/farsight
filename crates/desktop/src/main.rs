@@ -21,7 +21,7 @@ mod render;
 mod stats;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -137,25 +137,6 @@ fn key_comment() -> String {
     format!("{user}@{}", host.trim())
 }
 
-/// The address with its port, as the server is known in `known_hosts`.
-fn server_name(address: &str) -> String {
-    let port = farsight_proto::DEFAULT_PORT;
-    if address.parse::<SocketAddr>().is_ok() {
-        return address.to_string();
-    }
-    if let Ok(ip) = address.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
-        return SocketAddr::from((ip, port)).to_string();
-    }
-    match address.rsplit_once(':') {
-        Some((_, p)) if p.parse::<u16>().is_ok() => address.to_string(),
-        _ => format!("{address}:{port}"),
-    }
-}
-
-fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
-    server_name(address).to_socket_addrs()?.next().with_context(|| format!("{address} has no address"))
-}
-
 /// From the other threads to the window.
 enum UserEvent {
     Connected(Arc<Client>),
@@ -252,8 +233,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let address = args.address.clone().expect("required by clap");
-    let addr = resolve(&address)?;
-    let server_name = server_name(&address);
+    let addr = farsight_client::resolve(&address)?;
+    let server_name = farsight_client::server_name(&address);
     tracing::info!(%addr, core = farsight_client::version(), "farsight desktop client");
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

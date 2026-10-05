@@ -205,6 +205,15 @@ impl KnownHosts {
         }
     }
 
+    /// Forgets what was pinned for `name`, so the next connection pins
+    /// afresh: for a server whose identity was replaced on purpose.
+    pub fn forget(&self, name: &str) -> anyhow::Result<()> {
+        let Some((line, _)) = self.lookup(name)? else { return Ok(()) };
+        let text = std::fs::read_to_string(&self.path)?;
+        let out: String = text.lines().enumerate().filter(|(i, _)| i + 1 != line).map(|(_, l)| format!("{l}\n")).collect();
+        std::fs::write(&self.path, out).with_context(|| format!("writing {}", self.path.display()))
+    }
+
     fn line(name: &str, pin: &Pin) -> String {
         match pin {
             Pin::Tls(fp) => format!("{name} tls {fp}"),
@@ -265,6 +274,9 @@ mod tests {
         kh.check("other:7740", &Pin::Plain).unwrap();
         kh.check("other:7740", &Pin::Tls("cc".into())).unwrap();
         assert!(kh.check("other:7740", &Pin::Plain).is_err());
+        kh.forget("host:7740").unwrap();
+        kh.check("host:7740", &Pin::Tls("bb".into())).unwrap();
+        kh.check("other:7740", &Pin::Tls("cc".into())).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

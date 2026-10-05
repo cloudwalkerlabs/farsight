@@ -57,6 +57,7 @@ abstract class CargoNdkTask : DefaultTask() {
     @get:Input abstract val abis: ListProperty<String>
     @get:Input abstract val sdkDir: Property<String>
     @get:Input abstract val ndkDir: Property<String>
+    @get:Input abstract val platform: Property<Int>
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction
@@ -67,11 +68,14 @@ abstract class CargoNdkTask : DefaultTask() {
             workingDir = cargoRoot.get().asFile
             environment("ANDROID_HOME", sdkDir.get())
             // cargo-ndk passes the NDK on, but libopus's CMake build (for
-            // the client core) looks only here.
+            // the client core) looks only here, and libjpeg-turbo's (for
+            // tiles) needs the NDK's toolchain file.
             environment("ANDROID_NDK_HOME", ndkDir.get())
+            environment("CMAKE_TOOLCHAIN_FILE", "${ndkDir.get()}/build/cmake/android.toolchain.cmake")
             // Always optimised: debug builds are far too slow for video.
+            // At the app's minSdk: AAudio and libnativewindow need API 26.
             commandLine(
-                listOf("cargo", "ndk") +
+                listOf("cargo", "ndk", "-P", platform.get().toString()) +
                     abis.get().flatMap { listOf("-t", it) } +
                     listOf("-o", out.path, "build", "--release", "-p", "farsight-android"),
             )
@@ -112,6 +116,7 @@ val cargoNdk = tasks.register<CargoNdkTask>("cargoNdk") {
     abis.set(rustAbis)
     sdkDir.set(androidComponents.sdkComponents.sdkDirectory.map { it.asFile.path })
     ndkDir.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
+    platform.set(android.defaultConfig.minSdk!!)
     outputDir.set(layout.buildDirectory.dir("rust/jniLibs"))
 }
 

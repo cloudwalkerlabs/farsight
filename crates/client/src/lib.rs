@@ -24,7 +24,7 @@
 pub use farsight_audio as audio;
 pub mod mic;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +84,25 @@ impl std::fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// The address with its port, as the server is known in `known_hosts`.
+pub fn server_name(address: &str) -> String {
+    let port = farsight_proto::DEFAULT_PORT;
+    if address.parse::<SocketAddr>().is_ok() {
+        return address.to_string();
+    }
+    if let Ok(ip) = address.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return SocketAddr::from((ip, port)).to_string();
+    }
+    match address.rsplit_once(':') {
+        Some((_, p)) if p.parse::<u16>().is_ok() => address.to_string(),
+        _ => format!("{address}:{port}"),
+    }
+}
+
+pub fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+    server_name(address).to_socket_addrs()?.next().with_context(|| format!("{address} has no address"))
+}
 
 /// The client core's version.
 pub fn version() -> &'static str {
