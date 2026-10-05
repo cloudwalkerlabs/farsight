@@ -56,6 +56,7 @@ abstract class CargoNdkTask : DefaultTask() {
     @get:InputFiles abstract val sources: ConfigurableFileCollection
     @get:Input abstract val abis: ListProperty<String>
     @get:Input abstract val sdkDir: Property<String>
+    @get:Input abstract val ndkDir: Property<String>
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction
@@ -65,6 +66,9 @@ abstract class CargoNdkTask : DefaultTask() {
         exec.exec {
             workingDir = cargoRoot.get().asFile
             environment("ANDROID_HOME", sdkDir.get())
+            // cargo-ndk passes the NDK on, but libopus's CMake build (for
+            // the client core) looks only here.
+            environment("ANDROID_NDK_HOME", ndkDir.get())
             // Always optimised: debug builds are far too slow for video.
             commandLine(
                 listOf("cargo", "ndk") +
@@ -107,6 +111,7 @@ val cargoNdk = tasks.register<CargoNdkTask>("cargoNdk") {
     )
     abis.set(rustAbis)
     sdkDir.set(androidComponents.sdkComponents.sdkDirectory.map { it.asFile.path })
+    ndkDir.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
     outputDir.set(layout.buildDirectory.dir("rust/jniLibs"))
 }
 
