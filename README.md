@@ -65,8 +65,12 @@ client: `farsight-desktop --print-key` prints a line for
 server's certificate on first use. `--view-only` watches beside the
 controlling client; `--no-tls` on both ends (with `--listen` on the
 server) turns encryption off on networks that already encrypt, such as
-Tailscale. `farsight-server --app -- APP` runs a single app with no
-desktop. With `--mic`, the desktop client sends its microphone, echo
+Tailscale. The session's desktop is a Wayland compositor that the server
+runs nested: labwc, or the command after `--`, such as
+`farsight-server -- sway` or `farsight-server -- labwc --session
+xfce4-session`. labwc and sway are tested; `docs/design.md` lists the
+others. `farsight-server --app -- APP` runs a single app with no desktop
+compositor. With `--mic`, the desktop client sends its microphone, echo
 cancelled, while an app in the session records from `farsight-mic`.
 
 The server encodes with VA-API or NVENC, and sends tiles without either;
@@ -75,9 +79,9 @@ the client decodes with VA-API or in software. Both build against FFmpeg
 releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`, which also has a
 static libxkbcommon) and libva's and libdrm's headers, and build
 libjpeg-turbo and libopus in; the server also needs dbus-daemon, PipeWire,
-WirePlumber and pipewire-pulse, and labwc for the default desktop. To keep
-a session running permanently, install `dist/farsight-server@.service`; the
-file explains how.
+WirePlumber and pipewire-pulse, and the desktop's compositor (labwc unless
+told otherwise). To keep a session running permanently, install
+`dist/farsight-server@.service`; the file explains how.
 
 The Android build runs `cargo ndk` itself and generates the Kotlin bindings,
 so there is no separate Rust step. In the app, "This device's key" gives
