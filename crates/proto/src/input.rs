@@ -6,6 +6,9 @@
 //! pointer go out periodically, and in every packet while anything is held;
 //! the receiver compares them with what it has injected and corrects the
 //! difference, so a stuck key fixes itself within one snapshot interval.
+//! A standalone snapshot repeats the recent events too: a key tapped in a
+//! lost packet leaves nothing held for a snapshot to show, and would
+//! otherwise never be typed.
 //!
 //! [`InputSender`] (client) and [`InputReceiver`] (server) hold no clocks or
 //! sockets: the caller passes the time and moves the packets.
@@ -81,10 +84,14 @@ impl InputSender {
         InputPacket { seq: self.seq, events: self.history.iter().copied().collect(), snapshot }
     }
 
-    /// A standalone snapshot packet, if one is due.
+    /// A standalone snapshot packet, with the recent events, if one is due.
     pub fn tick(&mut self, now_ms: u64) -> Option<InputPacket> {
         let due = self.last_snapshot_ms.is_none_or(|t| now_ms.saturating_sub(t) >= SNAPSHOT_INTERVAL_MS);
-        due.then(|| InputPacket { seq: self.seq, events: Vec::new(), snapshot: Some(self.snapshot(now_ms)) })
+        due.then(|| InputPacket {
+            seq: self.seq,
+            events: self.history.iter().copied().collect(),
+            snapshot: Some(self.snapshot(now_ms)),
+        })
     }
 
     /// Forget held keys and buttons without sending releases, as when the
@@ -299,15 +306,15 @@ mod tests {
     }
 
     #[test]
-    fn events_older_than_a_snapshot_are_not_replayed() {
+    fn a_tap_lost_before_a_pause_comes_with_the_snapshot() {
         let mut tx = InputSender::new();
         let mut rx = InputReceiver::new();
         rx.receive(&tx.push(InputEvent::PointerAbs { x: 0.0, y: 0.0 }, 0));
         let _lost = tx.push(key(KEY_A, true), 1);
         let _lost = tx.push(key(KEY_A, false), 2);
-        assert!(rx.receive(&tx.tick(200).unwrap()).is_empty());
-        // The next packet repeats the press and release; typing "a" now
-        // would be wrong.
+        // Nothing is held, so only the snapshot's events tell of the tap.
+        assert_eq!(rx.receive(&tx.tick(200).unwrap()), vec![key(KEY_A, true), key(KEY_A, false)]);
+        // And once only.
         let out = rx.receive(&tx.push(InputEvent::PointerAbs { x: 1.0, y: 0.0 }, 201));
         assert_eq!(out, vec![InputEvent::PointerAbs { x: 1.0, y: 0.0 }]);
     }

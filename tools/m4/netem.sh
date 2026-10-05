@@ -21,6 +21,11 @@
 # module. SERVER_ARGS, CLIENT_ARGS and SESSION_APP as for tools/m1/e2e.sh;
 # SERVER_LOG and CLIENT_LOG are their RUST_LOG.
 #
+# TYPE_LINES=N types N lines through the client window into a terminal in
+# the session, which writes them to OUTDIR/typed.txt, and compares: a lost
+# key press is a missing letter, a stuck key repeats. Needs
+# tools/m1/wltool built.
+#
 # CHECK_FRAMES=1 checks that every picture the client decoded is exactly
 # what decoding the server's whole stream gives: the client decodes in
 # software and hashes each picture, and FFmpeg decodes the stream the
@@ -75,6 +80,13 @@ done
 [ -n "$OUTER" ] || { echo "the headless labwc did not start" >&2; exit 1; }
 
 APP=${SESSION_APP:-es2gears_wayland}
+WLTOOL=$ROOT/tools/m1/wltool/target/release/wltool
+LINE="the quick brown fox jumps over the lazy dog"
+if [ -n "$TYPE_LINES" ]; then
+	rm -f "$OUT/typed.txt"
+	printf 'exec cat > %s/typed.txt\n' "$OUT" > "$OUT/typing.sh"
+	APP="alacritty -e sh $OUT/typing.sh"
+fi
 if [ -n "$CHECK_FRAMES" ]; then
 	SERVER_ARGS="$SERVER_ARGS --out $OUT/stream.bin"
 	CLIENT_ARGS="$CLIENT_ARGS --software"
@@ -96,12 +108,34 @@ pids+=($!)
 XDG_RUNTIME_DIR=$CA timeout $((SECS + 4)) pw-record -P '{ stream.capture.sink = true }' --target auto_null \
 	"$OUT/played.wav" 2>/dev/null &
 REC=$!
+if [ -n "$TYPE_LINES" ]; then
+	# A keyboard, so the client window gets keyboard focus; then click it.
+	env WAYLAND_DISPLAY=$OUTER setsid "$WLTOOL" keyboard & pids+=($!)
+	sleep 3
+	WAYLAND_DISPLAY=$OUTER "$WLTOOL" move 960 540; WAYLAND_DISPLAY=$OUTER "$WLTOOL" click; sleep 1
+	codes=$(python3 -c "
+import sys
+k = {c: n for c, n in zip('qwertyuiop', range(16, 26))} | {c: n for c, n in zip('asdfghjkl', range(30, 39))}
+k |= {c: n for c, n in zip('zxcvbnm', range(44, 51))} | {' ': 57}
+print(' '.join(str(k[c]) for c in sys.argv[1]), 28)" "$LINE")
+	for _ in $(seq "$TYPE_LINES"); do WAYLAND_DISPLAY=$OUTER "$WLTOOL" key $codes; done
+fi
 wait $REC || true
 echo quit >&7
 sleep 1
 echo "netem: $(cat "$OUT/netem.txt")"
 grep -o 'fps=.*' "$OUT/client.log" | sed 's/^/  video: /' || true
 grep -o 'audio: .*' "$OUT/client.log" | sed 's/^/  /' || true
+if [ -n "$TYPE_LINES" ]; then
+	python3 - "$OUT/typed.txt" "$LINE" "$TYPE_LINES" <<'PY'
+import sys
+import os
+lines = open(sys.argv[1]).read().splitlines() if os.path.exists(sys.argv[1]) else []
+want, n = sys.argv[2], int(sys.argv[3])
+bad = [l for l in lines if l != want]
+print(f"  typing: {len(lines) - len(bad)} of {n} lines exact" + (f"; wrong: {bad[:3]}" if bad else ""))
+PY
+fi
 if [ -n "$CHECK_FRAMES" ]; then
 	codec=$(grep -o 'encoding=[a-z0-9]*' "$OUT/server.log" | tail -1 | cut -d= -f2)
 	ffmpeg -nostdin -y -loglevel fatal -f "$codec" -i "$OUT/stream.bin" -fps_mode passthrough -f framemd5 "$OUT/stream.md5"
