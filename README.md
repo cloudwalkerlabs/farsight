@@ -1,31 +1,25 @@
 # farsight
 
-A low-latency remote desktop for headless Linux servers. The server is its own
-headless Wayland compositor, and it streams hardware-encoded video over QUIC
-datagrams. Clients run on the Linux desktop and on Android, and the Android
-client is built to work with touch alone.
+A low-latency remote desktop for headless Linux servers, with clients for
+the Linux desktop and Android.
 
-Early days: the Linux desktop client works end to end, with input and a
-client-side cursor (M1). The remote desktop follows the client window's
-size and scale, and the two ends negotiate the encoding (M2): H.264 or HEVC
-through VA-API or NVENC, 4:4:4 where the hardware has it, and VNC-style
-tiles (TurboJPEG, palettes) when the server has no hardware encoder. The
-server is an isolated session (M3): its own D-Bus and PipeWire, audio
-played on the client, clipboard and text input, client keys, plaintext
-mode for tailnets, reconnection, takeover and view-only clients, and a
-kiosk mode for a single app. The stream holds up on lossy, congested
-networks (M4): delay-based congestion control, FEC, NACK on quick paths,
-reference frame invalidation, and audio redundancy that follows the loss.
-The Android client and the microphone (M5): MediaCodec straight to the
-screen, touchpad and direct touch, a zoomable viewport, extra keys and the
-soft keyboard, AAudio, clipboard; an app in the session that records
-hears the client's microphone, echo cancelled.
-See [`docs/design.md`](docs/design.md) for the design and milestones, and
-[`docs/m1-results.md`](docs/m1-results.md),
-[`docs/m2-results.md`](docs/m2-results.md),
-[`docs/m3-results.md`](docs/m3-results.md),
-[`docs/m4-results.md`](docs/m4-results.md) and
-[`docs/m5-results.md`](docs/m5-results.md) for what was measured.
+- **Smooth, sharp video:** hardware-accelerated on both ends, and stays
+  sharp for text.
+- **Fits your screen:** the remote desktop follows the client window's size
+  and scale.
+- **Holds up on bad networks:** lost packets don't freeze the picture or
+  leave keys stuck.
+- **A persistent session:** its own desktop that you can disconnect from
+  and pick up again, from another device too; watch view-only alongside, or
+  run a single app.
+- **Sound and microphone:** the session's audio plays on the client, and
+  apps in the session can use the client's mic, echo cancelled.
+- **Clipboard and text input**, both ways.
+- **Android:** touchpad or direct touch, pinch to zoom, an extra keys bar
+  and the soft keyboard.
+- **Secure by default:** only clients you authorize can connect.
+
+See [`docs/design.md`](docs/design.md) for the design.
 
 ## Layout
 
