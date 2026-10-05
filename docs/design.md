@@ -157,7 +157,7 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
                  │  │   input-method, output-management                    │
                  │  ├ Encoder: VA-API │ NVENC │ Vulkan Video │ software    │
                  │  ├ Transport: quinn + datagrams + FEC + congestion ctrl │
-                 │  └ Audio: PipeWire null sink → Opus                     │
+                 │  └ Audio: PipeWire sink/source streams ↔ Opus           │
                  └───────────────▲──────────────────┬──────────────────────┘
                      one surface │                  │ wl_seat input
                  ┌───────────────┴──────────────────▼──────────────────────┐
@@ -198,6 +198,17 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
   (which supports L4S) or on WebRTC's GCC. Its bandwidth estimate drives the
   encoder's target bitrate directly. Prototype it early, because it shapes
   the whole latency profile.
+- **Datagram priority.** quinn keeps every outgoing datagram in one FIFO,
+  so input or audio queued behind a keyframe waits for all of it to be
+  sent: about 120 ms for 300 KB at 20 Mbps. `farsight-net` puts a
+  scheduler in front of it:
+  - strict priority: input and ping > audio > video;
+  - quinn's own buffer holds only about one pacing interval, and the
+    rest waits in per-class queues, where only video may grow or drop;
+  - video, keyframes included, is paced at the controller's rate, so it
+    never fills the congestion window in one burst;
+  - audio's ~300 kbps comes off the estimate before the video bitrate is
+    set.
 - **Plaintext mode** (`--no-tls`), for networks that already encrypt and
   authenticate, such as Tailscale or WireGuard. See below.
 - **Not WebRTC:** its jitter buffer and pacing are tuned for video calls and
@@ -242,6 +253,9 @@ off.
   adds microseconds per packet. The main gain is one less layer to debug
   (packets are readable in Wireshark) and less CPU on weak clients.
   Measure it before recommending it.
+- **Audio and the microphone travel unencrypted too.** The warning says
+  so: the network must be trusted with what is heard and said, not only
+  with the screen.
 
 ## 2. Video pipeline
 
@@ -443,7 +457,9 @@ so it is already running before the first client connects:
 3. **The host compositor**: its Wayland socket goes in that directory and
    is given only to the nested compositor.
 4. **Session services**, launched as child processes on the private bus:
-   PipeWire and WirePlumber, with a null sink for audio capture.
+   PipeWire, WirePlumber and pipewire-pulse, with no access to the
+   server's sound hardware (§8). The server creates the session's only
+   sink and source itself.
 5. **The desktop**: the desktop command, `labwc` by default, started with
    the host's `WAYLAND_DISPLAY`.
    - The nested compositor creates its own Wayland socket for apps, along
@@ -464,6 +480,11 @@ so it is already running before the first client connects:
   display.
 - Children are in their own process group and are cleaned up when the
   server exits. Under systemd the unit's cgroup guarantees this.
+- **Sound hardware is out of reach** (§8): WirePlumber's ALSA, Bluetooth
+  and camera monitors are off, and the unit sets
+  `InaccessiblePaths=-/dev/snd -/run/pulse -/run/user/%U`.
+- Socket paths are limited to 108 bytes, and the longest is
+  `<rundir>/pulse/native`. The server checks this at startup.
 
 **GPU:** render nodes (`/dev/dri/renderD*`) are normally world-accessible,
 so the session needs no seat or `video` group to render and encode. If a
@@ -546,8 +567,46 @@ sent directly, with relative pointer capture when the server asks for it.
 
 ## 8. Everything else
 
-- **Audio:** Opus with 5–10 ms frames and in-band FEC, sent as datagrams.
-  Microphone redirection comes later.
+- **Audio** ([research](research/audio.md)):
+  - **Isolation.** The session's PipeWire runs in its private runtime dir.
+    WirePlumber runs a `farsight` profile with the hardware monitors off
+    (`hardware.audio`, `hardware.bluetooth` and `hardware.video-capture`
+    disabled), so the session has no hardware devices.
+    - The environment sets `PULSE_SERVER` explicitly, so libpulse never
+      falls back to a system instance or autospawns one.
+    - It sets `JACK_NO_START_SERVER=1`.
+    - pipewire-alsa is a dependency, so ALSA's `default` is PipeWire.
+    - The audio daemons get their own `XDG_CONFIG_HOME` and a per-session
+      `XDG_STATE_HOME`.
+  - **Server side.** `farsight-server` is a PipeWire client with two
+    streams: `farsight-speaker` (`Audio/Sink`) and `farsight-mic`
+    (`Audio/Source`). They live as long as the session, and WirePlumber
+    makes them the defaults. The graph runs at 48 kHz with a fixed
+    quantum of 240, one 5 ms frame per cycle, on the same monotonic clock
+    as video timestamps.
+  - **Desktop audio:** Opus `RESTRICTED_LOWDELAY` (CELT only), 5 ms
+    frames, stereo, 96–128 kbps.
+    - **Loss:** each datagram repeats the two previous frames. Opus
+      in-band FEC exists only in SILK mode, which needs frames of at least
+      10 ms.
+    - **Bad links:** fall back to 10 ms frames.
+    - **Silence:** nothing is sent while the sink is idle.
+  - **Client:** an adaptive jitter buffer of 5–20 ms, Opus PLC, and
+    drift correction by adaptive resampling. Video is never held back
+    for audio: audio trails it by 10–30 ms, well inside the 125 ms
+    detection threshold for late audio.
+  - **Microphone:** on demand.
+    - When an app starts recording from `farsight-mic`, the server sends
+      `MicDemand(true)`. The client opens its mic according to the user's
+      setting (never, ask or always) and shows an indicator.
+    - Opus `VOIP` mode, 10 ms frames, mono, with in-band FEC.
+    - **Echo cancellation runs on the client:** AAudio's
+      `VOICE_COMMUNICATION` preset on Android, and WebRTC's AEC3 on the
+      desktop. It can be turned off for headphones.
+  - **Wire:** datagram tags `TAG_AUDIO` and `TAG_MIC`, each carrying a
+    sequence number, `capture_us` and the newest frames. On the control
+    stream: `AudioCaps` in `Hello`, plus `AudioConfig`, `MicDemand` and
+    `SetAudio`.
 - **Clipboard:** MIME-typed and fetched lazily, over a stream. The server
   side reads and sets the nested desktop's clipboard through
   `ext-data-control`.
@@ -560,11 +619,11 @@ sent directly, with relative pointer capture when the server asks for it.
 | # | Goal | Done when |
 |---|---|---|
 | M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
-| M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured |
+| M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, datagram priority scheduler and video pacing (§1), VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured; input latency doesn't rise during keyframes |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
-| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`) | Runs as a system service; reconnect resumes the same session |
-| M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; `tc netem` test matrix | No stuck keys and no artifact spreading at 5% loss |
-| M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio, clipboard | Daily-usable from a phone or tablet |
+| M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured |
+| M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss |
+| M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
 
 ## Risks
@@ -582,6 +641,8 @@ sent directly, with relative pointer capture when the server asks for it.
    early.
 5. **HEVC/H.264 patent licensing** matters if this ships commercially. AV1
    avoids it.
+6. **Audio output latency varies by device**, Android especially (10–40 ms
+   in the output buffer). Measure it alongside MediaCodec.
 
 ## Sources
 
