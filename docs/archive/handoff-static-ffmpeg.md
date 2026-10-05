@@ -1,6 +1,26 @@
 # Handoff: link a minimal FFmpeg statically
 
-Status: 2026-10-05, not started. Branch `static-ffmpeg`.
+Status: 2026-10-05, done on branch `static-ffmpeg`; kept for the record.
+What was built differs from the plan below in a few places:
+
+- `tools/ffmpeg/build.sh` passes `--disable-autodetect`, `--disable-debug`
+  (FFmpeg's full debug info added about 17 MB to each binary) and
+  `--disable-iconv` too, so nothing else creeps in (iconv was enabled
+  otherwise). AV1's native decoder and hwaccel are Linux only, since
+  AV1 stays in software elsewhere; Windows enables the `d3d11va2` hwaccels
+  as well.
+- The licences and `FFMPEG.txt` go to `PREFIX/notice/`, not
+  `share/ffmpeg/`, which FFmpeg fills with its examples. dav1d's licence
+  (`COPYING.dav1d`) ships too.
+- Windows builds statically with MSVC from MSYS2, with two fixes in the
+  script: `.lib` copies of the `lib*.a` archives (before FFmpeg's configure,
+  which test-links dav1d), and `-libpath:`/`foo.lib` in the `.pc` files
+  rewritten as `-L`/`-lfoo` for the pkg-config crate.
+- Local builds without `PKG_CONFIG_PATH` still link the system's FFmpeg
+  dynamically: the pkg-config crate only links statically from outside
+  `/usr`.
+- The binaries still link libva, libva-drm and libdrm at load time; making
+  them optional is separate work.
 
 ## Goal
 
