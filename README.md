@@ -13,10 +13,14 @@ tiles (TurboJPEG, palettes) when the server has no hardware encoder. The
 server is an isolated session (M3): its own D-Bus and PipeWire, audio
 played on the client, clipboard and text input, client keys, plaintext
 mode for tailnets, reconnection, takeover and view-only clients, and a
-kiosk mode for a single app. See [`docs/design.md`](docs/design.md) for
-the design and milestones, and [`docs/m1-results.md`](docs/m1-results.md),
-[`docs/m2-results.md`](docs/m2-results.md) and
-[`docs/m3-results.md`](docs/m3-results.md) for what was measured.
+kiosk mode for a single app. The stream holds up on lossy, congested
+networks (M4): delay-based congestion control, FEC, NACK on quick paths,
+reference frame invalidation, and audio redundancy that follows the loss.
+See [`docs/design.md`](docs/design.md) for the design and milestones, and
+[`docs/m1-results.md`](docs/m1-results.md),
+[`docs/m2-results.md`](docs/m2-results.md),
+[`docs/m3-results.md`](docs/m3-results.md) and
+[`docs/m4-results.md`](docs/m4-results.md) for what was measured.
 
 ## Layout
 

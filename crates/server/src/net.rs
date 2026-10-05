@@ -284,9 +284,35 @@ async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>,
 }
 
 /// Routes the host's output to the connections.
+/// Video sent since the last log line: frames, their bytes, the datagrams'
+/// bytes (headers, padding and parity on top), and the longest
+/// packetization (parity takes the time).
+#[derive(Default)]
+struct VideoSent {
+    frames: u32,
+    bytes: usize,
+    sent: usize,
+    longest: std::time::Duration,
+}
+
+/// Video sent is logged this often.
+const VIDEO_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
     let mut next_update: u32 = 0;
+    let (mut video, mut logged) = (VideoSent::default(), Instant::now());
     while let Some(msg) = rx.recv().await {
+        if logged.elapsed() >= VIDEO_LOG_EVERY && video.frames > 0 {
+            let secs = logged.elapsed().as_secs_f64();
+            tracing::info!(
+                fps = format!("{:.1}", video.frames as f64 / secs),
+                mbps = format!("{:.2}", video.sent as f64 * 8.0 / secs / 1e6),
+                overhead = format!("{:.0}%", (video.sent as f64 / video.bytes.max(1) as f64 - 1.0) * 100.0),
+                packetize_max_us = video.longest.as_micros() as u64,
+                "video sent"
+            );
+            (video, logged) = (VideoSent::default(), Instant::now());
+        }
         let conns = shared.conns.lock().unwrap();
         match msg {
             ToNet::Shutdown(reason) => {
@@ -308,7 +334,12 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     capture_us: f.capture_us,
                     encode_us: f.encode_us,
                 };
+                let started = Instant::now();
                 let datagrams = packetize::packetize(&frame, max, loss);
+                video.longest = video.longest.max(started.elapsed());
+                video.frames += 1;
+                video.bytes += f.data.len();
+                video.sent += datagrams.iter().map(Bytes::len).sum::<usize>();
                 for c in conns.iter() {
                     c.sched.send_frame(datagrams.clone(), f.keyframe);
                 }

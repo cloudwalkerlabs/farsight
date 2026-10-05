@@ -1,10 +1,11 @@
 # farsight — design
 
-Status: 2026-10-05. M0–M3 are done: option B holds
+Status: 2026-10-05. M0–M4 are done: option B holds
 ([m0-results.md](m0-results.md)), the Linux desktop client works end to end
 ([m1-results.md](m1-results.md)), resize, scale, negotiation, NVENC and
-tiles work ([m2-results.md](m2-results.md)), and the server is a session
-with audio ([m3-results.md](m3-results.md)). M4 is next.
+tiles work ([m2-results.md](m2-results.md)), the server is a session
+with audio ([m3-results.md](m3-results.md)), and the stream holds up on
+lossy, congested networks ([m4-results.md](m4-results.md)). M5 is next.
 
 farsight is a low-latency remote desktop for headless Linux servers. Its
 requirements:
@@ -196,17 +197,38 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
   - one UDP port;
   - a later browser client through WebTransport.
 - **Catch:** QUIC datagrams are congestion-controlled, and quinn's built-in
-  controllers are built for bulk transfer. We plug in our own `Controller`:
-  a delay-based media controller modelled on
+  controllers are built for bulk transfer: they halve their window on
+  every loss, so a few percent of random loss, which FEC shrugs off, would
+  starve the stream. farsight plugs in its own (`farsight_net::cc`, M4),
+  delay-based after
   [SCReAM v2](https://www.ietf.org/archive/id/draft-johansson-ccwg-rfc8298bis-screamv2-04.html)
-  (which supports L4S) or on WebRTC's GCC. Its bandwidth estimate drives the
-  encoder's target bitrate directly. Prototype it early, because it shapes
-  the whole latency profile.
+  and WebRTC's GCC:
+  - quinn's `Controller` keeps a window of twice what the rate puts in
+    flight in a round trip, whatever is lost, and records bytes sent and
+    acked and each ack batch's shortest round trip;
+  - every 50 ms the rate is decided: queueing delay (the shortest recent
+    round trip over the shortest of the last 10 s) over 10 ms cuts it
+    towards what is delivered, at most 30% at once unless far more is
+    sent than delivered, then holds while the queue drains; under 4 ms it
+    grows, while the stream uses at least half of it; only heavy loss
+    (over 20%, averaged) counts as congestion;
+  - the ack-frequency extension asks the peer to ack within 2 ms, so round
+    trips measure the path rather than the peer's ack timer;
+  - the rate paces video (below) and, at 85% less FEC and audio, is the
+    encoder's target: encoders run at a constant QP, and a QP offset rises
+    with the overspend (six per doubling) and falls a step at a time.
+    While the slowest connection still has over 20 ms of video queued,
+    the pipeline skips encoding (a frame skipped costs nothing; one
+    dropped after encoding breaks the stream).
+- **The MTU stays at QUIC's minimum, 1200**, as media stacks do. Path MTU
+  discovery's black-hole detection takes random loss for a black hole, and
+  quinn then drops every queued datagram that no longer fits: a frame.
 - **Datagram priority.** quinn keeps every outgoing datagram in one FIFO,
   so input or audio queued behind a keyframe waits for all of it to be
   sent: about 120 ms for 300 KB at 20 Mbps. `farsight-net` puts a
   scheduler in front of it:
-  - strict priority: input and ping > audio > video;
+  - strict priority: input and ping > audio > repairs (NACKed shards) >
+    video;
   - quinn's own buffer holds only about one pacing interval, and the
     rest waits in per-class queues, where only video may grow or drop;
   - video, keyframes included, is paced at the controller's rate, so it
@@ -334,13 +356,33 @@ compositor reports exact damage, so only what changed is sent:
   - FEC block;
   - capture timestamp and encode duration;
   - the video epoch (§5).
-- Apply **adaptive Reed-Solomon FEC** to each frame, sized from the measured
-  loss. Keyframes get extra parity. Interleave fragments when loss is bursty.
-- **When RTT is under one frame interval** (LAN), selectively NACK and
-  retransmit. **Otherwise**, use FEC plus RFI: the client reports "frame N
-  lost, last good M" and the encoder references M.
-- **The client never decodes a damaged frame.** It drops the frame, sends
-  an RFI and keeps showing the last good frame.
+- Apply **adaptive Reed-Solomon FEC** to each frame (M4): the frame is
+  split into equal shards and followed by parity, and any `data` of its
+  shards rebuild it. The parity is the fewest shards that leave a frame
+  unrecoverable at most 0.2% of the time (0.05% for keyframes), for
+  independent loss at 1.5 times the rate measured on the worst connected
+  path. Shards of a frame of more than one are padded past half a
+  datagram, since QUIC packs small datagrams into one packet and they
+  would be lost together. Interleaving for bursty loss is not done: FEC
+  covers random loss, and NACK and RFI the rest.
+- **When a round trip and two shards' time fit in a frame** (LAN), the
+  client NACKs a stalled frame's missing shards, or a frame it has none
+  of, twice at most; frames behind it wait meanwhile. "Stalled" scales
+  with the gap between shards, so a frame still arriving on a slow path
+  isn't. The server keeps the last 32 frames, and sends repairs paced,
+  ahead of new video; not for frames its own scheduler dropped.
+- **Otherwise, RFI:** each fragment carries `refs`, the newest frame it may
+  reference. The client reports "frames after M up to N can't be decoded"
+  (`Rfi { lost, good }`), repeating it until it can decode again, and the
+  encoder predicts the next frame from M: NVENC invalidates the frames
+  after M (it keeps 8 for reference; Maxwell has invalidation, though not
+  several references per frame). VA-API, through FFmpeg, has no RFI and
+  sends a keyframe, as NVENC does when M has gone.
+- **The client never decodes a damaged frame.** It decodes a keyframe, or a
+  frame whose `refs` is no newer than the last frame decoded since the
+  last keyframe, and drops the rest, keeping the last good picture. (M4
+  checks this bit for bit: every picture decoded under loss matches a
+  decode of the server's whole stream.)
 - **No jitter buffer.** Decode as soon as a frame is complete, present
   immediately, and drop frames that are already superseded.
 
@@ -390,7 +432,9 @@ key stuck down. So input travels as unreliable datagrams but is designed as
   key is held.** It holds the pressed keys and buttons, pointer position,
   and modifier/lock state. The server compares it with its seat state and
   generates corrections, so a stuck key fixes itself within one snapshot
-  interval.
+  interval. A standalone snapshot repeats the recent events too: a key
+  tapped in a lost packet just before a pause leaves nothing held for the
+  snapshot to show, and would otherwise never be typed (found in M4).
 - **Absolute pointer motion:** the latest position wins and stale updates
   are dropped.
 - **Relative motion and scroll:** deltas accumulate per sequence number and
@@ -632,13 +676,19 @@ sent directly, with relative pointer capture when the server asks for it.
     as video timestamps.
   - **Desktop audio:** Opus `RESTRICTED_LOWDELAY` (CELT only), 5 ms
     frames, stereo, 96–128 kbps.
-    - **Loss:** each datagram repeats the two previous frames. Opus
-      in-band FEC exists only in SILK mode, which needs frames of at least
-      10 ms.
-    - **Bad links:** fall back to 10 ms frames.
+    - **Loss:** each datagram repeats the frames before its own: as many
+      as the lossiest listener's path needs to lose a frame less than once
+      in ten thousand, from two to five repeats (M4). Opus in-band FEC
+      exists only in SILK mode, which needs frames of at least 10 ms.
+    - **Slow links:** under 1.5 Mbit/s (back above 3), 10 ms frames at
+      64 kbit/s, which halves the datagrams and their headers. The client
+      swaps its player and keeps its output open.
     - **Silence:** nothing is sent while the sink is idle.
   - **Client:** an adaptive jitter buffer of 5–20 ms, Opus PLC, and
-    drift correction by adaptive resampling. Video is never held back
+    drift correction by adaptive resampling. A frame that came only as a
+    repeat came a frame or more late, so the buffer also holds as many
+    frames as repeats were needed from for all but one recent frame in a
+    thousand: nothing at all on a clean link. Video is never held back
     for audio: audio trails it by 10–30 ms, well inside the 125 ms
     detection threshold for late audio.
   - **Microphone:** on demand.
@@ -668,7 +718,7 @@ sent directly, with relative pointer capture when the server asks for it.
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, datagram priority scheduler and video pacing (§1), VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured; input latency doesn't rise during keyframes. **Done over loopback** ([results](m1-results.md)): 10 ms from commit to the client's swap; a run between two machines is still to do. |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles. **Done over loopback** ([results](m2-results.md)): layout changes hold frames 6–57 ms; AV1 is untested for want of an encoder. |
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured. **Done over loopback** ([results](m3-results.md)): 13–20 ms from the session's sink to the client's speaker; checked as a user service, not as root or with a user in `audio`; the client's keymap is still labwc's. |
-| M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss |
+| M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss. **Done under netem on one machine** ([results](m4-results.md)): at 5% loss nothing lost after FEC, every decoded picture bit-exact, every typed line exact, no audio concealed; RFI through NVENC, keyframes through VA-API; a run between two machines is still to do. |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
 
