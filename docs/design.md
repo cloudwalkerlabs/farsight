@@ -1,6 +1,7 @@
 # farsight — design
 
-Status: research and plan, 2026-10-05. Nothing below is implemented yet.
+Status: plan, 2026-10-05. The M0 spike is done and option B holds; see
+[m0-results.md](m0-results.md). Nothing past M0 is implemented yet.
 
 farsight is a low-latency remote desktop for headless Linux servers. Its
 requirements:
@@ -343,10 +344,12 @@ The client's window is the source of truth for the output
   - The nested compositor then tells its apps the new scale, and they
     redraw sharply. The client receives exactly its own pixel count and
     draws it 1:1.
-  - **Open question for the M0 spike:** does a size + scale change through
-    two compositors still look like one step, or is there a frame at the
-    new size with the old scale? If there is, the host holds the old frame
-    until both have been applied.
+  - **Measured in M0:** the change is not one step. Frames at the new size
+    with old content reach the host, so the host holds the last good frame
+    until the nested compositor confirms the new output state and a frame
+    arrives after it. labwc also ignores the host's `preferred_scale`, so
+    with labwc scale always goes through `wlr-output-management`
+    ([m0-results.md](m0-results.md#fractional-scale)).
 
   Under option A (or in kiosk mode) the host applies both in one atomic
   step itself.
@@ -511,7 +514,7 @@ sent directly, with relative pointer capture when the server asks for it.
 
 | # | Goal | Done when |
 |---|---|---|
-| M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. |
+| M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover | Runs as a system service; reconnect resumes the same session |
