@@ -160,6 +160,11 @@ impl Queues {
         self.dropped_frames
     }
 
+    /// How long the video queued now takes to send at the pacing rate.
+    pub fn backlog(&self) -> Duration {
+        Duration::from_secs_f64(self.video_bytes as f64 * 8.0 / self.rate_bps as f64)
+    }
+
     fn refill(&mut self, now: Instant) {
         let dt = now.saturating_duration_since(self.refilled).as_secs_f64();
         self.tokens = (self.tokens + dt * self.rate_bps as f64 / 8.0).min(self.burst() as f64);
@@ -214,6 +219,10 @@ impl Scheduler {
 
     pub fn dropped_frames(&self) -> u64 {
         self.shared.queues.lock().unwrap().dropped_frames()
+    }
+
+    pub fn backlog(&self) -> Duration {
+        self.shared.queues.lock().unwrap().backlog()
     }
 }
 
@@ -334,6 +343,7 @@ mod tests {
         }
         assert!(q.dropped_frames() > 10);
         assert!(q.video_bytes <= q.bytes_in(MAX_BACKLOG));
+        assert!(q.backlog() <= MAX_BACKLOG && q.backlog() > MAX_BACKLOG / 2);
         let Next::Send(first) = q.next(t, 0) else { panic!() };
         assert!(first[0] > 0);
     }

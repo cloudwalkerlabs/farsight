@@ -287,9 +287,12 @@ pub struct Nvenc {
     height: u32,
     /// `init` points at it.
     config: Box<NV_ENC_CONFIG>,
-    /// The ordinary and refinement QPs, on this codec's scale.
+    /// The ordinary and refinement QPs, on this codec's scale, the most it
+    /// takes, and the one set now.
     qp: u32,
     refine_qp: u32,
+    max_qp: u32,
+    current_qp: u32,
     init: Box<NV_ENC_INITIALIZE_PARAMS>,
 }
 
@@ -382,6 +385,8 @@ impl Nvenc {
             height,
             config,
             qp,
+            max_qp: if format.codec == Codec::Av1 { 255 } else { 51 },
+            current_qp: qp,
             refine_qp: match format.codec {
                 Codec::Av1 => settings.refine_qp * 255 / 51,
                 _ => settings.refine_qp,
@@ -425,14 +430,22 @@ impl Nvenc {
         self.session.with(|| unsafe { check(nv!(api, nvEncReconfigureEncoder(encoder, &mut params)), "changing the QP") })
     }
 
-    pub fn encode(&mut self, frame: MemFrame, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
-        if kind != FrameKind::Refine || self.refine_qp == self.qp {
-            return self.encode_frame(frame, pts_us, kind, out);
+    /// Encodes `frame`, `qp_offset` above its QP (on H.264's scale).
+    pub fn encode(
+        &mut self,
+        frame: MemFrame,
+        pts_us: i64,
+        kind: FrameKind,
+        qp_offset: u32,
+        out: &mut Vec<u8>,
+    ) -> anyhow::Result<bool> {
+        let base = if kind == FrameKind::Refine { self.refine_qp } else { self.qp };
+        let qp = (base + qp_offset * self.max_qp / 51).min(self.max_qp);
+        if qp != self.current_qp {
+            self.set_qp(qp)?;
+            self.current_qp = qp;
         }
-        self.set_qp(self.refine_qp)?;
-        let result = self.encode_frame(frame, pts_us, kind, out);
-        self.set_qp(self.qp)?;
-        result
+        self.encode_frame(frame, pts_us, kind, out)
     }
 
     fn encode_frame(&mut self, frame: MemFrame, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {

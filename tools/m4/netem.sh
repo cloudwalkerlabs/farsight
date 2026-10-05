@@ -5,10 +5,12 @@
 # loopback; the server, the client, the client's headless desktop and its
 # private sound server all run in there. Loopback carries both directions,
 # so the impairment applies each way: `delay 10ms` is a 20 ms round trip.
+# Give jitter a rate, as above: without one, netem reorders packets freely,
+# which real links seldom do.
 #
 #   tools/m4/netem.sh OUTDIR "NETEM" [SECONDS]
 #   tools/m4/netem.sh /tmp/m4 "loss 5%"
-#   tools/m4/netem.sh /tmp/m4 "delay 10ms 2ms loss 5%" 30
+#   tools/m4/netem.sh /tmp/m4 "delay 10ms 2ms rate 1gbit loss 5%" 30
 #   tools/m4/netem.sh /tmp/m4 ""                  # no impairment
 #
 # The session plays a 440 Hz tone (from 4 s in) under es2gears, which keeps

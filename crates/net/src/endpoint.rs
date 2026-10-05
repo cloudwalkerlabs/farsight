@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 /// arrive faster than the application reads them.
 pub const DATAGRAM_BUFFER: usize = 2 << 20;
 
+/// The longest a peer may hold back an ack.
+pub const MAX_ACK_DELAY: Duration = Duration::from_millis(2);
+
 /// The server's certificate and key.
 pub struct Identity {
     pub cert: CertificateDer<'static>,
@@ -78,6 +81,9 @@ pub fn fingerprint(cert: &[u8]) -> String {
 ///   MTU discovery's black-hole detection takes random loss for a black
 ///   hole, and when the MTU shrinks quinn drops every queued datagram that
 ///   no longer fits, which is a whole frame.
+/// - **Congestion control is farsight's own** ([`crate::cc`]), and the peer
+///   is asked to ack within [`MAX_ACK_DELAY`], so round trips measure the
+///   path rather than the peer's ack timer.
 /// - `FARSIGHT_NO_GSO` turns UDP segmentation offload off. Only tests want
 ///   it: `tc netem` drops an offloaded batch of packets whole, where a real
 ///   link loses them one by one (tools/m4/netem.sh).
@@ -87,7 +93,11 @@ pub fn transport_config() -> TransportConfig {
         .keep_alive_interval(Some(Duration::from_secs(1)))
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_BUFFER)
-        .mtu_discovery_config(None);
+        .mtu_discovery_config(None)
+        .congestion_controller_factory(Arc::new(crate::cc::Factory));
+    let mut acks = quinn::AckFrequencyConfig::default();
+    acks.max_ack_delay(Some(MAX_ACK_DELAY));
+    t.ack_frequency_config(Some(acks));
     if std::env::var_os("FARSIGHT_NO_GSO").is_some() {
         t.enable_segmentation_offload(false);
     }

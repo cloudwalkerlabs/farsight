@@ -15,6 +15,7 @@
 
 pub mod ffmpeg;
 mod nvenc;
+pub mod rate;
 mod readback;
 pub mod tiles;
 mod vaapi;
@@ -285,17 +286,24 @@ impl Frames {
 }
 
 impl Encoder {
-    pub fn encode(&mut self, input: Input, pts_us: i64, kind: FrameKind) -> anyhow::Result<Output> {
+    /// Whether QP means anything: tiles have no QP.
+    pub fn is_video(&self) -> bool {
+        !matches!(self, Encoder::Tiles(_))
+    }
+
+    /// Encodes `input`; video goes `qp_offset` above its QP (on H.264's
+    /// scale), to stay within the rate (`rate`).
+    pub fn encode(&mut self, input: Input, pts_us: i64, kind: FrameKind, qp_offset: u32) -> anyhow::Result<Output> {
         match (self, input) {
             (Encoder::Ffmpeg(c), Input::Va(s)) => {
                 let mut data = Vec::new();
                 // SAFETY: the surface comes from this epoch's VA-API pool.
-                let keyframe = unsafe { c.encode(s.into_raw(), pts_us, kind, &mut data)? };
+                let keyframe = unsafe { c.encode(s.into_raw(), pts_us, kind, qp_offset, &mut data)? };
                 Ok(Output::Video { data, keyframe })
             }
             (Encoder::Nvenc(c), Input::Mem(f)) => {
                 let mut data = Vec::new();
-                let keyframe = c.encode(f, pts_us, kind, &mut data)?;
+                let keyframe = c.encode(f, pts_us, kind, qp_offset, &mut data)?;
                 Ok(Output::Video { data, keyframe })
             }
             (Encoder::Tiles(t), Input::Tiles(d)) => Ok(Output::Tiles(t.encode(d)?)),

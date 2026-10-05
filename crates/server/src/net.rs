@@ -7,13 +7,14 @@
 //! connection alike, encoded once; replies go to the connection they answer.
 //! The session itself outlives them all.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
 use farsight_net::packetize::{EncodedFrame, Packetizer};
+use farsight_net::cc;
 use farsight_net::path::{self, PathState};
 use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
@@ -97,9 +98,15 @@ pub struct Options {
     /// Client keys allowed in (§6), read on every connection.
     pub authorized_keys: std::path::PathBuf,
     pub identity: endpoint::Identity,
-    /// Video is paced at this rate until there is a congestion controller
-    /// (M4).
+    /// The most video is paced at; congestion control picks the rate
+    /// below it, per connection (§1).
     pub rate_bps: u64,
+    /// What the encoder should aim for, in bits per second: set from the
+    /// slowest connection's rate.
+    pub video_target: Arc<AtomicU64>,
+    /// When the video queued for the slowest connection will have gone, in
+    /// the host's µs: the pipeline encodes nothing new until about then.
+    pub video_drain_at: Arc<AtomicU64>,
     /// The host's clock, which pongs and frame timestamps are in.
     pub start: Instant,
     pub audio: Arc<Audio>,
@@ -135,7 +142,7 @@ pub fn spawn(opts: Options, host: HostSender<ToHost>) -> anyhow::Result<mpsc::Un
     };
     let fingerprint = if opts.plain { "none (plaintext)".to_string() } else { opts.identity.fingerprint() };
     tracing::info!(
-        addr = %endpoint.local_addr()?, %fingerprint, rate_mbps = opts.rate_bps / 1_000_000, "listening"
+        addr = %endpoint.local_addr()?, %fingerprint, max_rate_mbps = opts.rate_bps / 1_000_000, "listening"
     );
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new().name("farsight-net".into()).spawn(move || {
@@ -156,6 +163,36 @@ impl Shared {
     fn update_listening(&self, conns: &[Conn]) {
         self.opts.audio.listening.store(conns.iter().any(|c| c.audio), Ordering::Relaxed);
     }
+
+    /// Notes when the slowest connection's video queue will have drained.
+    fn note_backlog(&self, conns: &[Conn]) {
+        let backlog = conns.iter().map(|c| c.sched.backlog()).max().unwrap_or_default();
+        let at = self.opts.start.elapsed() + backlog;
+        self.opts.video_drain_at.store(at.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Video is encoded once for everyone, so for the slowest path.
+    fn update_target(&self) {
+        let conns = self.conns.lock().unwrap();
+        if let Some(target) = conns.iter().map(|c| encoder_target(&c.path)).min() {
+            self.opts.video_target.store(target, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Audio's share of a path, when it plays: Opus and the packets around it.
+const AUDIO_RESERVE: u64 = 300_000;
+
+/// The share of a path's rate the encoder aims for. The rest leaves room
+/// for FEC, audio, input, and frames bigger than the rest.
+const ENCODER_SHARE: f64 = 0.85;
+
+/// The encoder's target for a path: its share, less parity for the loss
+/// (about twice the loss, as [`farsight_net::packetize::parity`] sizes it,
+/// and a little more for small frames) and audio.
+fn encoder_target(p: &PathState) -> u64 {
+    let fec = 1.0 + 3.0 * p.loss();
+    ((p.rate_bps() as f64 * ENCODER_SHARE / fec) as u64).saturating_sub(AUDIO_RESERVE).max(cc::MIN_RATE / 2)
 }
 
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
@@ -207,6 +244,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                 for c in conns.iter() {
                     c.sched.send_frame(datagrams.clone(), f.keyframe);
                 }
+                shared.note_backlog(&conns);
             }
             ToNet::Tiles(t) => {
                 let count = t.update.bodies.len();
@@ -240,6 +278,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                 for c in conns.iter() {
                     c.sched.send_frame(datagrams.clone(), false);
                 }
+                shared.note_backlog(&conns);
             }
             ToNet::Message(id, m) => {
                 if let Some(c) = conns.iter().find(|c| c.id == id) {
@@ -264,7 +303,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
     }
 }
 
-async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow::Result<()> {
+async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> anyhow::Result<()> {
     let (host, audio) = (&shared.host, &shared.opts.audio);
     let (authorized_keys, rate_bps, start) = (&shared.opts.authorized_keys, shared.opts.rate_bps, shared.opts.start);
     let conn = incoming.await.context("handshake")?;
@@ -298,7 +337,15 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
     let view_only = hello.view_only;
     tracing::info!(id, layout = ?hello.layout, decoders = hello.decoders.len(), view_only, "hello");
 
-    let sched = Scheduler::spawn(conn.clone(), rate_bps, endpoint::DATAGRAM_BUFFER);
+    let sched = Scheduler::spawn(conn.clone(), cc::START_RATE.min(rate_bps), endpoint::DATAGRAM_BUFFER);
+    // Video is paced at the path's rate, less audio's share.
+    let path = {
+        let (sched, shared) = (sched.clone(), shared.clone());
+        path::monitor(conn.clone(), rate_bps, move |p| {
+            sched.set_rate(p.rate_bps().saturating_sub(AUDIO_RESERVE).max(cc::MIN_RATE / 2));
+            shared.update_target();
+        })
+    };
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // Audio goes to a client that plays it, from a session that has it.
     let audio_config = hello.audio.and(audio.config.get().copied());
@@ -306,7 +353,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
         id,
         conn: conn.clone(),
         sched: sched.clone(),
-        path: path::monitor(conn.clone()),
+        path,
         control: control_tx,
         audio: audio_config.is_some(),
         view_only,

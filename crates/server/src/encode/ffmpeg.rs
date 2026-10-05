@@ -27,9 +27,11 @@ const AVERROR_EAGAIN: i32 = -libc::EAGAIN;
 pub struct FfEncoder {
     ctx: *mut ff::AVCodecContext,
     packet: *mut ff::AVPacket,
-    /// The QP offset of a refinement frame, as a fraction of the codec's
-    /// QP range (an ROI over the whole picture).
-    refine_offset: ff::AVRational,
+    /// A refinement frame's QP relative to the others, and the codec's QP
+    /// range: an ROI over the whole picture moves the QP by a fraction of
+    /// the range.
+    refine_delta: i32,
+    range: i32,
 }
 
 // SAFETY: the encoder owns its context outright and is used from one thread
@@ -55,7 +57,12 @@ impl FfEncoder {
             if codec.is_null() {
                 bail!("FFmpeg has no {} encoder", name.to_string_lossy());
             }
-            let enc = Self { ctx: ff::avcodec_alloc_context3(codec), packet: ff::av_packet_alloc(), refine_offset: ff::AVRational { num: 0, den: 1 } };
+            let enc = Self {
+                ctx: ff::avcodec_alloc_context3(codec),
+                packet: ff::av_packet_alloc(),
+                refine_delta: 0,
+                range: 51,
+            };
             let c = &mut *enc.ctx;
             c.width = width;
             c.height = height;
@@ -91,17 +98,18 @@ impl FfEncoder {
         }
     }
 
-    /// Refinement frames go at `refine_qp` instead of `qp`, through a
-    /// region of interest over the whole picture: FFmpeg's VA-API encoders
-    /// take no per-frame QP otherwise.
+    /// Refinement frames go at `refine_qp` instead of `qp`, and a QP
+    /// offset moves either, through a region of interest over the whole
+    /// picture: FFmpeg's VA-API encoders take no per-frame QP otherwise.
+    /// `range` is the codec's QP range, which `qp` is on.
     pub fn with_refinement(mut self, qp: u32, refine_qp: u32, range: u32) -> Self {
-        let delta = refine_qp.min(qp) as i32 - qp as i32;
-        self.refine_offset = ff::AVRational { num: delta, den: range as i32 };
+        self.refine_delta = refine_qp.min(qp) as i32 - qp as i32;
+        self.range = range as i32;
         self
     }
 
-    /// Encodes `frame` (consumed) into `out`; returns whether the result is
-    /// a keyframe.
+    /// Encodes `frame` (consumed) into `out`, `qp_offset` above its QP (on
+    /// H.264's scale); returns whether the result is a keyframe.
     ///
     /// # Safety
     /// `frame` must be a frame this encoder accepts, owned by the caller.
@@ -110,8 +118,11 @@ impl FfEncoder {
         mut frame: *mut ff::AVFrame,
         pts_us: i64,
         kind: FrameKind,
+        qp_offset: u32,
         out: &mut Vec<u8>,
     ) -> anyhow::Result<bool> {
+        let refine = if kind == FrameKind::Refine { self.refine_delta } else { 0 };
+        let delta = (refine + qp_offset as i32 * self.range / 51).clamp(-self.range, self.range);
         let mut keyframe = false;
         // SAFETY: as the caller promises; the packet is ours.
         unsafe {
@@ -120,7 +131,7 @@ impl FfEncoder {
                 FrameKind::Keyframe => ff::AVPictureType::AV_PICTURE_TYPE_I,
                 _ => ff::AVPictureType::AV_PICTURE_TYPE_NONE,
             };
-            if kind == FrameKind::Refine && self.refine_offset.num != 0 {
+            if delta != 0 {
                 let size = std::mem::size_of::<ff::AVRegionOfInterest>();
                 let sd = ff::av_frame_new_side_data(frame, ff::AVFrameSideDataType::AV_FRAME_DATA_REGIONS_OF_INTEREST, size);
                 if !sd.is_null() {
@@ -131,7 +142,7 @@ impl FfEncoder {
                         bottom: (*frame).height,
                         left: 0,
                         right: (*frame).width,
-                        qoffset: self.refine_offset,
+                        qoffset: ff::AVRational { num: delta, den: self.range },
                     });
                 }
             }

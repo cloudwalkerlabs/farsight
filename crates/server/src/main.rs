@@ -69,8 +69,8 @@ struct Args {
     /// Initial output scale.
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
-    /// Pace video at this many Mbit/s. A stand-in for congestion control,
-    /// which comes in M4.
+    /// The most video may use, in Mbit/s. Congestion control picks the
+    /// rate below this for each client.
     #[arg(long, default_value_t = 100)]
     rate: u64,
     /// Directory holding the server's TLS identity (`cert.der`, `key.der`,
@@ -163,6 +163,8 @@ fn main() -> anyhow::Result<()> {
     }
     let (to_host, from_net) = channel::channel();
     let audio = Arc::new(net::Audio::default());
+    let video_target = Arc::new(std::sync::atomic::AtomicU64::new(farsight_net::cc::START_RATE));
+    let video_drain_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let net = net::spawn(
         net::Options {
             listen: args.listen,
@@ -171,6 +173,8 @@ fn main() -> anyhow::Result<()> {
             authorized_keys,
             identity,
             rate_bps: args.rate * 1_000_000,
+            video_target: video_target.clone(),
+            video_drain_at: video_drain_at.clone(),
             start,
             audio: audio.clone(),
         },
@@ -200,6 +204,8 @@ fn main() -> anyhow::Result<()> {
             jpeg_quality: args.jpeg_quality,
             refine_qp: args.refine_qp,
             probe: args.probe,
+            video_target,
+            video_drain_at,
         },
         encoders,
         start,

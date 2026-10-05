@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -158,7 +158,16 @@ pub struct Options {
     pub refine_qp: u32,
     /// Read the probe client's frame number back from each nested frame.
     pub probe: bool,
+    /// The bitrate to keep video within, from congestion control.
+    pub video_target: Arc<AtomicU64>,
+    /// When the network's video queue drains, in host µs.
+    pub video_drain_at: Arc<AtomicU64>,
 }
+
+/// A new frame isn't encoded while the network would still hold more than
+/// this much video by the time it is ready. Skipping a frame before it is
+/// encoded costs nothing; dropping one after would break the stream.
+const MAX_QUEUED_US: u64 = 20_000;
 
 pub struct Pipeline {
     opts: Options,
@@ -199,6 +208,9 @@ pub struct Pipeline {
     /// When frame callbacks last went out, in host µs.
     last_callback_us: u64,
     callback_timer: bool,
+    /// A frame was skipped for the network (and whether it was a
+    /// refinement); it is encoded once the queue drains.
+    skipped: Option<bool>,
     clock: Clock<Monotonic>,
     presented: u64,
 }
@@ -242,9 +254,10 @@ impl Pipeline {
         let thread_lossy = lossy.clone();
         let in_flight: Arc<AtomicUsize> = Arc::default();
         let thread_in_flight = in_flight.clone();
+        let rate = (opts.video_target.clone(), encode::rate::QpControl::new(51u32.saturating_sub(opts.qp)));
         let thread = std::thread::Builder::new()
             .name("farsight-encode".into())
-            .spawn(move || encode_thread(rx, out, start, net, thread_lossy, thread_in_flight))?;
+            .spawn(move || encode_thread(rx, out, start, net, thread_lossy, thread_in_flight, rate))?;
         Ok(Self {
             opts,
             encoders,
@@ -267,6 +280,7 @@ impl Pipeline {
             force_keyframe: false,
             last_callback_us: 0,
             callback_timer: false,
+            skipped: None,
             clock: Clock::new(),
             presented: 0,
         })
@@ -564,6 +578,10 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
         new_epoch(host, w, h)?;
     }
 
+    if skip_for_network(host, refine) {
+        return Ok(());
+    }
+
     let t_start = now();
     let probe = if host.pipeline.opts.probe { read_probe(&mut host.renderer, texture)? } else { None };
     let t_probe = now();
@@ -637,6 +655,33 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
     Ok(())
 }
 
+/// Whether to leave this frame out because the network is behind; if so,
+/// the current picture is encoded once the queue drains.
+fn skip_for_network(host: &mut Host, refine: bool) -> bool {
+    let p = &mut host.pipeline;
+    let now = host.start.elapsed().as_micros() as u64;
+    let drain_at = p.opts.video_drain_at.load(Ordering::Relaxed);
+    // A keyframe replaces whatever is queued.
+    if p.force_keyframe || now + MAX_QUEUED_US >= drain_at {
+        p.skipped = None;
+        return false;
+    }
+    if p.skipped.is_none() {
+        let wait = Duration::from_micros(drain_at - MAX_QUEUED_US - now);
+        let _ = host.loop_handle.insert_source(Timer::from_duration(wait), |_, _, host| {
+            if let Some(refine) = host.pipeline.skipped.take() {
+                encode_current(host, refine);
+            }
+            TimeoutAction::Drop
+        });
+    }
+    // The latest wins: a new picture makes a refinement owed moot, and
+    // sending it arms the next one.
+    p.skipped = Some(refine);
+    tracing::debug!(behind_ms = (drain_at - now) / 1000, "network behind; frame skipped");
+    true
+}
+
 /// Tells the nested compositor its frame is done: presentation feedback
 /// now, frame callbacks now or once a refresh interval has passed since the
 /// last ones.
@@ -691,6 +736,7 @@ fn encode_thread(
     net: UnboundedSender<ToNet>,
     lossy: Arc<Mutex<Vec<Rect>>>,
     in_flight: Arc<AtomicUsize>,
+    (target, mut qp): (Arc<AtomicU64>, encode::rate::QpControl),
 ) {
     let now = || start.elapsed().as_micros() as u64;
     let mut codec = None;
@@ -715,7 +761,11 @@ fn encode_thread(
         let _ = job.sync.wait();
         let t_converted = now();
         let kind = job.kind;
-        let output = match codec.encode(job.input, job.t_commit as i64, kind) {
+        let qp_offset = match codec.is_video() && job.send {
+            true => qp.next(Instant::now(), target.load(Ordering::Relaxed)),
+            false => 0,
+        };
+        let output = match codec.encode(job.input, job.t_commit as i64, kind, qp_offset) {
             Ok(o) => o,
             Err(err) => {
                 tracing::error!("{err:#}");
@@ -724,6 +774,7 @@ fn encode_thread(
         };
         let t_encoded = now();
         let encode_us = (t_encoded - job.t_commit) as u32;
+        let video = matches!(output, Output::Video { .. });
         let (bytes, keyframe) = match output {
             Output::Video { data, keyframe } => {
                 if let Some(f) = &mut out
@@ -750,6 +801,10 @@ fn encode_thread(
             }
         };
 
+        if video && job.send {
+            qp.spent(Instant::now(), bytes);
+        }
+
         // One line per frame, parsed by tools/m0/analyze.py.
         tracing::info!(
             target: "frame",
@@ -766,6 +821,7 @@ fn encode_thread(
             bytes,
             keyframe,
             refine = kind == FrameKind::Refine,
+            qp_offset,
             "frame"
         );
     }

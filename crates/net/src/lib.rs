@@ -3,6 +3,7 @@
 //! packetization, FEC and congestion control (`docs/design.md` §1–2).
 
 pub mod auth;
+pub mod cc;
 pub mod endpoint;
 pub mod packetize;
 pub mod path;

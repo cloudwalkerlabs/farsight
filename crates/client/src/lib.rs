@@ -459,11 +459,18 @@ async fn run(
             match d.as_deref().and_then(Datagram::decode) {
                 Some(Datagram::Video(h, payload)) => {
                     if let Some(f) = rx.push(h, payload, now) {
+                        // Frames lost before a keyframe don't matter: it
+                        // starts afresh.
+                        let lost = rx.take_lost();
                         let mut stats = shared.stats.lock().unwrap();
                         stats.frames += 1;
+                        stats.lost += lost as u64;
                         drop(stats);
                         if f.header.keyframe() {
                             shared.want_keyframe.store(false, Ordering::Relaxed);
+                        } else if lost > 0 {
+                            tracing::debug!(lost, "frames lost; waiting for a keyframe");
+                            shared.want_keyframe.store(true, Ordering::Relaxed);
                         }
                         if shared.want_keyframe.load(Ordering::Relaxed) {
                             request(&mut last_request);
