@@ -1,7 +1,9 @@
 # farsight — design
 
-Status: plan, 2026-10-05. The M0 spike is done and option B holds; see
-[m0-results.md](m0-results.md). Nothing past M0 is implemented yet.
+Status: 2026-10-05. M0–M2 are done: option B holds
+([m0-results.md](m0-results.md)), the Linux desktop client works end to end
+([m1-results.md](m1-results.md)), and resize, scale, negotiation, NVENC and
+tiles work ([m2-results.md](m2-results.md)). M3 is next.
 
 farsight is a low-latency remote desktop for headless Linux servers. Its
 requirements:
@@ -274,8 +276,11 @@ off.
    finish, so the nested compositor can start its next frame at once.
 4. Hand the encoder surface to the encoder with zero copies:
    - **VA-API** (Intel/AMD): DRM-PRIME import.
-   - **NVENC**: import the dmabuf through CUDA external memory and register
-     it with NVENC in place. Re-import must be able to fail and be retried:
+   - **NVENC**: bound directly at API 12.1, not through FFmpeg, whose
+     NVENC needs drivers that Maxwell and Pascal GPUs never get. Today the
+     conversion is read back and copied in, since the host usually renders
+     on another GPU (M2). The zero-copy goal: import the dmabuf through
+     CUDA external memory and register it with NVENC in place. Re-import must be able to fail and be retried:
      Sunshine
      [hit `CUDA_ERROR_NOT_SUPPORTED`](https://github.com/LizardByte/Sunshine/issues/5613)
      after suspend.
@@ -349,7 +354,9 @@ compositor reports exact damage, so only what changed is sent:
 - The server intersects the two lists and ranks the matches. Only its
   hardware encoders take part; tiles (§2) are the last entry, which every
   client supports.
-  1. Hardware on both ends.
+  1. Hardware on both ends. (Measured in M2: HEVC wins on an HD 530 but
+     costs 4 ms more to encode than H.264; a measured encode time should
+     come into the ranking.)
   2. The mode the user asked for: "text" mode prefers 4:4:4, "motion" mode
      prefers efficiency.
   3. Codec efficiency: AV1 > HEVC > H.264.
@@ -646,7 +653,7 @@ sent directly, with relative pointer capture when the server asks for it.
 |---|---|---|
 | M0 | Spike: Smithay host compositor with labwc (+ XFCE) nested → dmabuf → VA-API H.264 → file | Desktop renders. Measured: app commit → encoder latency through labwc; whether labwc's buffers import with no blit; resize and fractional-scale behaviour; keymap pass-through. These numbers decide whether B holds or A/A′ is needed. **Done: B holds** ([results](m0-results.md)). |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, datagram priority scheduler and video pacing (§1), VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured; input latency doesn't rise during keyframes. **Done over loopback** ([results](m1-results.md)): 10 ms from commit to the client's swap; a run between two machines is still to do. |
-| M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles |
+| M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement; tiles (TurboJPEG, palette+zlib) when the server has no hardware encoder | Drag-resize and a move to a different-DPI monitor both stay sharp, with video and with tiles. **Done over loopback** ([results](m2-results.md)): layout changes hold frames 6–57 ms; AV1 is untested for want of an encoder. |
 | M3 | Session: isolated runtime dir, private D-Bus, PipeWire, desktop supervision and restart, kiosk mode, clipboard/IME via the nested compositor, client keys, reconnect and takeover; plaintext mode (`--no-tls`). **Audio out:** isolated audio daemons, `farsight-speaker`, Opus with redundancy, desktop client playback with jitter buffer and drift correction | Runs as a system service; reconnect resumes the same session; a video in the session plays on the client while the server's speakers stay silent, even with the user in `audio`; audio latency measured |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; audio redundancy depth and 10 ms fallback; `tc netem` test matrix | No stuck keys, no artifact spreading and no audible audio gaps at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio (AAudio), clipboard. **Microphone** on both clients: `farsight-mic`, `MicDemand`, client capture with echo cancellation | Daily-usable from a phone or tablet; a call app in the session hears the client's mic without echo |

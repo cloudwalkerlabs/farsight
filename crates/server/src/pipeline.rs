@@ -315,9 +315,16 @@ impl Pipeline {
         }
     }
 
-    /// The largest picture the first encoding allows.
+    /// The largest picture any video format allows, or tiles if there is
+    /// none. A size past the first format's limits starts the next epoch
+    /// in a format that fits (§3).
     pub fn max_size(&self) -> (u32, u32) {
-        self.choices.first().map_or((TILES_MAX, TILES_MAX), |c| (c.max_width, c.max_height))
+        if self.choices.is_empty() {
+            return (TILES_MAX, TILES_MAX);
+        }
+        let w = self.choices.iter().map(|c| c.max_width).max().unwrap_or(0);
+        let h = self.choices.iter().map(|c| c.max_height).max().unwrap_or(0);
+        (w, h)
     }
 
     fn encoding(&self) -> bool {

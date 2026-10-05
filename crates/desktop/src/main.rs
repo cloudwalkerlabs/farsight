@@ -118,6 +118,9 @@ struct Decoded {
     encode_us: u32,
     complete_us: u64,
     decoded_us: u64,
+    /// Counts in the statistics: every video frame, and the last datagram
+    /// of each tiles update.
+    sample: bool,
 }
 
 struct Gfx {
@@ -401,7 +404,9 @@ impl App {
             if let Content::Tiles { size, tiles } = &d.content {
                 gfx.renderer.upload_tiles(*size, tiles);
             }
-            pending = Some(d);
+            if d.sample {
+                pending = Some(d);
+            }
         }
         let size = gfx.window.inner_size();
         self.placement = gfx.renderer.draw((size.width, size.height));
@@ -599,6 +604,7 @@ fn decode_thread(
                     encode_us: t.header.encode_us,
                     complete_us: t.received_us,
                     decoded_us,
+                    sample: t.header.index + 1 == t.header.count,
                 };
                 if proxy.send_event(UserEvent::Decoded(d)).is_err() {
                     return;
@@ -637,6 +643,7 @@ fn decode_thread(
                     encode_us: frame.header.encode_us,
                     complete_us: frame.complete_us,
                     decoded_us,
+                    sample: true,
                 };
                 if proxy.send_event(UserEvent::Decoded(d)).is_err() {
                     return;
