@@ -11,7 +11,8 @@ requirements:
 3. **Codec negotiation.** Client and server agree on the best format both
    support. Clients decode in hardware where they can.
 4. **Headless Wayland server.** farsight handles every part of Wayland,
-   including creating and managing sessions.
+   including bringing up the session itself. One `farsight-server` process
+   is one long-running, isolated session that clients can reconnect to.
 5. **Resizing and HiDPI scaling first.** The remote desktop always matches
    the client window's size and scale.
 6. **Clients:** desktop and Android. The Android app must work well with
@@ -31,7 +32,7 @@ gives us:
   become the output's mode and scale in one atomic step.
 - **Direct input injection** into `wl_seat`, with no virtual-keyboard
   protocols, libei or portals.
-- **Control of the session lifecycle.**
+- **Control of the session lifecycle**, without a display manager.
 
 Both [Wolf](https://games-on-whales.github.io/wolf/stable/dev/wayland.html)
 (Games on Whales) and [wado](https://github.com/sandptel/wado) have shown that
@@ -48,19 +49,15 @@ share the encoder and transport. Not in v1.
 | Sunshine/Moonlight | Frames split into packets with Reed-Solomon FEC (parity = data × fec%); intra-refresh and post-invalidation P-frames; per-frame FEC status from the client; reference frame invalidation instead of IDR |
 | Parsec | Its own protocol on UDP (BUD); proof that a tuned protocol beats general-purpose ones |
 | RDP 10 | AVC444: 4:4:4 text clarity from 4:2:0 hardware codecs, using a main stream plus an auxiliary chroma stream; a display control channel that carries the monitor layout and `DesktopScaleFactor` |
-| gnome-remote-desktop | A headless session split into a system dispatcher and per-session daemons, with the connection handed over between them |
 | wado, Wolf, Selkies pixelflux | Zero-copy dmabuf → VA-API/NVENC with on-GPU RGB→NV12; a fallback ladder (zero-copy → readback → software); input on a channel that never queues behind video |
 
 ## Architecture
 
 ```
-                 ┌─────────────── server host ─────────────────────────────┐
- client ──QUIC──▶│ farsightd (root, systemd, :7740)                        │
-   │  (auth)     │   auth → PAM/logind session → spawn/locate session      │
-   │             │   returns {session addr, one-time ticket}               │
-   │             │                                                         │
-   └──QUIC──────▶│ farsight-session (as the user, one per session)         │
-     (media,     │  ┌ Smithay compositor (GLES/Vulkan on render node)      │
+                 ┌──────── farsight-server --port 7740 (as the user) ──────┐
+ client ──QUIC──▶│  ┌ auth (client keys), session state                    │
+  (media,        │  ├ private runtime dir, D-Bus session bus, PipeWire     │
+   input,        │  ├ Smithay compositor (GLES/Vulkan on render node)      │
       input,     │  │   xdg-shell, layer-shell, fractional-scale, viewporter│
       control)   │  │   linux-dmabuf, presentation-time, Xwayland, IME…    │
                  │  ├ Encoder: VA-API │ NVENC │ Vulkan Video │ software    │
@@ -76,7 +73,7 @@ share the encoder and transport. Not in v1.
 |---|---|
 | `farsight-proto` | Wire types: packet headers, control messages, negotiation. No I/O. |
 | `farsight-net` | QUIC transport, packetization, FEC, congestion control. Shared by both sides. |
-| `farsight-server` | `farsightd` (gatekeeper) and `farsight-session` (compositor, encoder). Linux only. |
+| `farsight-server` | The server: session environment, compositor, encoder. Linux only. |
 | `farsight-client` | Platform-independent client core: connection, negotiation, decode pipeline, input state sync, layout. |
 | `farsight-desktop` | Desktop client. |
 | `farsight-android` | Android bindings (uniffi, plus JNI for hot paths). |
@@ -252,37 +249,69 @@ The client's window is the source of truth for the output
 - **Multi-monitor (later):** one client window per output, each with its
   own encoder stream.
 
-## 6. Session management
+## 6. The session
 
-- **`farsightd`**: a small root daemon, socket-activated by systemd.
-  - **Authentication:**
-    - SSH-style Ed25519 user keys (`~/.config/farsight/authorized_keys`),
-      with an optional PAM password or OTP;
-    - the client pins the server certificate on first use (TOFU).
-  - Calls `pam_open_session`, which runs `pam_systemd`, so logind
-    registers a **seatless session** (`Class=user`, `Type=wayland`). That
-    gives `XDG_RUNTIME_DIR`, the user's systemd manager and the D-Bus
-    session bus.
-  - Starts `farsight-session` as a user unit.
-  - **GPU access:** logind grants device ACLs only to sessions with a seat.
-    The gatekeeper opens `/dev/dri/renderD*` and passes the fd over
-    `SCM_RIGHTS`, instead of requiring the `render` group.
-  - **Handover:** the gatekeeper returns the session's address and a
-    one-time ticket, and the client connects directly (0-RTT resumption).
-    The gatekeeper is never in the media path.
-- **`farsight-session`** runs as the user:
-  - Starts PipeWire with its own null sink.
-  - Starts `xdg-desktop-portal` with a small backend of our own.
-  - Starts Xwayland.
-  - Runs the user's autostart programs. Layer-shell lets bars and launchers
-    such as waybar and fuzzel work unchanged.
-- **Lifecycle:**
-  - Sessions outlive disconnects (like tmux) until an idle timeout.
-  - On reconnect, codec and layout are negotiated again.
-  - A second client can take over the session or share it read-only.
-- **Window manager:** keep v1 small: floating windows with
-  maximise/fullscreen, plus a single-app kiosk mode. This is the largest
-  scope risk.
+One `farsight-server` process **is** one session. There is no gatekeeper,
+no PAM, no logind session and no display manager. Run it by hand, or as a
+plain system service (`dist/farsight-server@.service`, one instance per
+port, with `User=` set). It doesn't need user systemd or lingering.
+
+```
+farsight-server [--port 7740]
+```
+
+**Startup** builds an isolated environment and starts the session at once,
+so it is already running before the first client connects:
+
+1. **Runtime directory**, mode 0700, holding every socket. It is the first
+   of these that exists:
+   - systemd's `$RUNTIME_DIRECTORY`;
+   - `$XDG_RUNTIME_DIR/farsight-<port>`;
+   - a fresh private directory under `/tmp`.
+
+   Children get it as their `XDG_RUNTIME_DIR`.
+2. **A private D-Bus session bus**: `dbus-daemon --session` (or
+   `dbus-broker-launch`) listening in that directory. Children get it as
+   `DBUS_SESSION_BUS_ADDRESS`. Apps in the session never see another bus.
+3. **The compositor**: the Wayland socket goes in that directory, and
+   children get `WAYLAND_DISPLAY`. Xwayland is started on demand, with
+   `DISPLAY` set.
+4. **Session services**, launched as child processes on the private bus:
+   - PipeWire and WirePlumber, with a null sink for audio capture;
+   - `xdg-desktop-portal` with a small backend of our own;
+   - a notification daemon.
+5. **Autostart**: the commands in `~/.config/farsight/autostart` (bar,
+   launcher, terminal, …). Layer-shell lets waybar, fuzzel and similar tools
+   work unchanged.
+
+**Isolation:**
+- The environment comes from the steps above, not from whatever started
+  the server, so two instances on different ports never share a bus or a
+  display.
+- Children are in their own process group and are cleaned up when the
+  server exits. Under systemd the unit's cgroup guarantees this.
+
+**GPU:** render nodes (`/dev/dri/renderD*`) are normally world-accessible,
+so the session needs no seat or `video` group to render and encode. If a
+host restricts them, add the user to the `render` group.
+
+**Clients:**
+- **Authentication:** SSH-style Ed25519 client keys
+  (`~/.config/farsight/authorized_keys`). The client pins the server's
+  certificate on first use (TOFU).
+- **Reconnection:** the session outlives disconnects. A reconnecting client
+  negotiates codec and layout again, and its layout is applied (§5).
+- **More than one client:** a second client can either take over the
+  session or join it view-only.
+
+**Window manager:** keep v1 small: floating windows with
+maximise/fullscreen, plus a single-app kiosk mode. This is the largest
+scope risk.
+
+**Later, if ever:** a login-screen style front end that starts sessions for
+any system user (as GDM's remote login does). It is deliberately out of
+scope; it would sit in front of `farsight-server` without changing the
+protocol.
 
 ## 7. Android client: touch-first, like RealVNC Viewer
 
@@ -351,7 +380,7 @@ sent directly, with relative pointer capture when the server asks for it.
 | M0 | Spike: Smithay headless → dmabuf → VA-API H.264 → file | foot and Firefox render; encode latency per frame measured |
 | M1 | End-to-end on the Linux desktop: quinn datagrams, packetizer, VA-API decode, present; input with repetition and snapshots; client-side cursor | Usable over LAN; latency measured |
 | M2 | Resize/scale (`SetLayout`, epochs, fractional scale), negotiation, NVENC, HEVC/AV1, 4:4:4 and idle refinement | Drag-resize and a move to a different-DPI monitor both stay sharp |
-| M3 | Sessions: gatekeeper, keys/PAM, seatless logind session, render-fd passing, persistence | Connect → login → session; reconnect resumes |
+| M3 | Session: isolated runtime dir, private D-Bus, PipeWire/portal children, autostart, client keys, reconnect and takeover | Runs as a system service; reconnect resumes the same session |
 | M4 | Loss resilience: custom congestion control, adaptive FEC, RFI/LTR, NACK on LAN; `tc netem` test matrix | No stuck keys and no artifact spreading at 5% loss |
 | M5 | Android client: MediaCodec low-latency, touch modes, viewport, extra keys, IME, audio, clipboard | Daily-usable from a phone or tablet |
 | M6 | Mirror backend for GNOME/KDE/sway; multi-monitor; WebTransport browser client | Optional |
@@ -376,7 +405,6 @@ sent directly, with relative pointer capture when the server asks for it.
 - [Selkies pixelflux](https://github.com/selkies-project/pixelflux)
 - [Sunshine UDP media streaming](https://deepwiki.com/qiin2333/foundation-sunshine/7.3-udp-media-streaming)
 - [Sunshine NVENC dmabuf re-import issue](https://github.com/LizardByte/Sunshine/issues/5613)
-- [GNOME headless remote sessions, part 2](https://www.suse.com/c/headless-remote-sessions-in-gnome-part-2/)
 - [RDP 10 AVC444](https://techcommunity.microsoft.com/blog/microsoft-security-blog/remote-desktop-protocol-rdp-10-avch-264-improvements-in-windows-10-and-windows-s/249588)
 - [ext-image-copy-capture merged](https://www.phoronix.com/news/Wayland-Merges-Screen-Capture)
 - [RADV AV1 encode](https://www.phoronix.com/news/RADV-Merges-AV1-Encode)

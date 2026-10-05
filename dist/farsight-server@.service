@@ -1,0 +1,27 @@
+# One farsight session per instance; the instance name is the UDP port:
+#
+#   cp dist/farsight-server@.service /etc/systemd/system/
+#   systemctl edit farsight-server@7740     # set User= (see below)
+#   systemctl enable --now farsight-server@7740
+#
+# A plain system service: no logind session or user systemd needed. The
+# server creates its own D-Bus session bus and Wayland display, isolated
+# from anything else the user runs.
+
+[Unit]
+Description=farsight remote desktop session on port %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+# The account the session runs as. Must be set; this placeholder fails.
+User=CHANGEME
+# Private runtime dir (sockets, bus), /run/farsight-<port>, mode 0700.
+RuntimeDirectory=farsight-%i
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/farsight-server --port %i
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
