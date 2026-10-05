@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioPacket;
 use crate::input::InputPacket;
 use crate::tiles::TilesHeader;
 use crate::video::FragmentHeader;
@@ -12,6 +13,7 @@ const TAG_INPUT: u8 = 2;
 const TAG_PING: u8 = 3;
 const TAG_PONG: u8 = 4;
 const TAG_TILES: u8 = 5;
+const TAG_AUDIO: u8 = 6;
 
 /// Bytes in front of a video fragment's payload.
 pub const VIDEO_OVERHEAD: usize = 1 + FragmentHeader::LEN;
@@ -37,6 +39,7 @@ pub struct Pong {
 pub enum Datagram<'a> {
     Video(FragmentHeader, &'a [u8]),
     Tiles(TilesHeader, &'a [u8]),
+    Audio(AudioPacket<'a>),
     Input(InputPacket),
     Ping(Ping),
     Pong(Pong),
@@ -56,6 +59,7 @@ impl<'a> Datagram<'a> {
                 let (h, body) = TilesHeader::read(body)?;
                 Datagram::Tiles(h, body)
             }
+            TAG_AUDIO => Datagram::Audio(AudioPacket::read(body)?),
             TAG_INPUT => Datagram::Input(postcard::from_bytes(body).ok()?),
             TAG_PING => Datagram::Ping(postcard::from_bytes(body).ok()?),
             TAG_PONG => Datagram::Pong(postcard::from_bytes(body).ok()?),
@@ -67,6 +71,10 @@ impl<'a> Datagram<'a> {
         match self {
             Datagram::Video(h, payload) => encode_video(h, payload, out),
             Datagram::Tiles(h, body) => encode_tiles(h, body, out),
+            Datagram::Audio(p) => {
+                out.push(TAG_AUDIO);
+                p.write(out);
+            }
             Datagram::Input(p) => tagged(TAG_INPUT, p, out),
             Datagram::Ping(p) => tagged(TAG_PING, p, out),
             Datagram::Pong(p) => tagged(TAG_PONG, p, out),
@@ -127,6 +135,7 @@ mod tests {
                 },
                 b"tiles",
             ),
+            Datagram::Audio(AudioPacket { flags: 0, seq: 1, capture_us: 2, frames: vec![b"opus"] }),
             Datagram::Input(input),
             Datagram::Ping(Ping { client_us: 5 }),
             Datagram::Pong(Pong { client_us: 5, server_us: 6 }),

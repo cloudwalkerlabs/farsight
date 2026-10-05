@@ -12,6 +12,7 @@
 //! at most every 50 ms while the user drags. Until the server's picture
 //! matches, the last one is stretched to the window.
 
+mod audio;
 mod cursor;
 mod decode;
 mod render;
@@ -67,6 +68,9 @@ struct Args {
     /// Offer only these formats, e.g. `hevc,h264:444`.
     #[arg(long, value_delimiter = ',')]
     codec: Vec<String>,
+    /// Don't play the session's audio; the server doesn't send it.
+    #[arg(long)]
+    no_audio: bool,
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -152,6 +156,9 @@ struct App {
     layout_sent: Option<(Layout, Instant)>,
     /// A layout waiting for the throttle.
     layout_pending: Option<Layout>,
+    /// Audio announced before the connection was ready.
+    audio_pending: Option<farsight_proto::audio::AudioConfig>,
+    audio: Option<audio::Output>,
 }
 
 /// At most one `SetLayout` this often during a drag-resize (§5).
@@ -184,9 +191,12 @@ fn main() -> anyhow::Result<()> {
         exit: None,
         layout_sent: None,
         layout_pending: None,
+        audio_pending: None,
+        audio: None,
     };
     event_loop.run_app(&mut app)?;
-    let App { client, runtime, decode_thread, exit, gfx, .. } = app;
+    let App { client, runtime, decode_thread, exit, gfx, audio, .. } = app;
+    drop(audio);
     drop(gfx);
     if let Some(client) = client {
         client.close();
@@ -263,7 +273,8 @@ impl App {
                 .expect("spawning the decode thread");
             self.decode_thread = Some(thread);
         }
-        let cfg = Config { addr: self.addr, layout, decoders, mode: self.args.mode };
+        let audio = (!self.args.no_audio).then_some(farsight_proto::audio::AudioCaps { max_channels: 2 });
+        let cfg = Config { addr: self.addr, layout, decoders, mode: self.args.mode, audio };
         let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
         let events = self.proxy.clone();
         tracing::info!(?layout, "connecting");
@@ -338,6 +349,21 @@ impl App {
         self.layout_sent = Some((layout, Instant::now()));
         self.layout_pending = None;
         None
+    }
+
+    fn start_audio(&mut self, config: farsight_proto::audio::AudioConfig) {
+        let Some(client) = self.client.clone() else { return };
+        self.audio = None;
+        match audio::open(client.clone(), config) {
+            Ok(output) => {
+                self.audio = Some(output);
+                self.runtime.spawn(audio::report(client));
+            }
+            Err(err) => {
+                tracing::warn!("{err:#}; muting the session's audio");
+                client.set_audio(false);
+            }
+        }
     }
 
     fn input(&self, event: InputEvent) {
@@ -453,6 +479,9 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Connected(client) => {
                 self.client = Some(client);
+                if let Some(config) = self.audio_pending.take() {
+                    self.start_audio(config);
+                }
                 // The window may have changed while connecting.
                 self.layout_changed();
             }
@@ -468,6 +497,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Net(Event::CursorImage(image)) => self.add_cursor_image(event_loop, image),
             UserEvent::Net(Event::Cursor(shape)) => self.set_cursor(shape),
+            UserEvent::Net(Event::AudioConfig(config)) => match self.client {
+                Some(_) => self.start_audio(config),
+                None => self.audio_pending = Some(config),
+            },
             UserEvent::Net(Event::Closed(reason)) => {
                 tracing::info!(%reason, "disconnected");
                 event_loop.exit();

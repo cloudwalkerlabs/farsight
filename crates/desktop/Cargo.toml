@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+cpal = { version = "0.18", features = ["pipewire"] }
 farsight-client = { version = "0.1.0", path = "../client" }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }

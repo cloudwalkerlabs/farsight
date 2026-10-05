@@ -25,6 +25,8 @@ smithay = { version = "0.7", default-features = false, features = ["backend_egl"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+pipewire = "0.10"
+opus = "0.4.0"
 
 [build-dependencies]
 bindgen = "0.72"

@@ -6,7 +6,8 @@
 //! Messages are tagged with the connection they belong to, so nothing meant
 //! for an old connection reaches a new one.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -15,6 +16,7 @@ use farsight_net::packetize::{EncodedFrame, Packetizer};
 use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{endpoint, stream};
+use farsight_proto::audio::AudioConfig;
 use farsight_proto::control::{ClientMessage, Hello, ServerMessage};
 use farsight_proto::datagram::{self, Datagram, Pong};
 use farsight_proto::tiles::TilesHeader;
@@ -42,6 +44,8 @@ pub enum ToNet {
     Frame(ConnId, Frame),
     Tiles(ConnId, Tiles),
     Message(ConnId, ServerMessage),
+    /// An audio datagram, for whichever client listens.
+    Audio(Bytes),
     /// The session is ending: close every connection with this reason.
     Shutdown(String),
 }
@@ -64,6 +68,15 @@ pub struct Tiles {
     pub encode_us: u32,
 }
 
+/// The session's audio, shared with the speaker's threads.
+#[derive(Default)]
+pub struct Audio {
+    /// Set once the speaker is up.
+    pub config: OnceLock<AudioConfig>,
+    /// A client is listening: the speaker encodes and sends.
+    pub listening: AtomicBool,
+}
+
 pub struct Options {
     pub port: u16,
     pub identity: endpoint::Identity,
@@ -72,6 +85,7 @@ pub struct Options {
     pub rate_bps: u64,
     /// The host's clock, which pongs and frame timestamps are in.
     pub start: Instant,
+    pub audio: Arc<Audio>,
 }
 
 /// The current connection, if any.
@@ -80,6 +94,8 @@ struct Current {
     conn: Connection,
     sched: Scheduler,
     control: mpsc::UnboundedSender<ServerMessage>,
+    /// The client plays audio and hasn't muted it.
+    audio: bool,
 }
 
 /// Starts the network thread and returns where to send it frames and
@@ -108,19 +124,22 @@ pub fn spawn(opts: Options, host: HostSender<ToHost>) -> anyhow::Result<mpsc::Un
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
     let current: Arc<Mutex<Option<Current>>> = Arc::default();
     tokio::spawn(dispatch(rx, current.clone()));
+    let audio = opts.audio.clone();
     let mut next_id: ConnId = 0;
     while let Some(incoming) = endpoint.accept().await {
         next_id += 1;
         let (id, host, current, rate_bps, start) = (next_id, host.clone(), current.clone(), opts.rate_bps, opts.start);
+        let audio = audio.clone();
         tokio::spawn(async move {
             let addr = incoming.remote_address();
-            match serve(id, incoming, host.clone(), current.clone(), rate_bps, start).await {
+            match serve(id, incoming, host.clone(), current.clone(), rate_bps, start, audio.clone()).await {
                 Ok(()) => tracing::info!(id, %addr, "client gone"),
                 Err(err) => tracing::info!(id, %addr, "client gone: {err:#}"),
             }
             let mut cur = current.lock().unwrap();
             if cur.as_ref().is_some_and(|c| c.id == id) {
                 *cur = None;
+                audio.listening.store(false, Ordering::Relaxed);
             }
             let _ = host.send(ToHost::Disconnected(id));
         });
@@ -183,6 +202,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Opt
             ToNet::Message(id, m) if id == c.id => {
                 let _ = c.control.send(m);
             }
+            ToNet::Audio(d) if c.audio => c.sched.send(Priority::Audio, d),
             _ => {} // for a connection that has gone
         }
     }
@@ -195,6 +215,7 @@ async fn serve(
     current: Arc<Mutex<Option<Current>>>,
     rate_bps: u64,
     start: Instant,
+    audio: Arc<Audio>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await.context("handshake")?;
     tracing::info!(id, addr = %conn.remote_address(), "client connected");
@@ -206,8 +227,11 @@ async fn serve(
 
     let sched = Scheduler::spawn(conn.clone(), rate_bps, endpoint::DATAGRAM_BUFFER);
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let next = Current { id, conn: conn.clone(), sched: sched.clone(), control: control_tx };
+    // Audio goes to a client that plays it, from a session that has it.
+    let audio_config = hello.audio.and(audio.config.get().copied());
+    let next = Current { id, conn: conn.clone(), sched: sched.clone(), control: control_tx, audio: audio_config.is_some() };
     let previous = current.lock().unwrap().replace(next);
+    audio.listening.store(audio_config.is_some(), Ordering::Relaxed);
     if let Some(prev) = previous {
         tracing::info!(id, previous = prev.id, "taking over the session");
         prev.conn.close(1u32.into(), b"another client took over");
@@ -217,11 +241,24 @@ async fn serve(
     let writer = async {
         while let Some(msg) = control_rx.recv().await {
             stream::send(&mut send, &msg).await?;
+            // The audio format follows the welcome, which comes first.
+            if let (ServerMessage::Welcome(_), Some(config)) = (&msg, audio_config) {
+                stream::send(&mut send, &ServerMessage::AudioConfig(config)).await?;
+            }
         }
         anyhow::Ok(())
     };
     let reader = async {
         while let Some(msg) = stream::recv::<ClientMessage>(&mut recv).await? {
+            if let ClientMessage::SetAudio { play } = msg {
+                let mut cur = current.lock().unwrap();
+                if let Some(c) = cur.as_mut().filter(|c| c.id == id) {
+                    c.audio = play && audio_config.is_some();
+                    audio.listening.store(c.audio, Ordering::Relaxed);
+                    tracing::info!(id, play, "audio");
+                }
+                continue;
+            }
             let _ = host.send(ToHost::Message(id, msg));
         }
         anyhow::Ok(())

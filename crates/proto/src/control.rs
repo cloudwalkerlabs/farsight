@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::{AudioCaps, AudioConfig};
 use crate::codec::{DecoderCaps, Encoding, Format, Mode};
 use crate::layout::Layout;
 
@@ -28,6 +29,9 @@ pub enum ClientMessage {
     /// The decoder for this format failed and can't be used again. The
     /// server moves on to the next format.
     DecoderFailed(Format),
+    /// Whether to send the session's audio: false mutes it at the server,
+    /// which saves the bandwidth.
+    SetAudio { play: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +39,8 @@ pub struct Hello {
     pub decoders: Vec<DecoderCaps>,
     pub layout: Layout,
     pub mode: Mode,
+    /// `None` if the client plays no audio.
+    pub audio: Option<AudioCaps>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +54,8 @@ pub enum ServerMessage {
     /// A cursor image, sent once per id before any `Cursor` names it.
     CursorImage(CursorImage),
     Cursor(CursorShape),
+    /// The session's audio format, before its first datagram (§8).
+    AudioConfig(AudioConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,7 +146,8 @@ pub fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{Chroma, Codec};
+    use crate::audio::AudioCaps;
+use crate::codec::{Chroma, Codec};
 
     #[test]
     fn framed_round_trip() {
@@ -152,6 +161,7 @@ mod tests {
             }],
             layout: Layout { width_px: 1920, height_px: 1080, scale_120: 120, refresh_mhz: 60_000 },
             mode: Mode::Text,
+            audio: Some(AudioCaps { max_channels: 2 }),
         });
         let bytes = encode_framed(&msg);
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

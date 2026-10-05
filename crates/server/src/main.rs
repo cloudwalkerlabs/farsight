@@ -10,6 +10,7 @@
 //! which sends input back. The desktop is restarted if it crashes
 //! (`session`). Commands on stdin drive experiments (see `control`).
 
+mod audio;
 mod cursor;
 mod encode;
 mod gpu;
@@ -121,8 +122,9 @@ fn main() -> anyhow::Result<()> {
     };
     let identity = farsight_net::endpoint::Identity::load_or_generate(&identity_dir)?;
     let (to_host, from_net) = channel::channel();
+    let audio = Arc::new(net::Audio::default());
     let net = net::spawn(
-        net::Options { port: args.port, identity, rate_bps: args.rate * 1_000_000, start },
+        net::Options { port: args.port, identity, rate_bps: args.rate * 1_000_000, start, audio: audio.clone() },
         to_host,
     )?;
 
@@ -158,6 +160,11 @@ fn main() -> anyhow::Result<()> {
     let mut host = Host::new(dh.clone(), event_loop.handle(), start, gpu.renderer, gpu.feedback, pipeline, net, layout);
 
     let session = session::Session::start(args.port, !args.no_audio)?;
+    if session.audio
+        && let Err(err) = audio::spawn(session.path("pipewire-0"), start, host.net.clone(), audio)
+    {
+        tracing::warn!("{err:#}; the session has no audio");
+    }
     // The host's socket is in the session's runtime directory, for the
     // desktop only (§6).
     let socket_name = std::ffi::OsString::from("farsight");
@@ -296,6 +303,7 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 pipeline::refresh(host);
             }
             ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
+            ClientMessage::SetAudio { .. } => {} // the network thread's
         },
         ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
         ToHost::Disconnected(id) if host.client == Some(id) => {

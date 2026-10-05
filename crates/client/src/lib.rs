@@ -12,6 +12,12 @@
 //! Tiles (when the server has no hardware encoder) are handed over a
 //! datagram at a time, as each decodes on its own. When part of an update
 //! is lost, the core asks for the cells it is missing.
+//!
+//! Audio goes into a jitter buffer here ([`audio::Player`]); the app opens
+//! its output when `AudioConfig` arrives and pulls samples through
+//! [`Client::fill_audio`].
+
+pub mod audio;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -23,6 +29,7 @@ use bytes::Bytes;
 use farsight_net::packetize::Reassembler;
 use farsight_net::quinn::Connection;
 use farsight_net::{endpoint, quinn, stream};
+use farsight_proto::audio::{AudioCaps, AudioConfig};
 use farsight_proto::codec::{DecoderCaps, Format, Mode};
 use farsight_proto::control::{ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome};
 use farsight_proto::datagram::{Datagram, Ping};
@@ -58,6 +65,8 @@ pub struct Config {
     pub layout: Layout,
     pub decoders: Vec<DecoderCaps>,
     pub mode: Mode,
+    /// `None`: no audio.
+    pub audio: Option<AudioCaps>,
 }
 
 #[derive(Debug)]
@@ -71,6 +80,9 @@ pub enum Event {
     Tiles(TilesPacket),
     CursorImage(CursorImage),
     Cursor(CursorShape),
+    /// The session's audio starts, in this format: open the output and
+    /// call [`Client::fill_audio`] from it.
+    AudioConfig(AudioConfig),
     /// The connection ended; the reason.
     Closed(String),
 }
@@ -121,6 +133,8 @@ struct Shared {
     rtt_max_us: AtomicU64,
     want_keyframe: AtomicBool,
     stats: Mutex<Stats>,
+    /// Set once the server announces its audio.
+    audio: Mutex<Option<audio::Player>>,
 }
 
 impl Shared {
@@ -141,7 +155,7 @@ impl Client {
         let (conn, fingerprint) = endpoint::connect(&endpoint, cfg.addr).await?;
         tracing::info!(addr = %cfg.addr, %fingerprint, "connected");
         let (mut send, mut recv) = conn.open_bi().await.context("opening the control stream")?;
-        let hello = Hello { decoders: cfg.decoders, layout: cfg.layout, mode: cfg.mode };
+        let hello = Hello { decoders: cfg.decoders, layout: cfg.layout, mode: cfg.mode, audio: cfg.audio };
         stream::send(&mut send, &ClientMessage::Hello(hello)).await?;
         let welcome = match stream::recv(&mut recv).await? {
             Some(ServerMessage::Welcome(w)) => w,
@@ -159,6 +173,7 @@ impl Client {
             rtt_max_us: AtomicU64::new(0),
             want_keyframe: AtomicBool::new(true),
             stats: Mutex::default(),
+            audio: Mutex::default(),
         });
         let (control, control_rx) = mpsc::unbounded_channel();
         on_event(Event::Connected { fingerprint, welcome });
@@ -224,6 +239,28 @@ impl Client {
         s
     }
 
+    /// Fills `out` (interleaved, in the `AudioConfig`'s format) with audio
+    /// to be heard `output_delay_us` from now: the output's own latency.
+    /// Silence until there is audio.
+    pub fn fill_audio(&self, out: &mut [f32], output_delay_us: u64) {
+        let now_us = self.now_us();
+        let offset = self.shared.offset_known.load(Ordering::Relaxed).then(|| self.shared.offset_us.load(Ordering::Relaxed));
+        match self.shared.audio.lock().unwrap().as_mut() {
+            Some(player) => player.pull(out, now_us, output_delay_us, offset),
+            None => out.fill(0.0),
+        }
+    }
+
+    /// Audio statistics since the last call, if there is audio.
+    pub fn audio_stats(&self) -> Option<audio::AudioStats> {
+        self.shared.audio.lock().unwrap().as_mut().map(|p| p.take_stats())
+    }
+
+    /// Mutes or unmutes the session's audio at the server.
+    pub fn set_audio(&self, play: bool) {
+        let _ = self.control.send(ClientMessage::SetAudio { play });
+    }
+
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"bye");
     }
@@ -264,6 +301,16 @@ async fn run(
                 ServerMessage::CursorImage(image) => on_event(Event::CursorImage(image)),
                 ServerMessage::Cursor(shape) => on_event(Event::Cursor(shape)),
                 ServerMessage::Welcome(_) => tracing::warn!("unexpected Welcome"),
+                ServerMessage::AudioConfig(config) => {
+                    tracing::info!(?config, "audio");
+                    match audio::Player::new(config) {
+                        Ok(player) => {
+                            *shared.audio.lock().unwrap() = Some(player);
+                            on_event(Event::AudioConfig(config));
+                        }
+                        Err(err) => tracing::warn!("audio: {err:#}"),
+                    }
+                }
             }
         }
         anyhow::Ok(())
@@ -334,6 +381,11 @@ async fn run(
                     let packet = TilesPacket { header, body: body.to_vec(), received_us: now };
                     if let Some(m) = gate.lock().unwrap().admit(Media::Tiles(packet)) {
                         on_event(m.into_event());
+                    }
+                }
+                Some(Datagram::Audio(p)) => {
+                    if let Some(player) = shared.audio.lock().unwrap().as_mut() {
+                        player.push(&p, now);
                     }
                 }
                 Some(Datagram::Pong(p)) => {
