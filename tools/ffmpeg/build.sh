@@ -84,7 +84,7 @@ esac
 configure=(
     --enable-static --disable-shared --enable-pic
     --disable-autodetect --disable-everything
-    --disable-programs --disable-doc --disable-network
+    --disable-programs --disable-doc --disable-network --disable-debug
     --disable-avformat --disable-avfilter --disable-avdevice
     --disable-swscale --disable-swresample --disable-iconv
     --enable-libdav1d
