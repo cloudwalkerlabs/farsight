@@ -19,7 +19,7 @@
 //! its output when `AudioConfig` arrives and pulls samples through
 //! [`Client::fill_audio`].
 
-pub mod audio;
+pub use farsight_audio as audio;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

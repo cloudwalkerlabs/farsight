@@ -1018,14 +1018,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "farsight-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "farsight-proto",
+ "opus",
+ "tracing",
+]
+
+[[package]]
 name = "farsight-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "farsight-audio",
  "farsight-net",
  "farsight-proto",
- "opus",
  "tokio",
  "tracing",
 ]

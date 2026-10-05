@@ -179,6 +179,7 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
 | `farsight-net` | QUIC transport, packetization, FEC, congestion control. Shared by both sides. |
 | `farsight-server` | The server: session environment, host compositor, nested desktop, encoder. Linux only. |
 | `farsight-client` | Platform-independent client core: connection, negotiation, decode pipeline, input state sync, layout. |
+| `farsight-audio` | The jitter buffer: the client plays the session's audio through it, and the server the client's microphone. |
 | `farsight-desktop` | Desktop client. |
 | `farsight-android` | Android bindings (uniffi, plus JNI for hot paths). |
 | `farsight-uniffi-bindgen` | uniffi's Kotlin generator, run by the Gradle build. |

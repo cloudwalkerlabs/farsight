@@ -30,6 +30,7 @@ crates/
   net/             QUIC transport, FEC, congestion control
   server/          farsight-server: one isolated headless session per process; Linux only
   client/          platform-independent client core
+  audio/           jitter buffer and playback, both ways
   desktop/         desktop client
   tiles/           tile coding, when the server has no hardware encoder
   va/              what a VA-API device encodes and decodes

@@ -1,16 +1,19 @@
 //! Audio playback (`docs/design.md` §8): a jitter buffer in front of the
-//! Opus decoder, with drift correction by resampling.
+//! Opus decoder, with drift correction by resampling. The client plays the
+//! session's audio through it, and the server plays the client's
+//! microphone into the session the same way.
 //!
 //! Unlike video, audio can't pause between packets, so it is buffered: just
 //! enough to cover the jitter seen recently, plus what the output takes
 //! per callback. Each datagram repeats the frames before its own, so a
 //! lost datagram usually costs nothing; a frame that never arrives is
-//! concealed by Opus. A frame that came only as a repeat came a frame or
-//! more late, so the buffer also holds as many frames as repeats have
-//! recently been needed from. The server's clock and the sound card's drift apart
-//! by tens of ppm, so the buffer is kept at its target by playing slightly
-//! faster or slower (at most 0.5%, after a burst), never by dropping
-//! samples.
+//! rebuilt from the next frame's in-band FEC where it has one (the
+//! microphone's SILK frames do), and concealed by Opus otherwise. A frame
+//! that came only as a repeat came a frame or more late, so the buffer
+//! also holds as many frames as repeats have recently been needed from.
+//! The sender's clock and the sound card's drift apart by tens of ppm, so
+//! the buffer is kept at its target by playing slightly faster or slower
+//! (at most 0.5%, after a burst), never by dropping samples.
 //!
 //! [`Player`] has no clock or device of its own: the network side
 //! [`push`](Player::push)es datagrams as they arrive and the output callback
@@ -66,6 +69,8 @@ pub struct AudioStats {
     pub buffered_us: u64,
     pub target_us: u64,
     pub concealed: u64,
+    /// Of those, frames rebuilt from the next one's in-band FEC.
+    pub fec: u64,
     /// Of those, frames that arrived after all, too late: jitter, not loss.
     pub late: u64,
     /// Frames the server sent as digital silence.
@@ -278,7 +283,17 @@ impl Player {
                     self.concealed_seqs.pop_front();
                 }
                 self.concealed_seqs.push_back(seq);
-                if self.decoder.decode_float(&[], &mut self.scratch, false).is_err() {
+                // The next frame may carry this one at a lower bitrate
+                // (SILK's in-band FEC); without that, Opus conceals.
+                let next = self.slots.front().and_then(Option::as_ref).filter(|s| !s.data.is_empty());
+                let decoded = match next {
+                    Some(next) => {
+                        self.stats.fec += 1;
+                        self.decoder.decode_float(&next.data, &mut self.scratch, true)
+                    }
+                    None => self.decoder.decode_float(&[], &mut self.scratch, false),
+                };
+                if decoded.is_err() {
                     self.scratch.fill(0.0);
                 }
                 capture_us
@@ -372,6 +387,7 @@ impl Player {
         let stats = self.stats.clone();
         self.stats.latency_us.clear();
         self.stats.concealed = 0;
+        self.stats.fec = 0;
         self.stats.late = 0;
         self.stats.silent = 0;
         self.stats.underruns = 0;
@@ -510,6 +526,37 @@ mod tests {
         assert!(sped_up);
         let s = player.take_stats();
         assert!(s.buffered_us < s.target_us + 5000, "{s:?}");
+    }
+
+    #[test]
+    fn a_lost_voice_frame_comes_back_from_the_next_ones_fec() {
+        // The microphone's format: mono, 10 ms, VOIP with in-band FEC, and
+        // no repeats.
+        let config = AudioConfig { channels: 1, sample_rate: SAMPLE_RATE, frame_us: 10_000 };
+        let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        encoder.set_inband_fec(true).unwrap();
+        encoder.set_packet_loss_perc(10).unwrap();
+        let mut player = Player::new(config).unwrap();
+        let mut out = vec![0.0; 480];
+        for seq in 0..300u32 {
+            let pcm: Vec<f32> = (0..480)
+                .map(|i| ((seq as usize * 480 + i) as f32 / SAMPLE_RATE as f32 * 300.0 * std::f32::consts::TAU).sin() * 0.3)
+                .collect();
+            let mut data = vec![0; 1500];
+            let n = encoder.encode_float(&pcm, &mut data).unwrap();
+            data.truncate(n);
+            let p = AudioPacket { flags: 0, seq, capture_us: seq as u64 * 10_000, frames: vec![&data] };
+            let mut buf = Vec::new();
+            p.write(&mut buf);
+            if seq % 10 != 5 {
+                push(&mut player, &buf, seq as u64 * 10_000 + 1000);
+            }
+            player.pull(&mut out, seq as u64 * 10_000 + 2000, 0, None);
+        }
+        let stats = player.take_stats();
+        assert!(stats.concealed >= 25, "{stats:?}");
+        assert_eq!(stats.fec, stats.concealed, "every gap had a next frame: {stats:?}");
+        assert_eq!(stats.underruns, 0);
     }
 
     #[test]
