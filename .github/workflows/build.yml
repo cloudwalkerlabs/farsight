@@ -15,21 +15,39 @@ jobs:
   linux:
     name: Linux x86_64 (server and desktop client)
     runs-on: ubuntu-latest
-    # Arch has the FFmpeg, PipeWire and Wayland the crates build against.
+    # Arch has the PipeWire and Wayland the crates build against.
     container: archlinux:latest
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rustup clang cmake nasm pkgconf \
-            ffmpeg libva libjpeg-turbo opus pipewire wayland libxkbcommon mesa libglvnd alsa-lib
+          pacman -Syu --noconfirm --needed base-devel git rustup clang cmake nasm meson ninja pkgconf \
+            libva libdrm libjpeg-turbo opus pipewire wayland libxkbcommon mesa libglvnd alsa-lib
           rustup default stable
       - uses: actions/checkout@v5
+      - id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prefix
+          key: ffmpeg-linux-${{ hashFiles('tools/ffmpeg/build.sh') }}
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: tools/ffmpeg/build.sh ffmpeg-prefix
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-server -p farsight-desktop
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
+      - name: Check linkage
+        run: |
+          ! ldd target/release/farsight-server target/release/farsight-desktop | grep -E 'libav|libdav1d'
+          target/release/farsight-desktop --help > /dev/null
       - name: Package
         run: |
           mkdir -p out/farsight
           cp target/release/farsight-server target/release/farsight-desktop README.md dist/farsight-server@.service out/farsight/
+          cp ffmpeg-prefix/notice/* out/farsight/
           tar -C out -czf farsight-linux-x86_64.tar.gz farsight
       - uses: actions/upload-artifact@v4
         with:
@@ -41,14 +59,33 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - run: brew install ffmpeg pkgconf
+      - run: brew install pkgconf meson ninja
+      - id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prefix
+          key: ffmpeg-macos-${{ hashFiles('tools/ffmpeg/build.sh') }}
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: tools/ffmpeg/build.sh ffmpeg-prefix
       - uses: dtolnay/rust-toolchain@stable
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-desktop
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
+      - name: Check linkage
+        run: |
+          otool -L target/release/farsight-desktop
+          ! otool -L target/release/farsight-desktop | tail -n +2 | grep -vE '^\s+(/System/Library/|/usr/lib/)'
+          target/release/farsight-desktop --help > /dev/null
       - name: Package
         run: |
           mkdir -p out/farsight
           cp target/release/farsight-desktop README.md out/farsight/
+          cp ffmpeg-prefix/notice/* out/farsight/
           tar -C out -czf farsight-desktop-macos-arm64.tar.gz farsight
       - uses: actions/upload-artifact@v4
         with:
@@ -59,26 +96,55 @@ jobs:
     name: Windows x86_64 (desktop client)
     runs-on: windows-latest
     env:
-      FFMPEG_DIR: ${{ github.workspace }}\ffmpeg
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v5
-      - name: Fetch FFmpeg
+      - uses: ilammy/msvc-dev-cmd@v1
+      # FFmpeg's configure needs a Unix shell; it and meson build with MSVC
+      # from it. The MinGW pkgconf takes the Windows paths cargo hands it.
+      - id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: make diffutils nasm tar xz mingw-w64-x86_64-pkgconf
+      - id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prefix
+          key: ffmpeg-windows-${{ hashFiles('tools/ffmpeg/build.sh') }}
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: pip install meson ninja
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          # MSYS2's coreutils link.exe would shadow MSVC's linker.
+          rm -f /usr/bin/link.exe
+          tools/ffmpeg/build.sh ffmpeg-prefix
+      - uses: dtolnay/rust-toolchain@stable
+      # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
+      # new FFmpeg needs a fresh one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
+      - run: cargo build --release --locked -p farsight-desktop
+        env:
+          PKG_CONFIG: ${{ steps.msys2.outputs.msys2-location }}\mingw64\bin\pkgconf.exe
+          PKG_CONFIG_PATH: ${{ github.workspace }}\ffmpeg-prefix\lib\pkgconfig
+      - name: Check linkage
         shell: pwsh
         run: |
-          $name = "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0"
-          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$name.zip" -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath .
-          Rename-Item $name ffmpeg
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked -p farsight-desktop
+          $deps = dumpbin /dependents target/release/farsight-desktop.exe
+          $deps
+          if ($deps -match 'av(codec|util)|dav1d') { throw "FFmpeg is linked dynamically" }
+          target/release/farsight-desktop.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory out/farsight | Out-Null
           Copy-Item target/release/farsight-desktop.exe, README.md out/farsight/
-          Copy-Item ffmpeg/bin/*.dll out/farsight/
+          Copy-Item ffmpeg-prefix/notice/* out/farsight/
           Compress-Archive out/farsight farsight-desktop-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
