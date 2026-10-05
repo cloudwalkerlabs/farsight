@@ -1,6 +1,9 @@
 //! What a VA-API device can encode and decode, from libva's own queries
 //! (`docs/design.md` §3). FFmpeg opens the codecs; it has no way to list
 //! what the driver supports.
+//!
+//! libva and libdrm load at the first call (`src/dlopen.c`): without them,
+//! nothing is supported.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::File;
@@ -19,7 +22,6 @@ struct VAConfigAttrib {
     value: u32,
 }
 
-#[link(name = "va")]
 unsafe extern "C" {
     fn vaInitialize(dpy: VADisplay, major: *mut c_int, minor: *mut c_int) -> VAStatus;
     fn vaTerminate(dpy: VADisplay) -> VAStatus;
@@ -38,7 +40,6 @@ unsafe extern "C" {
     fn vaSetInfoCallback(dpy: VADisplay, cb: VAMessageCallback, ctx: *mut c_void) -> VAMessageCallback;
 }
 
-#[link(name = "va-drm")]
 unsafe extern "C" {
     fn vaGetDisplayDRM(fd: c_int) -> VADisplay;
 }

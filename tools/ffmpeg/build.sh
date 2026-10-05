@@ -115,6 +115,13 @@ if [ "$os" = windows ]; then
 fi
 
 
+if [ "$os" = linux ]; then
+    # farsight-va loads libva, libva-drm and libdrm when first called, for
+    # FFmpeg too (crates/va/src/dlopen.c).
+    sed -i -E 's/ -l(va-drm|va|drm)\b//g' "$prefix"/lib/pkgconfig/libav*.pc
+    grep -H '^Libs' "$prefix"/lib/pkgconfig/libav*.pc
+fi
+
 mkdir -p "$prefix/notice"
 cp "ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$prefix/notice/"
 cp "dav1d-$DAV1D_VERSION/COPYING" "$prefix/notice/COPYING.dav1d"
