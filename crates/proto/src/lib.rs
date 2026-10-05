@@ -11,7 +11,7 @@ pub mod tiles;
 pub mod video;
 
 /// ALPN token for the QUIC connection. Bumped on incompatible changes.
-pub const ALPN: &[u8] = b"farsight/3";
+pub const ALPN: &[u8] = b"farsight/4";
 
 /// UDP port the server listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7740;

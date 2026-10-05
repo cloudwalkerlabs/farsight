@@ -19,6 +19,7 @@ mod host;
 mod ime;
 mod input;
 mod kiosk;
+mod mic;
 mod listen;
 mod net;
 mod outputs;

@@ -19,7 +19,7 @@ pub struct Output {
     _stream: cpal::Stream,
 }
 
-fn host() -> cpal::Host {
+pub fn host() -> cpal::Host {
     let preferred = [cpal::HostId::PipeWire];
     for id in preferred {
         if cpal::available_hosts().contains(&id)
@@ -31,7 +31,9 @@ fn host() -> cpal::Host {
     cpal::default_host()
 }
 
-pub fn open(client: Arc<Client>, config: AudioConfig) -> anyhow::Result<Output> {
+/// Opens the output; what it plays is copied to `reference` for the
+/// microphone's echo canceller.
+pub fn open(client: Arc<Client>, config: AudioConfig, reference: Arc<crate::mic::Reference>) -> anyhow::Result<Output> {
     let host = host();
     let device = host.default_output_device().context("no audio output device")?;
     let frame = config.frame_samples() as u32;
@@ -41,13 +43,15 @@ pub fn open(client: Arc<Client>, config: AudioConfig) -> anyhow::Result<Output> 
         buffer_size: cpal::BufferSize::Fixed(frame),
     };
     let build = |stream_config: cpal::StreamConfig| {
-        let client = client.clone();
+        let (client, reference) = (client.clone(), reference.clone());
+        let channels = config.channels as usize;
         device.build_output_stream(
             stream_config,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 let ts = info.timestamp();
                 let delay = ts.playback.duration_since(ts.callback);
                 client.fill_audio(data, delay.as_micros() as u64);
+                reference.push(data, channels, client.now_us() + delay.as_micros() as u64);
             },
             |err| tracing::warn!(%err, "audio output"),
             None,

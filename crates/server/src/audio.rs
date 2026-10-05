@@ -11,6 +11,9 @@
 //! encoded while no client listens. The node only runs while something
 //! plays; digital silence goes out as a few flagged datagrams and then
 //! nothing, until sound starts again.
+//!
+//! The PipeWire thread also runs the session's microphone,
+//! `farsight-mic` ([`crate::mic`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +23,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
-use farsight_proto::audio::{AudioConfig, AudioPacket, FLAG_DISCONTINUITY, FLAG_SILENCE, SAMPLE_RATE};
+use farsight_proto::audio::{AudioConfig, AudioPacket, FLAG_DISCONTINUITY, FLAG_SILENCE, MIC, SAMPLE_RATE};
 use farsight_proto::datagram::Datagram;
 use pipewire as pw;
 use pw::spa;
@@ -67,8 +70,9 @@ pub fn spawn(socket: PathBuf, start: Instant, net: UnboundedSender<ToNet>, share
         let _ = free_tx.try_send(Box::new([0.0; MAX_CYCLE * CHANNELS]));
     }
     let (ready_tx, ready_rx) = mpsc::channel();
+    let (mic_net, mic_shared) = (net.clone(), shared.clone());
     std::thread::Builder::new().name("farsight-pipewire".into()).spawn(move || {
-        if let Err(err) = pipewire_thread(socket, start, tx, free_rx, &ready_tx) {
+        if let Err(err) = pipewire_thread(socket, start, tx, free_rx, mic_net, mic_shared, &ready_tx) {
             let _ = ready_tx.send(Err(err));
         }
     })?;
@@ -85,6 +89,8 @@ fn pipewire_thread(
     start: Instant,
     tx: SyncSender<Cycle>,
     free: Receiver<Box<[f32; MAX_CYCLE * CHANNELS]>>,
+    net: UnboundedSender<ToNet>,
+    shared: Arc<Audio>,
     ready: &mpsc::Sender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -136,13 +142,66 @@ fn pipewire_thread(
         })
         .register()?;
 
+    connect(&stream, spa::utils::Direction::Input, &[spa::sys::SPA_AUDIO_CHANNEL_FL, spa::sys::SPA_AUDIO_CHANNEL_FR])?;
+    tracing::info!(socket = %socket.display(), "farsight-speaker is the session's sink");
+
+    // The microphone: a source that runs while an app records from it.
+    let props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CLASS => "Audio/Source",
+        *pw::keys::NODE_NAME => "farsight-mic",
+        *pw::keys::NODE_DESCRIPTION => "farsight client microphone",
+    };
+    let mic = pw::stream::StreamBox::new(&core, "farsight-mic", props)?;
+    let _mic_listener = mic
+        .add_local_listener_with_user_data(())
+        .state_changed({
+            let shared = shared.clone();
+            move |_, _, old, new| {
+                tracing::debug!(?old, ?new, "microphone state");
+                let on = matches!(new, pw::stream::StreamState::Streaming);
+                if shared.mic.set_demand(on) {
+                    tracing::info!(recording = on, "the session's microphone");
+                    let _ = net.send(ToNet::MicDemand(on));
+                }
+            }
+        })
+        .process({
+            let mut samples = vec![0.0f32; MAX_CYCLE];
+            move |stream, _| {
+                let Some(mut buffer) = stream.dequeue_buffer() else { return };
+                let requested = buffer.requested() as usize;
+                let Some(data) = buffer.datas_mut().first_mut() else { return };
+                let Some(bytes) = data.data() else { return };
+                let fits = (bytes.len() / 4).min(MAX_CYCLE);
+                let frames = if requested == 0 { fits.min(MIC.frame_samples()) } else { requested.min(fits) };
+                shared.mic.fill(&mut samples[..frames], start.elapsed().as_micros() as u64);
+                for (b, s) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&samples[..frames]) {
+                    *b = s.to_le_bytes();
+                }
+                let chunk = data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = 4;
+                *chunk.size_mut() = (frames * 4) as u32;
+            }
+        })
+        .register()?;
+    connect(&mic, spa::utils::Direction::Output, &[spa::sys::SPA_AUDIO_CHANNEL_MONO])?;
+    tracing::info!("farsight-mic is the session's source");
+    let _ = ready.send(Ok(()));
+    mainloop.run();
+    Ok(())
+}
+
+/// Connects a stream of 32-bit float samples at 48 kHz, with these
+/// channels.
+fn connect(stream: &pw::stream::Stream, direction: spa::utils::Direction, channels: &[u32]) -> anyhow::Result<()> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(CHANNELS as u32);
+    info.set_channels(channels.len() as u32);
     let mut position = [0; spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    position[..channels.len()].copy_from_slice(channels);
     info.set_position(position);
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
@@ -158,14 +217,11 @@ fn pipewire_thread(
     .into_inner();
     let mut params = [spa::pod::Pod::from_bytes(&values).context("format pod")?];
     stream.connect(
-        spa::utils::Direction::Input,
+        direction,
         None,
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
         &mut params,
     )?;
-    tracing::info!(socket = %socket.display(), "farsight-speaker is the session's sink");
-    let _ = ready.send(Ok(()));
-    mainloop.run();
     Ok(())
 }
 

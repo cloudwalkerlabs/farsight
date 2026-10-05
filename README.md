@@ -58,7 +58,8 @@ server's certificate on first use. `--view-only` watches beside the
 controlling client; `--no-tls` on both ends (with `--listen` on the
 server) turns encryption off on networks that already encrypt, such as
 Tailscale. `farsight-server --app -- APP` runs a single app with no
-desktop.
+desktop. With `--mic`, the desktop client sends its microphone, echo
+cancelled, while an app in the session records from `farsight-mic`.
 
 The server encodes with VA-API or NVENC, and sends tiles without either;
 the client decodes with VA-API or in software. Both need FFmpeg,

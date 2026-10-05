@@ -94,6 +94,9 @@ pub struct Hello {
     /// Join view-only, next to whoever controls the session, rather than
     /// take it over (§6).
     pub view_only: bool,
+    /// The client can send its microphone when an app in the session
+    /// records (`MicDemand`).
+    pub mic: bool,
 }
 
 /// The client's key, and its proof (§6): an Ed25519 signature over a value
@@ -122,6 +125,11 @@ pub enum ServerMessage {
     /// Whether a text field in the session has focus and takes text: the
     /// client may show its soft keyboard (§7).
     TextInput(bool),
+    /// Whether an app in the session is recording from `farsight-mic`
+    /// (§8): the client opens its microphone, as its user allows, and
+    /// sends `Mic` datagrams until this goes false. To the controlling
+    /// client only, if it offered a microphone.
+    MicDemand(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,6 +238,7 @@ use crate::codec::{Chroma, Codec};
             audio: Some(AudioCaps { max_channels: 2 }),
             auth: ClientAuth { key: [1; 32], signature: vec![2; 64] },
             view_only: false,
+            mic: true,
         });
         let bytes = encode_framed(&msg);
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

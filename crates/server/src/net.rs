@@ -59,6 +59,9 @@ pub enum ToNet {
     Audio(Bytes),
     /// The audio format changed, for every client that plays audio.
     AudioConfig(AudioConfig),
+    /// An app in the session started or stopped recording, for the client
+    /// that would send its microphone.
+    MicDemand(bool),
     /// An app in the session pastes: fetch the client's clipboard into the
     /// pipe.
     FetchClipboard(ConnId, crate::clipboard::Send),
@@ -99,6 +102,8 @@ pub struct Audio {
     /// The slowest listener's path is slow: 10 ms frames, at a lower
     /// bitrate.
     pub slow: AtomicBool,
+    /// The session's microphone.
+    pub mic: crate::mic::Mic,
 }
 
 impl Default for Audio {
@@ -108,6 +113,7 @@ impl Default for Audio {
             listening: AtomicBool::new(false),
             redundancy: AtomicUsize::new(farsight_proto::audio::REDUNDANCY),
             slow: AtomicBool::new(false),
+            mic: crate::mic::Mic::default(),
         }
     }
 }
@@ -158,6 +164,8 @@ struct Conn {
     audio: bool,
     /// The client plays audio, muted or not.
     plays: bool,
+    /// The client controls the session and has a microphone.
+    mic: bool,
     view_only: bool,
 }
 
@@ -265,6 +273,7 @@ fn encoder_target(p: &PathState) -> u64 {
 async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>, rx: mpsc::UnboundedReceiver<ToNet>) {
     let shared = Arc::new(Shared { opts, host, conns: Mutex::default(), history: Mutex::default() });
     tokio::spawn(dispatch(rx, shared.clone()));
+    tokio::spawn(report_mic(shared.clone()));
     let mut next_id: ConnId = 0;
     while let Some(incoming) = endpoint.accept().await {
         next_id += 1;
@@ -403,6 +412,11 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     let _ = c.control.send(ServerMessage::AudioConfig(config));
                 }
             }
+            ToNet::MicDemand(on) => {
+                for c in conns.iter().filter(|c| c.mic) {
+                    let _ = c.control.send(ServerMessage::MicDemand(on));
+                }
+            }
             ToNet::Audio(d) => {
                 for c in conns.iter().filter(|c| c.audio) {
                     c.sched.send(Priority::Audio, d.clone());
@@ -462,6 +476,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // Audio goes to a client that plays it, from a session that has it.
     let plays = hello.audio.is_some() && audio.config.lock().unwrap().is_some();
+    let mic = hello.mic && !view_only;
     let next = Conn {
         id,
         conn: conn.clone(),
@@ -470,6 +485,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
         control: control_tx,
         audio: plays,
         plays,
+        mic,
         view_only,
     };
     {
@@ -491,10 +507,16 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
     let writer = async {
         while let Some(msg) = control_rx.recv().await {
             stream::send(&mut send, &msg).await?;
-            // The audio format follows the welcome, which comes first.
-            let config = *audio.config.lock().unwrap();
-            if let (ServerMessage::Welcome(_), Some(config), true) = (&msg, config, plays) {
-                stream::send(&mut send, &ServerMessage::AudioConfig(config)).await?;
+            // The audio format follows the welcome, which comes first, and
+            // so does a recording already under way.
+            if let ServerMessage::Welcome(_) = msg {
+                let config = *audio.config.lock().unwrap();
+                if let (Some(config), true) = (config, plays) {
+                    stream::send(&mut send, &ServerMessage::AudioConfig(config)).await?;
+                }
+                if mic && audio.mic.demand() {
+                    stream::send(&mut send, &ServerMessage::MicDemand(true)).await?;
+                }
             }
         }
         anyhow::Ok(())
@@ -524,6 +546,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
                 Some(Datagram::Input(p)) => {
                     let _ = host.send(ToHost::Input(id, p));
                 }
+                Some(Datagram::Mic(p)) if mic => audio.mic.push(&p, start.elapsed().as_micros() as u64),
                 Some(Datagram::Ping(p)) => {
                     let pong = Pong { client_us: p.client_us, server_us: start.elapsed().as_micros() as u64 };
                     sched.send(Priority::Input, Bytes::from(Datagram::Pong(pong).to_vec()));
@@ -567,6 +590,34 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
         r = reader => r,
         r = datagrams => r,
         r = streams => r,
+    }
+}
+
+/// Logs the microphone's latency and the buffer's health every few
+/// seconds, while an app records.
+async fn report_mic(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(VIDEO_LOG_EVERY);
+    loop {
+        tick.tick().await;
+        let Some(mut s) = shared.opts.audio.mic.take_stats() else { continue };
+        if s.latency_us.is_empty() {
+            continue;
+        }
+        s.latency_us.sort_unstable();
+        let pct = |p: usize| s.latency_us[(s.latency_us.len() * p / 100).min(s.latency_us.len() - 1)] as f64 / 1000.0;
+        tracing::info!(
+            "microphone: capture→source ms p50 {:.1} p95 {:.1}; buffer {:.1} ms (target {:.1}); speed {:+.3}%; concealed {} (fec {}, late {}) underruns {} skipped {}",
+            pct(50),
+            pct(95),
+            s.buffered_us as f64 / 1000.0,
+            s.target_us as f64 / 1000.0,
+            s.adjust * 100.0,
+            s.concealed,
+            s.fec,
+            s.late,
+            s.underruns,
+            s.skipped,
+        );
     }
 }
 

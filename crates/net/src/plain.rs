@@ -38,7 +38,7 @@ pub const VERSION: u32 = 0x4653_5000;
 
 /// Carried in HELLO, as ALPN is in TLS; its number follows
 /// [`farsight_proto::ALPN`]'s.
-pub const IDENTITY: &[u8] = b"farsight-plain/3";
+pub const IDENTITY: &[u8] = b"farsight-plain/4";
 
 const HELLO: u8 = 1;
 const ACCEPT: u8 = 2;

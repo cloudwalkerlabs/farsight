@@ -17,9 +17,12 @@
 //!
 //! Audio goes into a jitter buffer here ([`audio::Player`]); the app opens
 //! its output when `AudioConfig` arrives and pulls samples through
-//! [`Client::fill_audio`].
+//! [`Client::fill_audio`]. When an app in the session records, `MicDemand`
+//! asks for the microphone, whose frames the app hands to
+//! [`Client::send_mic`] (§8).
 
 pub use farsight_audio as audio;
+pub mod mic;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -103,6 +106,8 @@ pub struct Config {
     pub audio: Option<AudioCaps>,
     /// Watch only, next to the client in control (§6).
     pub view_only: bool,
+    /// The app can send its microphone (`MicDemand`).
+    pub mic: bool,
 }
 
 #[derive(Debug)]
@@ -124,6 +129,10 @@ pub enum Event {
     ClipboardOffer(ClipboardOffer),
     /// A text field in the session gained (true) or lost focus.
     TextInput(bool),
+    /// An app in the session started (true) or stopped recording: open the
+    /// microphone, as the user allows, and hand its frames to
+    /// [`Client::send_mic`].
+    MicDemand(bool),
     /// The connection ended. `retry`: it was lost rather than ended, so
     /// connecting again resumes the session.
     Closed { reason: String, retry: bool },
@@ -187,6 +196,8 @@ struct Shared {
     /// The client's clipboard as offered to the server: its serial and
     /// what gives the data for a MIME type.
     clipboard: Mutex<Option<(u32, ClipboardProvider)>>,
+    /// While the session wants the microphone.
+    mic: Mutex<Option<mic::MicEncoder>>,
 }
 
 /// Gives the client's clipboard data in a MIME type, when an app in the
@@ -232,6 +243,7 @@ impl Client {
             audio: cfg.audio,
             auth,
             view_only: cfg.view_only,
+            mic: cfg.mic,
         };
         stream::send(&mut send, &ClientMessage::Hello(hello)).await?;
         let welcome = match stream::recv(&mut recv).await {
@@ -263,6 +275,7 @@ impl Client {
             stats: Mutex::default(),
             audio: Mutex::default(),
             clipboard: Mutex::default(),
+            mic: Mutex::default(),
         });
         let (control, control_rx) = mpsc::unbounded_channel();
         on_event(Event::Connected { fingerprint, welcome });
@@ -371,6 +384,17 @@ impl Client {
         let _ = self.control.send(ClientMessage::Preedit { text, cursor });
     }
 
+    /// One frame from the microphone ([`farsight_proto::audio::MIC`]'s
+    /// samples, echo cancelled), whose first sample was captured at
+    /// `capture_us` on the client's clock ([`Client::now_us`]). Dropped
+    /// unless the session wants the microphone.
+    pub fn send_mic(&self, pcm: &[f32], capture_us: u64) {
+        let offset = self.shared.offset_us.load(Ordering::Relaxed);
+        let capture_us = (capture_us as i64 + offset).max(0) as u64;
+        let Some(d) = self.shared.mic.lock().unwrap().as_mut().and_then(|m| m.encode(pcm, capture_us)) else { return };
+        let _ = self.conn.send_datagram(Bytes::from(d));
+    }
+
     /// Mutes or unmutes the session's audio at the server.
     pub fn set_audio(&self, play: bool) {
         let _ = self.control.send(ClientMessage::SetAudio { play });
@@ -418,6 +442,14 @@ async fn run(
                 ServerMessage::Welcome(_) => tracing::warn!("unexpected Welcome"),
                 ServerMessage::ClipboardOffer(offer) => on_event(Event::ClipboardOffer(offer)),
                 ServerMessage::TextInput(active) => on_event(Event::TextInput(active)),
+                ServerMessage::MicDemand(on) => {
+                    tracing::info!(on, "the session wants the microphone");
+                    *shared.mic.lock().unwrap() = match on {
+                        true => mic::MicEncoder::new().map_err(|err| tracing::warn!("microphone: {err:#}")).ok(),
+                        false => None,
+                    };
+                    on_event(Event::MicDemand(on));
+                }
                 ServerMessage::AudioConfig(config) => {
                     tracing::info!(?config, "audio");
                     match audio::Player::new(config) {

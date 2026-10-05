@@ -15,6 +15,7 @@ const TAG_PONG: u8 = 4;
 const TAG_TILES: u8 = 5;
 const TAG_AUDIO: u8 = 6;
 const TAG_NACK: u8 = 7;
+const TAG_MIC: u8 = 8;
 
 /// Bytes in front of a video fragment's payload.
 pub const VIDEO_OVERHEAD: usize = 1 + FragmentHeader::LEN;
@@ -50,6 +51,8 @@ pub enum Datagram<'a> {
     Video(FragmentHeader, &'a [u8]),
     Tiles(TilesHeader, &'a [u8]),
     Audio(AudioPacket<'a>),
+    /// The client's microphone, in [`crate::audio::MIC`]'s format.
+    Mic(AudioPacket<'a>),
     Input(InputPacket),
     Ping(Ping),
     Pong(Pong),
@@ -71,6 +74,7 @@ impl<'a> Datagram<'a> {
                 Datagram::Tiles(h, body)
             }
             TAG_AUDIO => Datagram::Audio(AudioPacket::read(body)?),
+            TAG_MIC => Datagram::Mic(AudioPacket::read(body)?),
             TAG_INPUT => Datagram::Input(postcard::from_bytes(body).ok()?),
             TAG_PING => Datagram::Ping(postcard::from_bytes(body).ok()?),
             TAG_PONG => Datagram::Pong(postcard::from_bytes(body).ok()?),
@@ -85,6 +89,10 @@ impl<'a> Datagram<'a> {
             Datagram::Tiles(h, body) => encode_tiles(h, body, out),
             Datagram::Audio(p) => {
                 out.push(TAG_AUDIO);
+                p.write(out);
+            }
+            Datagram::Mic(p) => {
+                out.push(TAG_MIC);
                 p.write(out);
             }
             Datagram::Input(p) => tagged(TAG_INPUT, p, out),
@@ -160,6 +168,7 @@ mod tests {
                 b"tiles",
             ),
             Datagram::Audio(AudioPacket { flags: 0, seq: 1, capture_us: 2, frames: vec![b"opus"] }),
+            Datagram::Mic(AudioPacket { flags: 0, seq: 3, capture_us: 4, frames: vec![b"voice", b""] }),
             Datagram::Input(input),
             Datagram::Ping(Ping { client_us: 5 }),
             Datagram::Pong(Pong { client_us: 5, server_us: 6 }),

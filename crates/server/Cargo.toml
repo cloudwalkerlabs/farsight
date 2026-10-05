@@ -12,6 +12,7 @@ workspace = true
 anyhow = "1.0.104"
 bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
+farsight-audio = { version = "0.1.0", path = "../audio" }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }
 farsight-tiles = { version = "0.1.0", path = "../tiles" }
@@ -25,7 +26,7 @@ smithay = { version = "0.7", default-features = false, features = ["backend_egl"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-pipewire = "0.10"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 opus = "0.4.0"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }

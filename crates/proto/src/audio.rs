@@ -4,6 +4,10 @@
 //! of them as loss rises, so a lost datagram costs nothing. Hand-encoded,
 //! like video fragments: 200 of them go every second.
 //!
+//! The client's microphone goes the other way in the same packets, in a
+//! fixed format ([`MIC`]): mono 10 ms frames of Opus for voice, with
+//! in-band FEC, the newest frame and [`MIC_REPEATS`] before it.
+//!
 //! ```text
 //! flags u8 | seq u32 | capture_us u64 | count u8 | count × (len u16, opus)
 //! ```
@@ -26,6 +30,14 @@ pub const REDUNDANCY: usize = 3;
 pub const MAX_REDUNDANCY: usize = 6;
 
 pub const SAMPLE_RATE: u32 = 48_000;
+
+/// The microphone's format, both ends: mono, 10 ms frames. Its capture
+/// times are on the server's clock, as far as the client knows it.
+pub const MIC: AudioConfig = AudioConfig { channels: 1, sample_rate: SAMPLE_RATE, frame_us: 10_000 };
+
+/// Frames repeated in each microphone datagram, besides the newest. A
+/// frame lost even so comes back from the next one's in-band FEC.
+pub const MIC_REPEATS: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioPacket<'a> {

@@ -14,5 +14,6 @@ bytes = "1"
 farsight-audio = { version = "0.1.0", path = "../audio" }
 farsight-net = { version = "0.1.0", path = "../net" }
 farsight-proto = { version = "0.1.0", path = "../proto" }
+opus = "0.4.0"
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"

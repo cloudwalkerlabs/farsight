@@ -16,6 +16,7 @@ mod audio;
 mod clipboard;
 mod cursor;
 mod decode;
+mod mic;
 mod render;
 mod stats;
 
@@ -81,6 +82,13 @@ struct Args {
     /// Don't play the session's audio; the server doesn't send it.
     #[arg(long)]
     no_audio: bool,
+    /// Send the microphone when an app in the session records from it.
+    #[arg(long)]
+    mic: bool,
+    /// Don't cancel the session's audio out of the microphone, as with
+    /// headphones.
+    #[arg(long)]
+    no_echo_cancel: bool,
     /// Don't pass the desktop's input method (IME) through; keys only.
     #[arg(long)]
     no_ime: bool,
@@ -209,6 +217,9 @@ struct App {
     /// Audio announced before the connection was ready.
     audio_pending: Option<farsight_proto::audio::AudioConfig>,
     audio: Option<audio::Output>,
+    /// What the output plays, for the microphone's echo canceller.
+    reference: Arc<mic::Reference>,
+    mic: Option<mic::Mic>,
     clipboard: Option<clipboard::Clipboard>,
     /// The connection was lost; connect again at this time.
     reconnect_at: Option<Instant>,
@@ -269,6 +280,8 @@ fn main() -> anyhow::Result<()> {
         layout_pending: None,
         audio_pending: None,
         audio: None,
+        reference: Arc::default(),
+        mic: None,
         clipboard: None,
         reconnect_at: None,
         reconnects: None,
@@ -369,6 +382,7 @@ impl App {
             mode: self.args.mode,
             audio,
             view_only: self.args.view_only,
+            mic: self.args.mic && !self.args.view_only,
         };
         let (proxy, cell) = (self.proxy.clone(), self.client_cell.clone());
         let events = self.proxy.clone();
@@ -453,7 +467,7 @@ impl App {
     fn start_audio(&mut self, config: farsight_proto::audio::AudioConfig) {
         let Some(client) = self.client.clone() else { return };
         self.audio = None;
-        match audio::open(client.clone(), config) {
+        match audio::open(client.clone(), config, self.reference.clone()) {
             Ok(output) => {
                 self.audio = Some(output);
                 self.runtime.spawn(audio::report(client));
@@ -569,6 +583,7 @@ impl ApplicationHandler<UserEvent> for App {
     /// The GL surface must go while the Wayland connection is still up:
     /// NVIDIA's EGL crashes destroying it afterwards.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.mic = None;
         self.audio = None;
         self.gfx = None;
         self.clipboard = None;
@@ -660,6 +675,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Net(Event::TextInput(active)) => tracing::debug!(active, "a text field in the session"),
+            UserEvent::Net(Event::MicDemand(on)) => {
+                self.mic = None;
+                if let (true, Some(client)) = (on, self.client.clone()) {
+                    match mic::open(client, self.reference.clone(), !self.args.no_echo_cancel) {
+                        Ok(m) => self.mic = Some(m),
+                        Err(err) => tracing::warn!("{err:#}"),
+                    }
+                }
+                self.set_title(if self.mic.is_some() { " (microphone on)" } else { "" });
+            }
             UserEvent::Net(Event::AudioConfig(config)) => match self.client {
                 Some(_) => self.start_audio(config),
                 None => self.audio_pending = Some(config),
@@ -669,6 +694,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.client = None;
                 self.audio = None;
                 self.audio_pending = None;
+                self.mic = None;
                 if retry {
                     // The session lives on at the server; the picture stays
                     // until it's back.
