@@ -282,6 +282,15 @@ impl Pipeline {
         });
     }
 
+    /// A new nested window (the desktop restarted): its commits and damage
+    /// start afresh, in a new epoch.
+    pub fn nested_window_changed(&mut self) {
+        self.last_commit = None;
+        self.damage.clear();
+        self.frames = None;
+        self.hold = None;
+    }
+
     /// Frames go to `client` from now on, starting with a keyframe.
     pub fn set_client(&mut self, client: Option<ConnId>) {
         self.client = client;

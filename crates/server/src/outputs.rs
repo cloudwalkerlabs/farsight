@@ -50,6 +50,8 @@ struct State {
 
 /// The connection to the nested compositor.
 pub struct Outputs {
+    /// Tells this connection from one to a restarted desktop.
+    generation: u64,
     conn: Connection,
     queue: EventQueue<State>,
     state: State,
@@ -77,8 +79,13 @@ impl Outputs {
         tracing::info!(socket = %path.display(), "connecting to the nested compositor");
         let state = State::default();
         let fd = conn.as_fd().try_clone_to_owned()?;
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         host.loop_handle
-            .insert_source(Generic::new(fd, Interest::READ, Mode::Level), |_, _, host| {
+            .insert_source(Generic::new(fd, Interest::READ, Mode::Level), move |_, _, host| {
+                if host.outputs.as_ref().is_none_or(|o| o.generation != generation) {
+                    return Ok(PostAction::Remove); // a desktop that has gone
+                }
                 if let Some(outputs) = host.outputs.as_mut()
                     && let Err(err) = outputs.dispatch()
                 {
@@ -90,7 +97,7 @@ impl Outputs {
                 Ok(PostAction::Continue)
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        host.outputs = Some(Outputs { conn, queue, state });
+        host.outputs = Some(Outputs { generation, conn, queue, state });
         Ok(())
     }
 

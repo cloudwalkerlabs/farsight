@@ -42,6 +42,8 @@ pub enum ToNet {
     Frame(ConnId, Frame),
     Tiles(ConnId, Tiles),
     Message(ConnId, ServerMessage),
+    /// The session is ending: close every connection with this reason.
+    Shutdown(String),
 }
 
 #[derive(Debug)]
@@ -133,6 +135,9 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, current: Arc<Mutex<Opt
         let cur = current.lock().unwrap();
         let Some(c) = cur.as_ref() else { continue };
         match msg {
+            ToNet::Shutdown(reason) => {
+                c.conn.close(2u32.into(), reason.as_bytes());
+            }
             ToNet::Frame(id, f) if id == c.id => {
                 let Some(max) = c.conn.max_datagram_size() else { continue };
                 let frame = EncodedFrame {

@@ -5,8 +5,9 @@
 #   systemctl enable --now farsight-server@7740
 #
 # A plain system service: no logind session or user systemd needed. The
-# server creates its own D-Bus session bus and Wayland display, isolated
-# from anything else the user runs.
+# server creates its own D-Bus session bus, Wayland display and PipeWire,
+# isolated from anything else the user runs. The session's audio never
+# reaches the server's sound hardware, even if the user is in `audio`.
 
 [Unit]
 Description=farsight remote desktop session on port %i
@@ -20,6 +21,14 @@ User=CHANGEME
 # Private runtime dir (sockets, bus), /run/farsight-<port>, mode 0700.
 RuntimeDirectory=farsight-%i
 RuntimeDirectoryMode=0700
+# Out of reach: the sound devices, the system PulseAudio and the user's own
+# desktop session. /dev/dri stays visible for encoding, so no
+# PrivateDevices=.
+InaccessiblePaths=-/dev/snd -/run/pulse -/run/user/%U
+# PipeWire takes realtime priority itself; rtkit only grants it to local
+# sessions.
+LimitRTPRIO=88
+LimitMEMLOCK=64M
 ExecStart=/usr/local/bin/farsight-server --port %i
 Restart=on-failure
 

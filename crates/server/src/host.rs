@@ -318,6 +318,8 @@ impl XdgShellHandler for Host {
             return;
         }
         tracing::info!("nested window created");
+        self.initial_configure_repeated = false;
+        self.pipeline.nested_window_changed();
         configure_fullscreen(&surface, &self.output, self.layout);
         self.output.enter(surface.wl_surface());
         let scale = self.layout.scale;
@@ -359,6 +361,8 @@ impl XdgShellHandler for Host {
         if self.toplevel.as_ref() == Some(&surface) {
             tracing::info!("nested window destroyed");
             self.toplevel = None;
+            // A restarted desktop gets a connection of its own.
+            self.outputs = None;
         }
     }
 

@@ -5,10 +5,10 @@
 //! compositor in it, and serves clients on one port. Clients that disconnect
 //! can reconnect to the same session. See `docs/design.md` §6.
 //!
-//! Current state: M2. The host compositor runs the desktop nested, encodes
-//! it in the format negotiated with the client (§3) and streams it to one
-//! client at a time, which sends input back. The session's isolation (§6)
-//! comes in M3. Commands on stdin drive experiments (see `control`).
+//! The host compositor runs the desktop nested, encodes it in the format
+//! negotiated with the client (§3) and streams it to one client at a time,
+//! which sends input back. The desktop is restarted if it crashes
+//! (`session`). Commands on stdin drive experiments (see `control`).
 
 mod cursor;
 mod encode;
@@ -18,11 +18,10 @@ mod input;
 mod net;
 mod outputs;
 mod pipeline;
+mod session;
 
 use std::io::BufRead;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,8 +32,7 @@ use smithay::reexports::calloop::channel::{self, Channel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
-use smithay::reexports::wayland_server::Display;
-use smithay::wayland::socket::ListeningSocketSource;
+use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use tracing_subscriber::EnvFilter;
 
 use farsight_proto::control::{ClientMessage, ServerMessage, Welcome};
@@ -86,6 +84,13 @@ struct Args {
     /// Read the probe client's frame number from each frame (spike).
     #[arg(long)]
     probe: bool,
+    /// When the desktop exits: restart it after a crash (on-failure), always,
+    /// or never. A clean exit under on-failure ends the session.
+    #[arg(long, value_enum, default_value_t = session::Restart::OnFailure)]
+    restart: session::Restart,
+    /// Run the session without audio daemons.
+    #[arg(long)]
+    no_audio: bool,
     /// The desktop to run nested.
     #[arg(last = true, default_values_t = ["labwc".to_string()])]
     desktop: Vec<String>,
@@ -102,6 +107,8 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     tracing::info!(port = args.port, "farsight-server starting");
+    // Before any thread starts, so that they all inherit the mask.
+    let signals = signal_channel()?;
 
     let mut event_loop: EventLoop<Host> = EventLoop::try_new()?;
     let display: Display<Host> = Display::new()?;
@@ -150,15 +157,20 @@ fn main() -> anyhow::Result<()> {
     let layout = Layout { width: args.size.0, height: args.size.1, scale: args.scale, refresh_mhz: 60_000 };
     let mut host = Host::new(dh.clone(), event_loop.handle(), start, gpu.renderer, gpu.feedback, pipeline, net, layout);
 
-    let socket = ListeningSocketSource::with_name(&format!("farsight-{}", args.port))
-        .context("binding the host Wayland socket")?;
-    let socket_name = socket.socket_name().to_os_string();
+    let session = session::Session::start(args.port, !args.no_audio)?;
+    // The host's socket is in the session's runtime directory, for the
+    // desktop only (§6).
+    let socket_name = std::ffi::OsString::from("farsight");
+    let socket = ListeningSocket::bind_absolute(session.path("farsight")).context("binding the host Wayland socket")?;
     let loop_handle = event_loop.handle();
     loop_handle
-        .insert_source(socket, |stream, _, host| {
-            if let Err(err) = host.display.insert_client(stream, Arc::new(ClientState::default())) {
-                tracing::warn!(%err, "inserting client");
+        .insert_source(Generic::new(socket, Interest::READ, Mode::Level), |_, socket, host| {
+            while let Some(stream) = socket.accept()? {
+                if let Err(err) = host.display.insert_client(stream, Arc::new(ClientState::default())) {
+                    tracing::warn!(%err, "inserting client");
+                }
             }
+            Ok(PostAction::Continue)
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     loop_handle
@@ -180,6 +192,14 @@ fn main() -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     loop_handle
+        .insert_source(signals, |event, _, host| {
+            if let channel::Event::Msg(signal) = event {
+                tracing::info!(signal, "stopping");
+                host.running = false;
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    loop_handle
         .insert_source(control_channel(), |event, _, host| {
             if let channel::Event::Msg(line) = event {
                 control(host, &line);
@@ -187,12 +207,16 @@ fn main() -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut child = spawn_desktop(&args.desktop, &socket_name)?;
-    let child_pid = child.id();
+    let mut desktop = session::Desktop::new(args.desktop.clone(), socket_name, args.restart);
+    desktop.start(&session)?;
+    // Dropped in this order: the desktop, then the services it used.
+    let mut supervisor = (desktop, session);
     loop_handle
         .insert_source(Timer::from_duration(Duration::from_millis(250)), move |_, _, host| {
-            if let Ok(Some(status)) = child.try_wait() {
-                tracing::info!(%status, "desktop exited");
+            let (desktop, session) = &mut supervisor;
+            session.check_services();
+            if desktop.supervise(session) == session::Supervision::End {
+                tracing::info!("the session ends");
                 host.running = false;
                 return TimeoutAction::Drop;
             }
@@ -204,8 +228,11 @@ fn main() -> anyhow::Result<()> {
         event_loop.dispatch(Some(Duration::from_millis(100)), &mut host)?;
         let _ = host.display.flush_clients();
     }
-    // SAFETY: plain syscall; the child leads its own process group.
-    unsafe { libc::kill(-(child_pid as i32), libc::SIGTERM) };
+    let _ = host.net.send(net::ToNet::Shutdown("the session ended".into()));
+    // Dropping the event loop drops the supervisor, which stops the desktop
+    // and the session's services.
+    drop(event_loop);
+    std::thread::sleep(Duration::from_millis(100));
     Ok(())
 }
 
@@ -299,22 +326,33 @@ fn set_layout(host: &mut Host, l: farsight_proto::layout::Layout) -> bool {
     true
 }
 
-fn spawn_desktop(cmd: &[String], socket: &std::ffi::OsStr) -> anyhow::Result<Child> {
-    tracing::info!(?cmd, ?socket, "starting desktop");
-    let mut c = Command::new(&cmd[0]);
-    c.args(&cmd[1..])
-        .env("WAYLAND_DISPLAY", socket)
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_SOCKET")
-        .process_group(0);
-    // The session's environment comes from us, not from whoever started the
-    // server (§6): a stray WLR_BACKENDS would stop labwc nesting.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"WLR_") {
-            c.env_remove(key);
+/// SIGTERM, SIGINT and SIGHUP, delivered to the event loop so the session
+/// ends cleanly. Blocks them in the calling thread, and so in every thread
+/// started after.
+fn signal_channel() -> anyhow::Result<Channel<i32>> {
+    // SAFETY: plain libc calls on a local, initialised sigset.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, s);
         }
-    }
-    c.spawn().with_context(|| format!("starting {}", cmd[0]))
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            anyhow::bail!("blocking signals");
+        }
+        set
+    };
+    let (tx, rx) = channel::channel();
+    std::thread::Builder::new().name("farsight-signals".into()).spawn(move || {
+        loop {
+            let mut signal = 0;
+            // SAFETY: `set` is initialised and `signal` a valid out-pointer.
+            if unsafe { libc::sigwait(&set, &mut signal) } == 0 && tx.send(signal).is_err() {
+                break;
+            }
+        }
+    })?;
+    Ok(rx)
 }
 
 /// Experiments, one command per line on stdin.
