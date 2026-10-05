@@ -6,7 +6,7 @@
 #   tools/ffmpeg/build.sh PREFIX
 #
 # Then build with PKG_CONFIG_PATH=PREFIX/lib/pkgconfig and FFMPEG_DIR unset.
-# PREFIX/share/ffmpeg/ gets the licences and a notice to ship alongside.
+# PREFIX/notice/ gets the licences and a notice to ship alongside.
 #
 # Needs a C compiler, make, pkg-config, nasm (x86_64), meson and ninja. On
 # Windows, run it from an MSYS2 shell with the MSVC environment loaded.
@@ -103,10 +103,10 @@ if [ "$os" = windows ]; then
     done
 fi
 
-mkdir -p "$prefix/share/ffmpeg"
-cp "ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$prefix/share/ffmpeg/"
-cp "dav1d-$DAV1D_VERSION/COPYING" "$prefix/share/ffmpeg/COPYING.dav1d"
-cat >"$prefix/share/ffmpeg/FFMPEG.txt" <<EOF
+mkdir -p "$prefix/notice"
+cp "ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$prefix/notice/"
+cp "dav1d-$DAV1D_VERSION/COPYING" "$prefix/notice/COPYING.dav1d"
+cat >"$prefix/notice/FFMPEG.txt" <<EOF
 farsight links FFmpeg $FFMPEG_VERSION (https://ffmpeg.org) statically,
 under the GNU Lesser General Public License 2.1 (COPYING.LGPLv2.1), and
 dav1d $DAV1D_VERSION (https://code.videolan.org/videolan/dav1d), under the

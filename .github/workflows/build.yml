@@ -43,7 +43,7 @@ jobs:
         run: |
           mkdir -p out/farsight
           cp target/release/farsight-server target/release/farsight-desktop README.md dist/farsight-server@.service out/farsight/
-          cp ffmpeg-prefix/share/ffmpeg/* out/farsight/
+          cp ffmpeg-prefix/notice/* out/farsight/
           tar -C out -czf farsight-linux-x86_64.tar.gz farsight
       - uses: actions/upload-artifact@v4
         with:
@@ -77,7 +77,7 @@ jobs:
         run: |
           mkdir -p out/farsight
           cp target/release/farsight-desktop README.md out/farsight/
-          cp ffmpeg-prefix/share/ffmpeg/* out/farsight/
+          cp ffmpeg-prefix/notice/* out/farsight/
           tar -C out -czf farsight-desktop-macos-arm64.tar.gz farsight
       - uses: actions/upload-artifact@v4
         with:
@@ -132,7 +132,7 @@ jobs:
         run: |
           New-Item -ItemType Directory out/farsight | Out-Null
           Copy-Item target/release/farsight-desktop.exe, README.md out/farsight/
-          Copy-Item ffmpeg-prefix/share/ffmpeg/* out/farsight/
+          Copy-Item ffmpeg-prefix/notice/* out/farsight/
           Compress-Archive out/farsight farsight-desktop-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
