@@ -2,11 +2,13 @@
 //! its size in physical pixels and its scale, and the server applies both
 //! to the output in one step (`docs/design.md` §5).
 
+use serde::{Deserialize, Serialize};
+
 /// Scale is carried in 1/120 steps, as in `wp_fractional_scale_v1`.
 pub const SCALE_DENOMINATOR: u32 = 120;
 
 /// One output, as the client wants it or as the server applied it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout {
     /// Width in physical pixels.
     pub width_px: u32,

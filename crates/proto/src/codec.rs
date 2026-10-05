@@ -1,21 +1,23 @@
 //! Codec negotiation types (`docs/design.md` §3). The client lists what it
 //! can decode; the server intersects that with what it can encode and picks.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Codec {
     H264,
     Hevc,
     Av1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Chroma {
     Yuv420,
     Yuv444,
 }
 
 /// One decoder the client offers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecoderCaps {
     pub codec: Codec,
     pub chroma: Chroma,
