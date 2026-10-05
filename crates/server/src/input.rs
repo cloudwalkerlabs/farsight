@@ -7,7 +7,7 @@
 use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
-use smithay::utils::{Point, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use farsight_proto::input::{InputEvent, InputPacket};
 
@@ -29,7 +29,13 @@ pub fn release_all(host: &mut Host) {
 pub fn inject(host: &mut Host, event: InputEvent) {
     tracing::trace!(?event, "inject");
     let time = (host.now_us() / 1000) as u32;
-    let focus = host.toplevel.as_ref().map(|t| (t.wl_surface().clone(), Point::from((0.0, 0.0))));
+    // Nested, everything goes to the nested compositor's one window; a
+    // kiosk app is hit-tested, popups first.
+    let s = host.logical_scale();
+    let under = |host: &Host, location: Point<f64, Logical>| match &host.kiosk {
+        Some(k) => k.surface_under(location),
+        None => host.toplevel.as_ref().map(|t| (t.wl_surface().clone(), Point::from((0.0, 0.0)))),
+    };
     match event {
         InputEvent::Key { code, pressed } => {
             let Some(kbd) = host.seat.get_keyboard() else { return };
@@ -41,15 +47,24 @@ pub fn inject(host: &mut Host, event: InputEvent) {
         }
         InputEvent::Button { code, pressed } => {
             let Some(ptr) = host.seat.get_pointer() else { return };
+            // A click outside a kiosk app's popups closes them.
+            if pressed && let Some(k) = host.kiosk.as_mut() {
+                let on_popup = ptr.current_focus().is_some_and(|f| k.popups.find_popup(&f).is_some());
+                if !on_popup {
+                    k.dismiss_popups();
+                }
+            }
             let state = if pressed { ButtonState::Pressed } else { ButtonState::Released };
             ptr.button(host, &ButtonEvent { serial: SERIAL_COUNTER.next_serial(), time, button: code, state });
             ptr.frame(host);
         }
         InputEvent::PointerAbs { x, y } => {
             let Some(ptr) = host.seat.get_pointer() else { return };
-            // The host's logical space is the output's pixels (§5).
+            // The client sends output pixels.
             let (w, h) = (host.layout.width as f64, host.layout.height as f64);
-            let location = (f64::from(x).clamp(0.0, w - 1.0), f64::from(y).clamp(0.0, h - 1.0)).into();
+            let location: Point<f64, Logical> =
+                (f64::from(x).clamp(0.0, w - 1.0) / s, f64::from(y).clamp(0.0, h - 1.0) / s).into();
+            let focus = under(host, location);
             // wlroots' Wayland backend ignores the position in
             // wl_pointer.enter, so the nested compositor's cursor would stay
             // put until the next motion. Follow an enter with a motion.
@@ -61,11 +76,12 @@ pub fn inject(host: &mut Host, event: InputEvent) {
         }
         InputEvent::PointerRel { dx, dy } => {
             let Some(ptr) = host.seat.get_pointer() else { return };
-            let delta: Point<f64, _> = (f64::from(dx), f64::from(dy)).into();
-            let (w, h) = (host.layout.width as f64, host.layout.height as f64);
+            let delta: Point<f64, _> = (f64::from(dx) / s, f64::from(dy) / s).into();
+            let (w, h) = (host.layout.width as f64 / s, host.layout.height as f64 / s);
             let mut location = ptr.current_location() + delta;
-            location.x = location.x.clamp(0.0, w - 1.0);
-            location.y = location.y.clamp(0.0, h - 1.0);
+            location.x = location.x.clamp(0.0, w - 1.0 / s);
+            location.y = location.y.clamp(0.0, h - 1.0 / s);
+            let focus = under(host, location);
             let entering = ptr.current_focus().is_none();
             for _ in 0..1 + entering as usize {
                 ptr.motion(host, focus.clone(), &MotionEvent { location, serial: SERIAL_COUNTER.next_serial(), time });

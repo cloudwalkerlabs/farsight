@@ -124,15 +124,19 @@ fn read_image(host: &mut Host, surface: &WlSurface) -> Option<CursorImage> {
     };
     let size = texture.size();
     let (width, height) = (size.w as u32, size.h as u32);
-    // The host's logical pixels are output pixels (§5): the image's
-    // density is its width over its logical width, which covers both
-    // buffer_scale and a viewport. The hotspot is logical.
-    let scale_120 = match logical_w {
-        w if w > 0 => width * farsight_proto::layout::SCALE_DENOMINATOR / w as u32,
-        _ => scale as u32 * farsight_proto::layout::SCALE_DENOMINATOR,
+    // Image pixels per logical pixel: its width over its logical width,
+    // which covers both buffer_scale and a viewport. The hotspot is
+    // logical.
+    let denominator = farsight_proto::layout::SCALE_DENOMINATOR;
+    let per_logical = match logical_w {
+        w if w > 0 => width * denominator / w as u32,
+        _ => scale as u32 * denominator,
     };
-    let to_image = |v: i32| v * scale_120 as i32 / farsight_proto::layout::SCALE_DENOMINATOR as i32;
+    let to_image = |v: i32| v * per_logical as i32 / denominator as i32;
     let hotspot = (to_image(hotspot.x), to_image(hotspot.y));
+    // Per output pixel: nested, logical pixels are output pixels (§5); in
+    // kiosk mode there are `scale` output pixels to each.
+    let scale_120 = (per_logical as f64 / host.logical_scale()).round() as u32;
     let mut hasher = DefaultHasher::new();
     (width, height, hotspot, scale_120, &pixels).hash(&mut hasher);
     Some(CursorImage { id: hasher.finish(), width, height, hotspot, scale_120, pixels })

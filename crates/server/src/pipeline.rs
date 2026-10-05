@@ -386,6 +386,37 @@ pub fn on_toplevel_commit(host: &mut Host, toplevel: &ToplevelSurface) {
     present(host, surface);
 }
 
+/// Kiosk mode: the app committed; composite it and encode the result.
+pub fn on_kiosk_commit(host: &mut Host) {
+    let t_commit = host.now_us();
+    let (size, scale) = ((host.layout.width, host.layout.height), host.layout.scale);
+    let Some(kiosk) = host.kiosk.as_mut() else { return };
+    let composited = match kiosk.composite(&mut host.renderer, size, scale) {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::error!("{err:#}");
+            return;
+        }
+    };
+    let (texture, damage) = composited;
+    host.pipeline.damage.extend(damage);
+    // Hold while the app hasn't drawn itself at the new size yet.
+    let drawn = crate::kiosk::drawn_size(host).map(|(w, h)| {
+        let near = |a: i32, b: i32| (a - b).abs() <= 2;
+        if near(w, size.0) && near(h, size.1) { size } else { (w, h) }
+    });
+    if host.pipeline.encoding()
+        && release_hold(host, drawn.unwrap_or(size))
+        && let Err(err) = convert_and_encode(host, &texture, t_commit, false)
+    {
+        tracing::error!("{err:#}");
+    }
+    if let Some(surface) = host.toplevel.as_ref().map(|t| t.wl_surface().clone()) {
+        present(host, &surface);
+    }
+}
+
 /// Adds the nested window's damage since the last commit we saw.
 fn collect_damage(host: &mut Host, surface: &WlSurface) {
     let p = &mut host.pipeline;
@@ -425,10 +456,11 @@ fn encode_current(host: &mut Host, refine: bool) {
     }
     let Some(surface) = host.toplevel.as_ref().map(|t| t.wl_surface().clone()) else { return };
     let ctx = host.renderer.context_id();
-    let Some(texture) = with_renderer_surface_state(&surface, |rs| rs.texture::<GlesTexture>(ctx).cloned()).flatten()
-    else {
-        return;
+    let texture = match &host.kiosk {
+        Some(k) => k.texture(),
+        None => with_renderer_surface_state(&surface, |rs| rs.texture::<GlesTexture>(ctx).cloned()).flatten(),
     };
+    let Some(texture) = texture else { return };
     let t = host.now_us();
     if let Err(err) = convert_and_encode(host, &texture, t, refine) {
         tracing::error!("{err:#}");
@@ -642,9 +674,13 @@ fn send_frame_callbacks(host: &mut Host) {
     host.pipeline.last_callback_us = host.now_us();
     let output = host.output.clone();
     let time: Duration = host.pipeline.clock.now().into();
-    smithay::desktop::utils::send_frames_surface_tree(toplevel.wl_surface(), &output, time, None, |_, _| {
-        Some(output.clone())
-    });
+    match host.kiosk.as_ref().and_then(|k| k.window.as_ref()) {
+        // The app's popups too.
+        Some(window) => window.send_frame(&output, time, None, |_, _| Some(output.clone())),
+        None => smithay::desktop::utils::send_frames_surface_tree(toplevel.wl_surface(), &output, time, None, |_, _| {
+            Some(output.clone())
+        }),
+    }
     let _ = host.display.flush_clients();
 }
 

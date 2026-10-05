@@ -18,6 +18,7 @@ mod gpu;
 mod host;
 mod ime;
 mod input;
+mod kiosk;
 mod listen;
 mod net;
 mod outputs;
@@ -107,10 +108,15 @@ struct Args {
     /// or never. A clean exit under on-failure ends the session.
     #[arg(long, value_enum, default_value_t = session::Restart::OnFailure)]
     restart: session::Restart,
+    /// Kiosk mode: the command is a single app, shown fullscreen with no
+    /// nested compositor, e.g. `--app -- firefox`. No clipboard or text
+    /// input yet.
+    #[arg(long)]
+    app: bool,
     /// Run the session without audio daemons.
     #[arg(long)]
     no_audio: bool,
-    /// The desktop to run nested.
+    /// The desktop to run nested (or, with --app, the app).
     #[arg(last = true, default_values_t = ["labwc".to_string()])]
     desktop: Vec<String>,
 }
@@ -200,7 +206,8 @@ fn main() -> anyhow::Result<()> {
         net.clone(),
     )?;
     let layout = Layout { width: args.size.0, height: args.size.1, scale: args.scale, refresh_mhz: 60_000 };
-    let mut host = Host::new(dh.clone(), event_loop.handle(), start, gpu.renderer, gpu.feedback, pipeline, net, layout);
+    let mut host =
+        Host::new(dh.clone(), event_loop.handle(), start, gpu.renderer, gpu.feedback, pipeline, net, layout, args.app);
 
     let session = session::Session::start(args.port, !args.no_audio)?;
     if session.audio

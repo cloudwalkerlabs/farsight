@@ -96,6 +96,11 @@ pub struct Host {
     /// The same, for the session's clipboard and text input.
     pub clipboard: Option<crate::clipboard::Clipboard>,
     pub ime: Option<crate::ime::Ime>,
+    /// For a kiosk app: GTK sets up no seat without a data device, and
+    /// copying and pasting within the app needs it.
+    pub data_device: smithay::wayland::selection::data_device::DataDeviceState,
+    /// Kiosk mode: the one app, composited by the host itself.
+    pub kiosk: Option<crate::kiosk::Kiosk>,
     pub net: tokio::sync::mpsc::UnboundedSender<ToNet>,
     /// labwc drops the configure that arrives before its output is enabled;
     /// we repeat it once after the first frame (see `pipeline`).
@@ -114,6 +119,7 @@ impl Host {
         pipeline: Pipeline,
         net: tokio::sync::mpsc::UnboundedSender<ToNet>,
         layout: Layout,
+        kiosk: bool,
     ) -> Self {
         let dh = &display;
         let compositor = CompositorState::new_v6::<Self>(dh);
@@ -148,6 +154,7 @@ impl Host {
             Box::new(XdgDecorationState::new::<Self>(dh)),
         ];
 
+        let data_device = smithay::wayland::selection::data_device::DataDeviceState::new::<Self>(dh);
         let mut host = Self {
             display,
             loop_handle,
@@ -173,6 +180,8 @@ impl Host {
             outputs: None,
             clipboard: None,
             ime: None,
+            data_device,
+            kiosk: kiosk.then(Default::default),
             net,
             initial_configure_repeated: false,
             _globals: globals,
@@ -208,7 +217,7 @@ impl Host {
         );
         self.output.set_preferred(mode);
         if let Some(toplevel) = &self.toplevel {
-            configure_fullscreen(toplevel, &self.output, layout);
+            configure_fullscreen(toplevel, &self.output, self.logical_size());
             toplevel.send_configure();
             let scale = layout.scale;
             with_states(toplevel.wl_surface(), |states| {
@@ -218,6 +227,18 @@ impl Host {
                 });
             });
         }
+    }
+
+    /// Logical units per output pixel: 1 when nested (the nested
+    /// compositor applies the scale), the scale itself in kiosk mode.
+    pub fn logical_scale(&self) -> f64 {
+        if self.kiosk.is_some() { self.layout.scale } else { 1.0 }
+    }
+
+    /// The output in logical units: the size the window is configured to.
+    pub fn logical_size(&self) -> (i32, i32) {
+        let s = self.logical_scale();
+        ((self.layout.width as f64 / s).round() as i32, (self.layout.height as f64 / s).round() as i32)
     }
 
     /// The layout in effect, as the client sees it.
@@ -235,13 +256,13 @@ impl Host {
     }
 }
 
-/// The nested window always fills the output, in physical pixels. The host's
-/// own logical coordinate space is 1:1 with pixels; scale is only a hint to
-/// the nested compositor (§5).
-fn configure_fullscreen(toplevel: &ToplevelSurface, output: &Output, layout: Layout) {
+/// The window always fills the output. Nested, the host's logical
+/// coordinates are the output's pixels and scale is only a hint to the
+/// nested compositor (§5); in kiosk mode they are scaled as usual.
+fn configure_fullscreen(toplevel: &ToplevelSurface, output: &Output, size: (i32, i32)) {
     let wl_output = output.client_outputs(&toplevel.wl_surface().client().unwrap()).next();
     toplevel.with_pending_state(|state| {
-        state.size = Some((layout.width, layout.height).into());
+        state.size = Some(size.into());
         state.states.set(xdg_toplevel::State::Fullscreen);
         state.states.set(xdg_toplevel::State::Activated);
         state.fullscreen_output = wl_output;
@@ -268,15 +289,24 @@ impl CompositorHandler for Host {
             crate::cursor::surface_committed(self, surface);
             return;
         }
-        let Some(toplevel) = self.toplevel.clone() else { return };
-        if toplevel.wl_surface() != surface {
-            if compositor::get_parent(surface).is_some() {
-                tracing::warn!("subsurface commit; subsurfaces are not composited in the spike");
+        let Some(toplevel) = self.toplevel.clone() else {
+            // A kiosk app's popups may commit before its window shows.
+            if let Some(k) = self.kiosk.as_mut() {
+                k.popups.commit(surface);
             }
             return;
-        }
-        if !toplevel.is_initial_configure_sent() {
+        };
+        if toplevel.wl_surface() == surface && !toplevel.is_initial_configure_sent() {
             toplevel.send_configure();
+            return;
+        }
+        if self.kiosk.is_some() {
+            return crate::kiosk::commit(self, surface);
+        }
+        if toplevel.wl_surface() != surface {
+            if compositor::get_parent(surface).is_some() {
+                tracing::warn!("subsurface commit; subsurfaces of the nested window are not composited");
+            }
             return;
         }
         crate::pipeline::on_toplevel_commit(self, &toplevel);
@@ -323,18 +353,26 @@ impl XdgShellHandler for Host {
             tracing::warn!("second toplevel; only one nested window is shown");
             return;
         }
-        tracing::info!("nested window created");
+        tracing::info!(kiosk = self.kiosk.is_some(), "window created");
         self.initial_configure_repeated = false;
         self.pipeline.nested_window_changed();
-        configure_fullscreen(&surface, &self.output, self.layout);
+        configure_fullscreen(&surface, &self.output, self.logical_size());
         self.output.enter(surface.wl_surface());
         let scale = self.layout.scale;
         with_states(surface.wl_surface(), |states| {
             compositor::send_surface_state(surface.wl_surface(), states, scale.ceil() as i32, Transform::Normal);
         });
+        if let Some(kiosk) = self.kiosk.as_mut() {
+            kiosk.window = Some(smithay::desktop::Window::new_wayland_window(surface.clone()));
+        }
         // The nested compositor's socket is up by the time it shows a
         // window; connect for its output scale.
-        if let Some(pid) = surface.wl_surface().client().and_then(|c| c.get_credentials(&self.display).ok()).map(|c| c.pid)
+        if let Some(pid) = surface
+            .wl_surface()
+            .client()
+            .and_then(|c| c.get_credentials(&self.display).ok())
+            .map(|c| c.pid)
+            .filter(|_| self.kiosk.is_none())
         {
             match crate::outputs::Outputs::connect(self, pid) {
                 Ok(()) => {
@@ -359,20 +397,37 @@ impl XdgShellHandler for Host {
         self.toplevel = Some(surface);
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        tracing::warn!("popup on the host; ignored");
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let Some(kiosk) = self.kiosk.as_mut() else {
+            tracing::warn!("popup on the host; ignored");
+            return;
+        };
+        surface.with_pending_state(|state| state.geometry = positioner.get_geometry());
+        tracing::debug!(geometry = ?positioner.get_geometry(), "popup");
+        if let Err(err) = kiosk.popups.track_popup(smithay::desktop::PopupKind::from(surface)) {
+            tracing::warn!(?err, "tracking a popup");
+        }
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
 
-    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {}
+    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+    }
 
     fn fullscreen_request(&mut self, _surface: ToplevelSurface, _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {}
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if self.toplevel.as_ref() == Some(&surface) {
-            tracing::info!("nested window destroyed");
+            tracing::info!("window destroyed");
             self.toplevel = None;
+            if let Some(k) = self.kiosk.as_mut() {
+                k.window = None;
+            }
             // A restarted desktop gets connections of its own.
             self.outputs = None;
             self.clipboard = None;
@@ -431,6 +486,20 @@ impl FractionalScaleHandler for Host {
     }
 }
 
+impl smithay::wayland::selection::SelectionHandler for Host {
+    type SelectionUserData = ();
+}
+
+impl smithay::wayland::selection::data_device::DataDeviceHandler for Host {
+    fn data_device_state(&self) -> &smithay::wayland::selection::data_device::DataDeviceState {
+        &self.data_device
+    }
+}
+
+impl smithay::wayland::selection::data_device::ClientDndGrabHandler for Host {}
+impl smithay::wayland::selection::data_device::ServerDndGrabHandler for Host {}
+
+smithay::delegate_data_device!(Host);
 delegate_compositor!(Host);
 delegate_shm!(Host);
 delegate_dmabuf!(Host);
