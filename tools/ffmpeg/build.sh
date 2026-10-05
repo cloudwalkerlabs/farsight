@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the small, static FFmpeg (and dav1d) that release builds link:
 # libavcodec and libavutil with only the codecs and hardware APIs farsight
-# uses, LGPL only (never --enable-gpl or --enable-nonfree).
+# uses, LGPL only (never --enable-gpl or --enable-nonfree). On Linux, also
+# a static libxkbcommon for the server.
 #
 #   tools/ffmpeg/build.sh PREFIX
 #
@@ -14,6 +15,7 @@ set -euo pipefail
 
 FFMPEG_VERSION=9.0.2
 DAV1D_VERSION=1.5.4
+XKBCOMMON_VERSION=1.13.2
 
 prefix=${1:?usage: build.sh PREFIX}
 mkdir -p "$prefix"
@@ -120,11 +122,22 @@ if [ "$os" = linux ]; then
     # FFmpeg too (crates/va/src/dlopen.c).
     sed -i -E 's/ -l(va-drm|va|drm)\b//g' "$prefix"/lib/pkgconfig/libav*.pc
     grep -H '^Libs' "$prefix"/lib/pkgconfig/libav*.pc
+
+    # The keymaps and compose tables stay the system's.
+    curl -fsSL "https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-$XKBCOMMON_VERSION.tar.gz" | tar xz
+    meson setup xkbcommon-build "libxkbcommon-xkbcommon-$XKBCOMMON_VERSION" \
+        --prefix="$prefix" --libdir=lib --buildtype=release \
+        -Ddefault_library=static -Denable-tools=false -Denable-docs=false \
+        -Denable-x11=false -Denable-wayland=false -Denable-xkbregistry=false -Denable-bash-completion=false \
+        -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale \
+        -Dxkb-config-extra-path=/etc/xkb
+    ninja -C xkbcommon-build install
 fi
 
 mkdir -p "$prefix/notice"
 cp "ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$prefix/notice/"
 cp "dav1d-$DAV1D_VERSION/COPYING" "$prefix/notice/COPYING.dav1d"
+[ "$os" = linux ] && cp "libxkbcommon-xkbcommon-$XKBCOMMON_VERSION/LICENSE" "$prefix/notice/COPYING.xkbcommon"
 cat >"$prefix/notice/FFMPEG.txt" <<EOF
 farsight links FFmpeg $FFMPEG_VERSION (https://ffmpeg.org) statically,
 under the GNU Lesser General Public License 2.1 (COPYING.LGPLv2.1), and

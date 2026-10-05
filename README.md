@@ -69,11 +69,12 @@ cancelled, while an app in the session records from `farsight-mic`.
 The server encodes with VA-API or NVENC, and sends tiles without either;
 the client decodes with VA-API or in software. Both build against FFmpeg
 (the system's, or the small static one `tools/ffmpeg/build.sh` builds, as
-releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`), and build
-libjpeg-turbo and libopus in; the server also needs dbus-daemon, PipeWire, WirePlumber and
-pipewire-pulse, and labwc for the default desktop. To keep a session
-running permanently, install `dist/farsight-server@.service`; the file
-explains how.
+releases do: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`, which also has a
+static libxkbcommon) and libva's and libdrm's headers, and build
+libjpeg-turbo and libopus in; the server also needs dbus-daemon, PipeWire,
+WirePlumber and pipewire-pulse, and labwc for the default desktop. To keep
+a session running permanently, install `dist/farsight-server@.service`; the
+file explains how.
 
 The Android build runs `cargo ndk` itself and generates the Kotlin bindings,
 so there is no separate Rust step. In the app, "This device's key" gives
