@@ -51,8 +51,8 @@ impl Media {
         self.audio.stop();
     }
 
-    pub fn set_mic(&self, on: bool) -> anyhow::Result<()> {
-        self.audio.set_mic(on)
+    pub fn set_mic(&self, on: bool, echo_cancel: bool) -> anyhow::Result<()> {
+        self.audio.set_mic(on, echo_cancel)
     }
 
     pub fn stats(&self) -> MediaStats {

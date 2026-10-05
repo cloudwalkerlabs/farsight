@@ -96,6 +96,8 @@ class SessionController(
     private var composing = ""
     private var lastClip: String? = null
     private var micDemand = false
+    /** The user allowed the microphone once: it is the session's until it ends. */
+    private var micAllowed = false
 
     val running: Boolean get() = session != null
 
@@ -133,6 +135,7 @@ class SessionController(
         session = null
         micDemand = false
         micAsked = false
+        micAllowed = false
     }
 
     fun setLayout(layout: ScreenLayout) {
@@ -272,31 +275,34 @@ class SessionController(
     /** The user answered the session's request for the microphone. */
     fun answerMic(allow: Boolean) {
         micAsked = false
+        micAllowed = allow
         if (allow && micDemand) requestMicPermission { granted -> if (granted && micDemand) startMic() }
     }
 
     private fun startMic() {
         val audio = context.getSystemService(AudioManager::class.java)
-        // The platform's echo canceller works in communication mode, which
-        // plays through the earpiece unless told otherwise: a desktop on a
-        // phone wants the speaker, if nothing is plugged in.
-        audio.mode = AudioManager.MODE_IN_COMMUNICATION
-        if (Build.VERSION.SDK_INT >= 31) {
-            val devices = audio.availableCommunicationDevices
-            val headset = devices.firstOrNull {
-                it.type in setOf(
-                    AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET,
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET,
-                )
+        if (server.echoCancel) {
+            // The platform's echo canceller works in communication mode,
+            // which plays through the earpiece unless told otherwise: a
+            // desktop on a phone wants the speaker, if nothing is plugged in.
+            audio.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= 31) {
+                val devices = audio.availableCommunicationDevices
+                val headset = devices.firstOrNull {
+                    it.type in setOf(
+                        AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET,
+                        AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET,
+                    )
+                }
+                val target = headset ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                target?.let { audio.setCommunicationDevice(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                audio.isSpeakerphoneOn = true
             }
-            val target = headset ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-            target?.let { audio.setCommunicationDevice(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audio.isSpeakerphoneOn = true
         }
         try {
-            session?.setMic(true)
+            session?.setMic(true, server.echoCancel)
             micOn = true
         } catch (e: Exception) {
             Log.w("farsight", "microphone: $e")
@@ -307,7 +313,7 @@ class SessionController(
     fun stopMic() {
         if (!micOn) return
         try {
-            session?.setMic(false)
+            session?.setMic(false, false)
         } catch (_: Exception) {
         }
         micOn = false
@@ -377,7 +383,7 @@ class SessionController(
         }
         when (server.mic) {
             MicPolicy.NEVER -> {}
-            MicPolicy.ASK -> micAsked = true
+            MicPolicy.ASK -> if (micAllowed) answerMic(true) else micAsked = true
             MicPolicy.ALWAYS -> answerMic(true)
         }
     }

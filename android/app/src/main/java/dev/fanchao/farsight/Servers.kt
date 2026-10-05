@@ -27,6 +27,8 @@ data class Server(
     val motion: Boolean = false,
     val audio: Boolean = true,
     val mic: MicPolicy = MicPolicy.ASK,
+    /** Cancel the session's audio out of the microphone; off for headphones. */
+    val echoCancel: Boolean = true,
     val viewOnly: Boolean = false,
     /** When it was last connected to, in ms; 0 if never. */
     val lastUsed: Long = 0,
@@ -53,6 +55,7 @@ data class Server(
         .put("motion", motion)
         .put("audio", audio)
         .put("mic", mic.name)
+        .put("echoCancel", echoCancel)
         .put("viewOnly", viewOnly)
         .put("lastUsed", lastUsed)
 
@@ -68,6 +71,7 @@ data class Server(
             motion = o.optBoolean("motion"),
             audio = o.optBoolean("audio", true),
             mic = runCatching { MicPolicy.valueOf(o.optString("mic")) }.getOrDefault(MicPolicy.ASK),
+            echoCancel = o.optBoolean("echoCancel", true),
             viewOnly = o.optBoolean("viewOnly"),
             lastUsed = o.optLong("lastUsed"),
         )

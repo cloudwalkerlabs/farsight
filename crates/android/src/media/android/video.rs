@@ -365,7 +365,7 @@ impl State {
                 self.feed();
             }
             CodecEvent::Output { index, pts_us } => {
-                if let Err(err) = v.codec.render(index) {
+                if let Err(err) = v.codec.render(index, monotonic_ns()) {
                     tracing::warn!("rendering a frame: {err:#}");
                 }
                 self.failures = 0;

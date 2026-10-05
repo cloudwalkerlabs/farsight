@@ -332,9 +332,10 @@ impl Session {
     }
 
     /// Opens or closes the microphone, while the session wants it. The
-    /// app holds RECORD_AUDIO and has put the device in communication mode.
-    pub fn set_mic(&self, on: bool) -> Result<(), FarsightError> {
-        Ok(self.inner.media.set_mic(on)?)
+    /// app holds RECORD_AUDIO, and with `echo_cancel` has put the device in
+    /// communication mode; without it (headphones), nothing is cancelled.
+    pub fn set_mic(&self, on: bool, echo_cancel: bool) -> Result<(), FarsightError> {
+        Ok(self.inner.media.set_mic(on, echo_cancel)?)
     }
 
     /// Ends the session here; it lives on at the server.
@@ -424,7 +425,7 @@ impl Inner {
             Event::TextInput(active) => self.listener.text_input(active),
             Event::MicDemand(on) => {
                 if !on {
-                    let _ = self.media.set_mic(false);
+                    let _ = self.media.set_mic(false, false);
                 }
                 self.listener.mic_demand(on);
             }
@@ -530,11 +531,13 @@ async fn report(inner: Arc<Inner>) {
         let Some(client) = inner.client() else { continue };
         let core = client.stats();
         let media = inner.media.stats();
-        let audio_ms = client
-            .audio_stats()
-            .and_then(|mut s| {
-                s.latency_us.sort_unstable();
-                s.latency_us.get(s.latency_us.len() / 2).copied()
+        let audio = client.audio_stats();
+        let audio_ms = audio
+            .as_ref()
+            .and_then(|s| {
+                let mut l = s.latency_us.clone();
+                l.sort_unstable();
+                l.get(l.len() / 2).copied()
             })
             .map_or(0.0, |us| us as f32 / 1000.0);
         let stats = SessionStats {
@@ -549,7 +552,7 @@ async fn report(inner: Arc<Inner>) {
             mic_on: media.mic_on,
         };
         n += 1;
-        if n % 5 == 0 {
+        if n.is_multiple_of(5) {
             tracing::info!(
                 "latency ms: network {:.1} decode {:.1} total {:.1}; fps {:.0}; rtt {:.1}; lost {}; audio {:.1}; {}",
                 stats.network_ms,
@@ -561,6 +564,18 @@ async fn report(inner: Arc<Inner>) {
                 stats.audio_ms,
                 stats.encoding
             );
+            if let Some(a) = audio.filter(|a| !a.latency_us.is_empty() || a.underruns > 0) {
+                tracing::info!(
+                    "audio: buffer {:.1} ms (target {:.1}); output {:.1} ms; concealed {} (late {}) underruns {} skipped {}",
+                    a.buffered_us as f64 / 1000.0,
+                    a.target_us as f64 / 1000.0,
+                    a.output_delay_us as f64 / 1000.0,
+                    a.concealed,
+                    a.late,
+                    a.underruns,
+                    a.skipped
+                );
+            }
         }
         inner.listener.stats(stats);
     }

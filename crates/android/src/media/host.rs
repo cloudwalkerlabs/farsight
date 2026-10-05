@@ -28,7 +28,7 @@ impl Media {
 
     pub fn stop_audio(&self) {}
 
-    pub fn set_mic(&self, on: bool) -> anyhow::Result<()> {
+    pub fn set_mic(&self, on: bool, _echo_cancel: bool) -> anyhow::Result<()> {
         anyhow::ensure!(!on, "no microphone here");
         Ok(())
     }

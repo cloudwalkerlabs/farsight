@@ -128,10 +128,12 @@ impl Codec {
         check(unsafe { ffi::AMediaCodec_queueInputBuffer(self.ptr.as_ptr(), index, 0, data.len(), pts_us, flags) })
     }
 
-    /// Sends output buffer `index` to the display.
-    pub fn render(&self, index: usize) -> anyhow::Result<()> {
+    /// Sends output buffer `index` to the display, at once: with no time
+    /// given, the surface would take the frame's timestamp as when to show
+    /// it.
+    pub fn render(&self, index: usize, now_ns: i64) -> anyhow::Result<()> {
         // SAFETY: an output buffer the codec handed us.
-        check(unsafe { ffi::AMediaCodec_releaseOutputBuffer(self.ptr.as_ptr(), index, true) })
+        check(unsafe { ffi::AMediaCodec_releaseOutputBufferAtTime(self.ptr.as_ptr(), index, now_ns) })
     }
 
     /// Goes on drawing into another surface.

@@ -5,8 +5,10 @@
 //! Echo cancellation is the platform's: the microphone opens with the
 //! `VOICE_COMMUNICATION` preset, and while it is open the output plays as
 //! voice communication too, with the app in communication mode (Kotlin's
-//! part), so the device's canceller has the far end it needs. Without the
-//! microphone, the output plays as media, in low-latency mode.
+//! part), so the device's canceller has the far end it needs. With echo
+//! cancellation off (headphones), the microphone opens for voice
+//! recognition, which processes nothing, and the output stays media.
+//! Without the microphone, the output plays as media, in low-latency mode.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,9 @@ struct State {
     config: Option<AudioConfig>,
     output: Option<Stream>,
     mic: Option<Stream>,
+    /// The microphone is open with echo cancellation: the output plays as
+    /// voice.
+    voice: bool,
 }
 
 /// An open stream; closed when dropped.
@@ -55,7 +60,7 @@ impl Audio {
     pub fn start(&self, config: AudioConfig) {
         let mut s = self.state.lock().unwrap();
         s.config = Some(config);
-        let voice = s.mic.is_some();
+        let voice = s.voice;
         s.output = None;
         match open_output(&self.client, config, voice) {
             Ok(stream) => s.output = Some(Stream(stream)),
@@ -81,17 +86,18 @@ impl Audio {
 
     /// Opens or closes the microphone; the output follows, as voice or as
     /// media.
-    pub fn set_mic(&self, on: bool) -> anyhow::Result<()> {
+    pub fn set_mic(&self, on: bool, echo_cancel: bool) -> anyhow::Result<()> {
         let mut s = self.state.lock().unwrap();
-        if s.mic.is_some() == on {
+        if s.mic.is_some() == on && (!on || s.voice == echo_cancel) {
             return Ok(());
         }
         // Close first: the output's usage changes with it.
         s.output = None;
         s.mic = None;
-        let result = if on { open_mic(&self.client).map(|m| s.mic = Some(Stream(m))) } else { Ok(()) };
+        let result = if on { open_mic(&self.client, echo_cancel).map(|m| s.mic = Some(Stream(m))) } else { Ok(()) };
+        s.voice = s.mic.is_some() && echo_cancel;
         if let Some(config) = s.config {
-            let voice = s.mic.is_some();
+            let voice = s.voice;
             match open_output(&self.client, config, voice) {
                 Ok(stream) => s.output = Some(Stream(stream)),
                 Err(err) => tracing::warn!("{err:#}"),
@@ -151,6 +157,11 @@ fn open_output(client: &ClientSlot, config: AudioConfig, voice: bool) -> anyhow:
         .error_callback(Box::new(|_, err| tracing::warn!(?err, "audio output")))
         .open_stream()
         .context("opening the audio output")?;
+    // AAudio buffers far more than it needs; two bursts is what low-latency
+    // players keep, and the jitter buffer covers the network.
+    if !voice {
+        let _ = stream.set_buffer_size_in_frames(2 * stream.frames_per_burst());
+    }
     stream.request_start().context("starting the audio output")?;
     tracing::info!(
         voice,
@@ -170,7 +181,7 @@ struct Piece {
     samples: [f32; PIECE],
 }
 
-fn open_mic(client: &ClientSlot) -> anyhow::Result<AudioStream> {
+fn open_mic(client: &ClientSlot, echo_cancel: bool) -> anyhow::Result<AudioStream> {
     let (mut producer, consumer) = rtrb::RingBuffer::<Piece>::new(PIECES);
     let rate = MIC.sample_rate as i64;
     let slot = client.clone();
@@ -205,7 +216,7 @@ fn open_mic(client: &ClientSlot) -> anyhow::Result<AudioStream> {
         .format(AudioFormat::PCM_Float)
         .channel_count(1)
         .sample_rate(MIC.sample_rate as i32)
-        .input_preset(AudioInputPreset::VoiceCommunication)
+        .input_preset(if echo_cancel { AudioInputPreset::VoiceCommunication } else { AudioInputPreset::VoiceRecognition })
         .data_callback(Box::new(callback))
         .error_callback(Box::new(|_, err| tracing::warn!(?err, "microphone")))
         .open_stream()
@@ -213,7 +224,7 @@ fn open_mic(client: &ClientSlot) -> anyhow::Result<AudioStream> {
     stream.request_start().context("starting the microphone")?;
     let worker = client.clone();
     std::thread::Builder::new().name("farsight-mic".into()).spawn(move || send(consumer, worker))?;
-    tracing::info!(burst = stream.frames_per_burst(), mode = ?stream.performance_mode(), "microphone open");
+    tracing::info!(echo_cancel, burst = stream.frames_per_burst(), mode = ?stream.performance_mode(), "microphone open");
     Ok(stream)
 }
 

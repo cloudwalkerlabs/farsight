@@ -189,6 +189,7 @@ private fun EditServer(server: Server, onDismiss: () -> Unit, onSave: (Server) -
                 Choice("Microphone", MicPolicy.entries, s.mic, { it.name.lowercase().replaceFirstChar(Char::uppercase) }) {
                     s = s.copy(mic = it)
                 }
+                Toggle("Echo cancellation (off with headphones)", s.echoCancel) { s = s.copy(echoCancel = it) }
                 Toggle("Sound", s.audio) { s = s.copy(audio = it) }
                 Toggle("Prefer motion to sharp text", s.motion) { s = s.copy(motion = it) }
                 Toggle("Watch only", s.viewOnly) { s = s.copy(viewOnly = it) }

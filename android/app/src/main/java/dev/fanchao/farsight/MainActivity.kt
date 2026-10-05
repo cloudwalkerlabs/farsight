@@ -105,13 +105,20 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent) {
         val address = intent.getStringExtra("address") ?: return
-        val existing = list.firstOrNull { it.address == address }
+        val existing = list.firstOrNull { it.address == address }?.let {
+            // Tests may change these on a server already known.
+            it.copy(
+                echoCancel = intent.getBooleanExtra("echo_cancel", it.echoCancel),
+                mic = runCatching { MicPolicy.valueOf(intent.getStringExtra("mic") ?: "") }.getOrDefault(it.mic),
+            ).also { s -> list = servers.put(s) }
+        }
         val server = existing ?: Server(
             address = address,
             plain = intent.getBooleanExtra("plain", false),
             inputMode = if (intent.getStringExtra("mode") == "direct") InputMode.DIRECT else InputMode.TOUCHPAD,
             mic = runCatching { MicPolicy.valueOf(intent.getStringExtra("mic") ?: "") }.getOrDefault(MicPolicy.ASK),
             scalePercent = intent.getIntExtra("scale", 0),
+            echoCancel = intent.getBooleanExtra("echo_cancel", true),
         ).also { list = servers.put(it) }
         if (controller?.server?.id != server.id) {
             leave()
