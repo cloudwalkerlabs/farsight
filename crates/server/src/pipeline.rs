@@ -16,6 +16,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -52,6 +54,48 @@ struct Hold {
     scale: f64,
     since: Instant,
     confirmed: bool,
+}
+
+/// How long the picture must stay still before it is refined.
+const IDLE: Duration = Duration::from_millis(250);
+
+struct Idle {
+    last_change: Instant,
+    /// The picture since the last change has been refined (or needs none).
+    refined: bool,
+    /// The idle timer is armed.
+    timer: bool,
+}
+
+/// Notes that a new picture went out, and arms the idle timer.
+fn changed(host: &mut Host) {
+    let p = &mut host.pipeline;
+    p.idle.last_change = Instant::now();
+    p.idle.refined = p.opts.refine_qp >= p.opts.qp && !matches!(p.frames, Some((_, Encoding::Tiles)));
+    if !p.idle.timer && !p.idle.refined {
+        p.idle.timer = true;
+        let _ = host.loop_handle.insert_source(Timer::from_duration(IDLE), |_, _, host| idle_tick(host));
+    }
+}
+
+fn idle_tick(host: &mut Host) -> TimeoutAction {
+    let p = &mut host.pipeline;
+    if p.idle.refined || p.client.is_none() {
+        p.idle.timer = false;
+        return TimeoutAction::Drop;
+    }
+    let still = p.idle.last_change.elapsed();
+    if still < IDLE {
+        return TimeoutAction::ToDuration(IDLE - still);
+    }
+    if p.in_flight.load(Ordering::Acquire) > 0 {
+        return TimeoutAction::ToDuration(Duration::from_millis(10));
+    }
+    p.idle.timer = false;
+    p.idle.refined = true;
+    tracing::debug!("idle: refining");
+    encode_current(host, true);
+    TimeoutAction::Drop
 }
 
 /// The longest a layout change holds frames back.
@@ -110,6 +154,8 @@ pub struct Options {
     pub qp: u32,
     /// JPEG quality for tiles.
     pub jpeg_quality: u8,
+    /// QP for idle refinement; the same as `qp` turns it off.
+    pub refine_qp: u32,
     /// Read the probe client's frame number back from each nested frame.
     pub probe: bool,
 }
@@ -133,6 +179,13 @@ pub struct Pipeline {
     mode: Mode,
     /// Frames are held across a layout change (§5).
     hold: Option<Hold>,
+    /// When the picture last changed, for idle refinement (§2).
+    idle: Idle,
+    /// Tiles sent lossy since the last refinement, from the encode thread.
+    lossy: Arc<Mutex<Vec<Rect>>>,
+    /// Jobs queued or being encoded: refinement waits for them, so it sees
+    /// every lossy tile.
+    in_flight: Arc<AtomicUsize>,
     /// To the encode thread; `None` only while shutting down.
     jobs: Option<SyncSender<Job>>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
@@ -160,7 +213,7 @@ struct EncodeJob {
     input: Input,
     sync: SyncPoint,
     client: Option<ConnId>,
-    force_keyframe: bool,
+    kind: FrameKind,
     epoch: u16,
     n: u64,
     probe: Option<u32>,
@@ -184,9 +237,13 @@ impl Pipeline {
             None => None,
         };
         let (jobs, rx) = mpsc::sync_channel(ENCODE_QUEUE);
+        let lossy: Arc<Mutex<Vec<Rect>>> = Arc::default();
+        let thread_lossy = lossy.clone();
+        let in_flight: Arc<AtomicUsize> = Arc::default();
+        let thread_in_flight = in_flight.clone();
         let thread = std::thread::Builder::new()
             .name("farsight-encode".into())
-            .spawn(move || encode_thread(rx, out, start, net))?;
+            .spawn(move || encode_thread(rx, out, start, net, thread_lossy, thread_in_flight))?;
         Ok(Self {
             opts,
             encoders,
@@ -197,6 +254,9 @@ impl Pipeline {
             last_commit: None,
             mode: Mode::default(),
             hold: None,
+            idle: Idle { last_change: Instant::now(), refined: true, timer: false },
+            lossy,
+            in_flight,
             jobs: Some(jobs),
             encode_thread: Some(thread),
             last_buffer: None,
@@ -301,7 +361,7 @@ pub fn on_toplevel_commit(host: &mut Host, toplevel: &ToplevelSurface) {
 
     if host.pipeline.encoding()
         && release_hold(host, (size.w, size.h))
-        && let Err(err) = convert_and_encode(host, &texture, t_commit)
+        && let Err(err) = convert_and_encode(host, &texture, t_commit, false)
     {
         tracing::error!("{err:#}");
     }
@@ -328,7 +388,7 @@ fn collect_damage(host: &mut Host, surface: &WlSurface) {
 /// idle.
 pub fn refresh(host: &mut Host) {
     host.pipeline.force_keyframe = true;
-    encode_current(host);
+    encode_current(host, false);
 }
 
 /// Tiles: sends `rects` again, which the client lost.
@@ -337,11 +397,11 @@ pub fn repaint(host: &mut Host, rects: &[Rect]) {
         return;
     }
     host.pipeline.damage.extend_from_slice(rects);
-    encode_current(host);
+    encode_current(host, false);
 }
 
-/// Encodes the nested window's current buffer.
-fn encode_current(host: &mut Host) {
+/// Encodes the nested window's current buffer, or refines it.
+fn encode_current(host: &mut Host, refine: bool) {
     if host.pipeline.hold.is_some() {
         return; // the frame after the hold starts a new epoch anyway
     }
@@ -352,7 +412,7 @@ fn encode_current(host: &mut Host) {
         return;
     };
     let t = host.now_us();
-    if let Err(err) = convert_and_encode(host, &texture, t) {
+    if let Err(err) = convert_and_encode(host, &texture, t, refine) {
         tracing::error!("{err:#}");
     }
 }
@@ -412,7 +472,8 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
     let mut opened = None;
     for c in fits.iter().chain(p.choices.first()) {
         let info = &p.encoders[c.encoder];
-        match encode::open(info, &p.opts.render_node, &mut host.renderer, w, h, &Settings { qp: p.opts.qp }) {
+        let settings = Settings { qp: p.opts.qp, refine_qp: p.opts.refine_qp };
+        match encode::open(info, &p.opts.render_node, &mut host.renderer, w, h, &settings) {
             Ok(pair) => {
                 opened = Some((pair, c.format));
                 break;
@@ -428,6 +489,7 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
     let jobs = p.jobs.as_ref().expect("pipeline running");
     jobs.send(Job::Start(encoder)).map_err(|_| anyhow::anyhow!("encode thread gone"))?;
     p.frames = Some((frames, encoding));
+    p.lossy.lock().unwrap().clear();
     p.epoch = p.epoch.wrapping_add(1);
     p.force_keyframe = true;
     tracing::info!(epoch = p.epoch, w, h, %encoding, "new video epoch");
@@ -438,7 +500,7 @@ fn new_epoch(host: &mut Host, w: i32, h: i32) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> anyhow::Result<()> {
+fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, refine: bool) -> anyhow::Result<()> {
     let size = texture.size();
     let (w, h) = (size.w, size.h);
     let start = host.start;
@@ -458,20 +520,33 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> 
 
     let p = &mut host.pipeline;
     let (frames, encoding) = p.frames.as_mut().unwrap();
-    // Tiles send the damage, or everything for a "keyframe".
-    let damage = match *encoding {
-        Encoding::Tiles if p.force_keyframe => vec![Rect::new(0, 0, w as u16, h as u16)],
-        Encoding::Tiles => encode::tiles::align(&p.damage, w, h),
-        Encoding::Video(_) => Vec::new(),
+    let kind = match (p.force_keyframe, refine) {
+        (true, _) => FrameKind::Keyframe,
+        (false, true) => FrameKind::Refine,
+        (false, false) => FrameKind::Normal,
     };
-    p.damage.clear();
+    // Tiles send the damage, everything for a "keyframe", or what went
+    // lossy for a refinement.
+    let damage = match (*encoding, kind) {
+        (Encoding::Tiles, FrameKind::Keyframe) => vec![Rect::new(0, 0, w as u16, h as u16)],
+        (Encoding::Tiles, FrameKind::Refine) => {
+            encode::tiles::align(&std::mem::take(&mut *p.lossy.lock().unwrap()), w, h)
+        }
+        (Encoding::Tiles, FrameKind::Normal) => encode::tiles::align(&p.damage, w, h),
+        (Encoding::Video(_), _) => Vec::new(),
+    };
+    if kind != FrameKind::Refine {
+        p.damage.clear();
+    } else {
+        tracing::debug!(regions = damage.len(), "refinement");
+    }
     if *encoding == Encoding::Tiles && damage.is_empty() {
         return Ok(());
     }
     let tile_options = farsight_tiles::Options {
         quality: p.opts.jpeg_quality,
         chroma444: p.mode == Mode::Text,
-        lossless: false,
+        lossless: kind == FrameKind::Refine,
     };
     let t_surface = now();
     let (input, sync) = frames.convert(&mut host.renderer, p.shaders.as_ref().unwrap(), texture, &damage, tile_options)?;
@@ -481,7 +556,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> 
         input,
         sync,
         client: p.client,
-        force_keyframe: p.force_keyframe,
+        kind,
         epoch: p.epoch,
         n: p.frame_count,
         probe,
@@ -490,12 +565,22 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64) -> 
         t_probe,
         t_surface,
     };
+    p.in_flight.fetch_add(1, Ordering::AcqRel);
     match p.send(Job::Encode(Box::new(job))) {
-        Ok(()) => p.force_keyframe = false,
+        Ok(()) => {
+            p.force_keyframe = false;
+            if kind != FrameKind::Refine {
+                changed(host);
+            }
+        }
         Err(TrySendError::Full(_)) => {
+            p.in_flight.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!("encoder busy; frame dropped");
             // Tiles must still send what changed.
-            p.damage.extend_from_slice(&damage);
+            match kind {
+                FrameKind::Refine => p.lossy.lock().unwrap().extend_from_slice(&damage),
+                _ => p.damage.extend_from_slice(&damage),
+            }
         }
         Err(TrySendError::Disconnected(_)) => anyhow::bail!("encode thread gone"),
     }
@@ -545,7 +630,14 @@ fn send_frame_callbacks(host: &mut Host) {
     let _ = host.display.flush_clients();
 }
 
-fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant, net: UnboundedSender<ToNet>) {
+fn encode_thread(
+    rx: mpsc::Receiver<Job>,
+    mut out: Option<File>,
+    start: Instant,
+    net: UnboundedSender<ToNet>,
+    lossy: Arc<Mutex<Vec<Rect>>>,
+    in_flight: Arc<AtomicUsize>,
+) {
     let now = || start.elapsed().as_micros() as u64;
     let mut codec = None;
     for job in rx {
@@ -556,11 +648,19 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
             }
             Job::Encode(job) => job,
         };
+        // Counts the job done however this iteration ends.
+        struct Done<'a>(&'a AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _done = Done(&in_flight);
         let Some(codec) = codec.as_mut() else { continue };
         // The conversion pass must have finished writing the surface.
         let _ = job.sync.wait();
         let t_converted = now();
-        let kind = if job.force_keyframe { FrameKind::Keyframe } else { FrameKind::Normal };
+        let kind = job.kind;
         let output = match codec.encode(job.input, job.t_commit as i64, kind) {
             Ok(o) => o,
             Err(err) => {
@@ -585,13 +685,14 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
                 }
                 (bytes, keyframe)
             }
-            Output::Tiles(update) => {
+            Output::Tiles(mut update) => {
                 let bytes = update.bodies.iter().map(Vec::len).sum();
+                lossy.lock().unwrap().append(&mut update.lossy);
                 if let Some(client) = job.client {
                     let tiles = net::Tiles { update, epoch: job.epoch, capture_us: job.t_commit, encode_us };
                     let _ = net.send(ToNet::Tiles(client, tiles));
                 }
-                (bytes, job.force_keyframe)
+                (bytes, kind == FrameKind::Keyframe)
             }
         };
 
@@ -610,6 +711,7 @@ fn encode_thread(rx: mpsc::Receiver<Job>, mut out: Option<File>, start: Instant,
             total_us = t_encoded - job.t_commit,
             bytes,
             keyframe,
+            refine = kind == FrameKind::Refine,
             "frame"
         );
     }

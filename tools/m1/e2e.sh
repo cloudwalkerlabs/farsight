@@ -16,7 +16,9 @@
 # Needs: cargo build --release -p farsight-server -p farsight-desktop
 #        (cd tools/m1/wltool && cargo build --release)
 #        labwc, es2gears_wayland, alacritty, python3 with Pillow (input only)
-# CLIENT_ARGS and SERVER_ARGS are passed on, e.g. CLIENT_ARGS="--codec h264".
+# CLIENT_ARGS and SERVER_ARGS are passed on, e.g. CLIENT_ARGS="--codec h264";
+# SESSION_APP replaces the scenario's app in the session; SERVER_LOG is the
+# server's RUST_LOG.
 set -e
 OUT=$(mkdir -p "$1" && cd "$1" && pwd); SCENARIO=${2:-gears}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -57,9 +59,10 @@ case $SCENARIO in
 		RATE=20 ;;
 	*) echo "unknown scenario $SCENARIO" >&2; exit 1 ;;
 esac
+APP=${SESSION_APP:-$APP}
 
 rm -f "$OUT/ctl"; mkfifo "$OUT/ctl"
-env -u DISPLAY RUST_LOG=info,smithay=warn setsid "$BIN/farsight-server" --port $PORT $SERVER_ARGS \
+env -u DISPLAY RUST_LOG=${SERVER_LOG:-info,smithay=warn} setsid "$BIN/farsight-server" --port $PORT $SERVER_ARGS \
 	--identity "$OUT/identity" --rate $RATE -- labwc -C "$OUT/cfg" -s "$APP" \
 	> "$OUT/server.log" 2>&1 < "$OUT/ctl" &
 pids+=($!)

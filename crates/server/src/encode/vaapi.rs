@@ -65,6 +65,14 @@ impl Drop for Surface {
     }
 }
 
+/// The QP range FFmpeg's VA-API encoders map an ROI's offset onto.
+pub fn quant_range(codec: Codec) -> u32 {
+    match codec {
+        Codec::H264 | Codec::Hevc => 51,
+        Codec::Av1 => 255,
+    }
+}
+
 pub fn encoder_name(codec: Codec) -> &'static std::ffi::CStr {
     match codec {
         Codec::H264 => c"h264_vaapi",

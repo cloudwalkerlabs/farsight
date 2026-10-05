@@ -98,6 +98,9 @@ fn ffmpeg_has(name: &std::ffi::CStr) -> bool {
 pub struct Settings {
     /// Constant QP for ordinary frames (H.264's scale; AV1 scales it).
     pub qp: u32,
+    /// QP for idle refinement (§2): the picture sent again once it stops
+    /// changing.
+    pub refine_qp: u32,
 }
 
 /// How a picture in memory is laid out.
@@ -132,6 +135,9 @@ pub enum FrameKind {
     Normal,
     /// A keyframe the decoder can start from (an IDR).
     Keyframe,
+    /// The same picture again at `Settings::refine_qp`, once the screen is
+    /// idle; tiles send their lossy tiles again losslessly.
+    Refine,
 }
 
 const SHADER_HEAD: &str = r#"#version 100
@@ -233,6 +239,7 @@ pub fn open(
     match info.backend {
         Backend::Vaapi => {
             let (surfaces, codec) = vaapi::open(info, render_node, width, height, settings)?;
+            let codec = codec.with_refinement(settings.qp, settings.refine_qp, vaapi::quant_range(info.caps.format.codec));
             Ok((Frames::Va(surfaces), Encoder::Ffmpeg(codec)))
         }
         Backend::Nvenc => {

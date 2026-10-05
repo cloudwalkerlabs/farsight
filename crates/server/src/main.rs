@@ -71,6 +71,11 @@ struct Args {
     /// Constant QP for the encoder.
     #[arg(long, default_value_t = 24)]
     qp: u32,
+    /// QP for idle refinement: once the screen is still for 250 ms, it is
+    /// sent once more at this QP. Tiles send their JPEG tiles again
+    /// losslessly instead. Equal to --qp turns video refinement off.
+    #[arg(long, default_value_t = 14)]
+    refine_qp: u32,
     /// JPEG quality for tiles, when there is no hardware encoder.
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     jpeg_quality: u8,
@@ -135,6 +140,7 @@ fn main() -> anyhow::Result<()> {
             out: args.out.clone(),
             qp: args.qp,
             jpeg_quality: args.jpeg_quality,
+            refine_qp: args.refine_qp,
             probe: args.probe,
         },
         encoders,

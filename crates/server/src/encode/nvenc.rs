@@ -38,6 +38,7 @@ const PRESET_CONFIG_VER: u32 = struct_version(4) | 1 << 31;
 const PIC_PARAMS_VER: u32 = struct_version(6) | 1 << 31;
 const LOCK_BITSTREAM_VER: u32 = struct_version(1) | 1 << 31;
 const LOCK_INPUT_VER: u32 = struct_version(1);
+const RECONFIGURE_VER: u32 = struct_version(1) | 1 << 31;
 const INFINITE_GOP: u32 = 0xffff_ffff;
 
 const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
@@ -285,7 +286,10 @@ pub struct Nvenc {
     width: u32,
     height: u32,
     /// `init` points at it.
-    _config: Box<NV_ENC_CONFIG>,
+    config: Box<NV_ENC_CONFIG>,
+    /// The ordinary and refinement QPs, on this codec's scale.
+    qp: u32,
+    refine_qp: u32,
     init: Box<NV_ENC_INITIALIZE_PARAMS>,
 }
 
@@ -376,7 +380,13 @@ impl Nvenc {
             buffer_format,
             width,
             height,
-            _config: config,
+            config,
+            qp,
+            refine_qp: match format.codec {
+                Codec::Av1 => settings.refine_qp * 255 / 51,
+                _ => settings.refine_qp,
+            }
+            .min(qp),
             init,
         };
         let init_ptr: *mut NV_ENC_INITIALIZE_PARAMS = &mut *enc.init;
@@ -401,7 +411,31 @@ impl Nvenc {
         Ok(enc)
     }
 
+    /// Changes the constant QP from the next frame on, without an IDR.
+    fn set_qp(&mut self, qp: u32) -> anyhow::Result<()> {
+        self.config.rcParams.constQP = NV_ENC_QP { qpInterP: qp, qpInterB: qp, qpIntra: qp };
+        let mut params = NV_ENC_RECONFIGURE_PARAMS {
+            version: RECONFIGURE_VER,
+            reInitEncodeParams: *self.init,
+            ..Default::default()
+        };
+        params.reInitEncodeParams.encodeConfig = &mut *self.config;
+        let (api, encoder) = (self.session.api, self.session.encoder);
+        // SAFETY: a reconfigure of our session with its own parameters.
+        self.session.with(|| unsafe { check(nv!(api, nvEncReconfigureEncoder(encoder, &mut params)), "changing the QP") })
+    }
+
     pub fn encode(&mut self, frame: MemFrame, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+        if kind != FrameKind::Refine || self.refine_qp == self.qp {
+            return self.encode_frame(frame, pts_us, kind, out);
+        }
+        self.set_qp(self.refine_qp)?;
+        let result = self.encode_frame(frame, pts_us, kind, out);
+        self.set_qp(self.qp)?;
+        result
+    }
+
+    fn encode_frame(&mut self, frame: MemFrame, pts_us: i64, kind: FrameKind, out: &mut Vec<u8>) -> anyhow::Result<bool> {
         let api = self.session.api;
         let encoder = self.session.encoder;
         let (input, output) = (self.input, self.output);
