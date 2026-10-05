@@ -23,6 +23,7 @@ glutin = "0.32"
 glutin-winit = "0.5"
 libc = "0.2"
 raw-window-handle = "0.6"
+smithay-clipboard = "0.7"
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

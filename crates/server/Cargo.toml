@@ -27,6 +27,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 pipewire = "0.10"
 opus = "0.4.0"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [build-dependencies]
 bindgen = "0.72"

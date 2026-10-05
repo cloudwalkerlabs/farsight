@@ -13,6 +13,7 @@
 //! matches, the last one is stretched to the window.
 
 mod audio;
+mod clipboard;
 mod cursor;
 mod decode;
 mod render;
@@ -80,6 +81,9 @@ struct Args {
     /// Don't play the session's audio; the server doesn't send it.
     #[arg(long)]
     no_audio: bool,
+    /// Don't pass the desktop's input method (IME) through; keys only.
+    #[arg(long)]
+    no_ime: bool,
     /// Watch only, next to whoever controls the session, instead of taking
     /// it over. Input and the window's size aren't sent.
     #[arg(long)]
@@ -151,6 +155,8 @@ enum UserEvent {
     Failed { error: String, refused: bool },
     Net(Event),
     Decoded(Decoded),
+    /// Text from the session's clipboard.
+    ClipboardText(String),
 }
 
 struct Decoded {
@@ -165,11 +171,13 @@ struct Decoded {
     sample: bool,
 }
 
+/// Dropped in this order: GL objects, then the surface and context, then
+/// the window they draw into.
 struct Gfx {
-    window: Window,
+    renderer: Renderer,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    renderer: Renderer,
+    window: Window,
 }
 
 struct App {
@@ -201,6 +209,7 @@ struct App {
     /// Audio announced before the connection was ready.
     audio_pending: Option<farsight_proto::audio::AudioConfig>,
     audio: Option<audio::Output>,
+    clipboard: Option<clipboard::Clipboard>,
     /// The connection was lost; connect again at this time.
     reconnect_at: Option<Instant>,
     /// Failed attempts since the connection was lost; `None` while
@@ -259,6 +268,7 @@ fn main() -> anyhow::Result<()> {
         layout_pending: None,
         audio_pending: None,
         audio: None,
+        clipboard: None,
         reconnect_at: None,
         reconnects: None,
     };
@@ -301,8 +311,8 @@ impl App {
         let raw = window.window_handle()?.as_raw();
         let ctx_attrs =
             ContextAttributesBuilder::new().with_context_api(ContextApi::Gles(Some(Version::new(3, 0)))).build(Some(raw));
-        // SAFETY: the window outlives the context and surface (both in Gfx,
-        // dropped before it).
+        // SAFETY: the window outlives the context and surface: Gfx drops
+        // them first.
         let context = unsafe { display.create_context(&config, &ctx_attrs)? };
         let surface_attrs = window.build_surface_attributes(Default::default())?;
         // SAFETY: as above.
@@ -316,6 +326,7 @@ impl App {
         // SAFETY: the context is current on this thread.
         let gl = unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) };
         let renderer = Renderer::new(gl)?;
+        window.set_ime_allowed(!self.args.no_ime && !self.args.view_only);
         self.gfx = Some(Gfx { window, surface, context, renderer });
         Ok(())
     }
@@ -559,6 +570,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.audio = None;
         self.gfx = None;
+        self.clipboard = None;
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -577,6 +589,9 @@ impl ApplicationHandler<UserEvent> for App {
         if self.gfx.is_some() {
             return;
         }
+        if !self.args.view_only {
+            self.clipboard = clipboard::Clipboard::new(event_loop);
+        }
         if let Err(err) = self.create_window(event_loop) {
             return self.fail(event_loop, err);
         }
@@ -590,6 +605,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.reconnects.take().is_some() {
                     tracing::info!("reconnected");
                     self.set_title("");
+                }
+                // The window may have had focus all along.
+                if let (Some(c), Some(client)) = (self.clipboard.as_mut(), &self.client)
+                    && self.gfx.as_ref().is_some_and(|g| g.window.has_focus())
+                {
+                    c.offer_local(client);
                 }
                 if let Some(config) = self.audio_pending.take() {
                     self.start_audio(config);
@@ -617,6 +638,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Net(Event::CursorImage(image)) => self.add_cursor_image(event_loop, image),
             UserEvent::Net(Event::Cursor(shape)) => self.set_cursor(shape),
+            UserEvent::Net(Event::ClipboardOffer(offer)) => {
+                // smithay-clipboard takes text only, and eagerly.
+                if let (Some(client), Some(mime)) = (self.client.clone(), clipboard::Clipboard::text_mime(&offer)) {
+                    let (proxy, mime) = (self.proxy.clone(), mime.to_string());
+                    self.runtime.spawn(async move {
+                        match client.fetch_clipboard(offer.serial, &mime).await {
+                            Ok(data) => {
+                                let _ = proxy.send_event(UserEvent::ClipboardText(String::from_utf8_lossy(&data).into()));
+                            }
+                            Err(err) => tracing::debug!("fetching the session's clipboard: {err:#}"),
+                        }
+                    });
+                }
+            }
+            UserEvent::ClipboardText(text) => {
+                if let Some(c) = self.clipboard.as_mut() {
+                    tracing::debug!(bytes = text.len(), "the session's clipboard");
+                    c.set(text);
+                }
+            }
+            UserEvent::Net(Event::TextInput(active)) => tracing::debug!(active, "a text field in the session"),
             UserEvent::Net(Event::AudioConfig(config)) => match self.client {
                 Some(_) => self.start_audio(config),
                 None => self.audio_pending = Some(config),
@@ -655,6 +697,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { .. } => self.layout_changed(),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Focused(true) if !self.args.view_only => {
+                if let (Some(c), Some(client)) = (self.clipboard.as_mut(), &self.client) {
+                    c.offer_local(client);
+                }
+            }
+            WindowEvent::Ime(ime) if !self.args.view_only => {
+                let Some(client) = &self.client else { return };
+                match ime {
+                    winit::event::Ime::Commit(text) => client.commit_text(text),
+                    winit::event::Ime::Preedit(text, cursor) => {
+                        client.preedit(text, cursor.map(|(b, e)| (b as u32, e as u32)));
+                    }
+                    winit::event::Ime::Disabled => client.preedit(String::new(), None),
+                    winit::event::Ime::Enabled => {}
+                }
+            }
             WindowEvent::Focused(false) => {
                 if let Some(c) = &self.client {
                     c.release_all();

@@ -8,11 +8,22 @@
 //!   wltool wheel N           N wheel clicks, positive is down
 //!   wltool key CODE...       evdev key codes, each pressed and released;
 //!                            +CODE holds one until the end (for Shift)
+//!   wltool copy TEXT         sets the clipboard, and serves it until
+//!                            something else replaces it
+//!   wltool paste             prints the clipboard's text
+//!   wltool keyboard          holds a virtual keyboard until killed, so
+//!                            windows get keyboard focus
+//!   wltool commit TEXT       as the input method, commits TEXT to the
+//!                            focused text field once one is active
 use std::io::Write;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1, ext_data_control_source_v1,
+};
+use wayland_protocols_misc::zwp_input_method_v2::client::{zwp_input_method_manager_v2, zwp_input_method_v2};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1};
 use wayland_protocols_wlr::screencopy::v1::client::{zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1};
@@ -25,6 +36,15 @@ struct S {
     copy: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     vptr: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     vkbd: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    dcm: Option<ext_data_control_manager_v1::ExtDataControlManagerV1>,
+    offers: Vec<(ext_data_control_offer_v1::ExtDataControlOfferV1, Vec<String>)>,
+    selection: Option<(ext_data_control_offer_v1::ExtDataControlOfferV1, Vec<String>)>,
+    copy_text: String,
+    imm: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
+    im_pending: bool,
+    im_active: bool,
+    im_done: u32,
+    cancelled: bool,
     size: (i32, i32),
     fmt: Option<(wl_shm::Format, u32, u32, u32)>,
     done: bool,
@@ -42,6 +62,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for S {
                 "zwlr_screencopy_manager_v1" => s.copy = Some(r.bind(name, version.min(3), qh, ())),
                 "zwlr_virtual_pointer_manager_v1" => s.vptr = Some(r.bind(name, 1, qh, ())),
                 "zwp_virtual_keyboard_manager_v1" => s.vkbd = Some(r.bind(name, 1, qh, ())),
+                "ext_data_control_manager_v1" => s.dcm = Some(r.bind(name, 1, qh, ())),
+                "zwp_input_method_manager_v2" => s.imm = Some(r.bind(name, 1, qh, ())),
                 _ => {}
             }
         }
@@ -72,6 +94,56 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for S {
         }
     }
 }
+impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for S {
+    fn event(s: &mut Self, _: &ext_data_control_device_v1::ExtDataControlDeviceV1, e: ext_data_control_device_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            ext_data_control_device_v1::Event::DataOffer { id } => s.offers.push((id, Vec::new())),
+            ext_data_control_device_v1::Event::Selection { id } => {
+                s.selection = id.and_then(|id| s.offers.iter().position(|(o, _)| *o == id).map(|i| s.offers.swap_remove(i)));
+            }
+            _ => {}
+        }
+    }
+    wayland_client::event_created_child!(S, ext_data_control_device_v1::ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ext_data_control_offer_v1::ExtDataControlOfferV1, ()),
+    ]);
+}
+impl Dispatch<ext_data_control_offer_v1::ExtDataControlOfferV1, ()> for S {
+    fn event(s: &mut Self, o: &ext_data_control_offer_v1::ExtDataControlOfferV1, e: ext_data_control_offer_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let ext_data_control_offer_v1::Event::Offer { mime_type } = e
+            && let Some((_, m)) = s.offers.iter_mut().find(|(x, _)| x == o)
+        {
+            m.push(mime_type);
+        }
+    }
+}
+impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for S {
+    fn event(s: &mut Self, _: &ext_data_control_source_v1::ExtDataControlSourceV1, e: ext_data_control_source_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            ext_data_control_source_v1::Event::Send { fd, .. } => {
+                let _ = std::fs::File::from(fd).write_all(s.copy_text.as_bytes());
+            }
+            ext_data_control_source_v1::Event::Cancelled => s.cancelled = true,
+            _ => {}
+        }
+    }
+}
+impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for S {
+    fn event(s: &mut Self, _: &zwp_input_method_v2::ZwpInputMethodV2, e: zwp_input_method_v2::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            zwp_input_method_v2::Event::Activate => s.im_pending = true,
+            zwp_input_method_v2::Event::Deactivate => s.im_pending = false,
+            zwp_input_method_v2::Event::Done => {
+                s.im_done += 1;
+                s.im_active = s.im_pending;
+            }
+            zwp_input_method_v2::Event::Unavailable => panic!("another input method is running"),
+            _ => {}
+        }
+    }
+}
+delegate_noop!(S: zwp_input_method_manager_v2::ZwpInputMethodManagerV2);
+delegate_noop!(S: ext_data_control_manager_v1::ExtDataControlManagerV1);
 delegate_noop!(S: ignore wl_shm::WlShm);
 delegate_noop!(S: ignore wl_seat::WlSeat);
 delegate_noop!(S: ignore wl_shm_pool::WlShmPool);
@@ -170,7 +242,7 @@ fn main() {
             p.destroy();
             q.roundtrip(&mut s).unwrap();
         }
-        "key" => {
+        "key" | "keyboard" => {
             let k = s.vkbd.as_ref().unwrap().create_virtual_keyboard(s.seat.as_ref().unwrap(), &qh, ());
             let ctx = xkbcommon::xkb::Context::new(0);
             let km = xkbcommon::xkb::Keymap::new_from_names(&ctx, "", "", "us", "", None, 0).unwrap();
@@ -182,6 +254,10 @@ fn main() {
             q.roundtrip(&mut s).unwrap();
             // Clients drop keys that arrive while they load a new keymap.
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if args[0] == "keyboard" {
+                while q.blocking_dispatch(&mut s).is_ok() {}
+                return;
+            }
             // "+" before a code holds it until the end (for shift).
             let mut held = Vec::new();
             for a in &args[1..] {
@@ -203,6 +279,50 @@ fn main() {
             }
             q.roundtrip(&mut s).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        "copy" => {
+            s.copy_text = args[1].clone();
+            let dcm = s.dcm.clone().expect("ext-data-control");
+            let device = dcm.get_data_device(s.seat.as_ref().unwrap(), &qh, ());
+            let source = dcm.create_data_source(&qh, ());
+            for m in ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+                source.offer(m.into());
+            }
+            device.set_selection(Some(&source));
+            while !s.cancelled && q.blocking_dispatch(&mut s).is_ok() {}
+        }
+        "commit" => {
+            let im = s.imm.clone().expect("input-method-v2").get_input_method(s.seat.as_ref().unwrap(), &qh, ());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !s.im_active {
+                assert!(std::time::Instant::now() < deadline, "no text field became active");
+                q.roundtrip(&mut s).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            im.commit_string(args[1].clone());
+            im.commit(s.im_done);
+            q.roundtrip(&mut s).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        "paste" => {
+            let dcm = s.dcm.clone().expect("ext-data-control");
+            dcm.get_data_device(s.seat.as_ref().unwrap(), &qh, ());
+            q.roundtrip(&mut s).unwrap();
+            q.roundtrip(&mut s).unwrap();
+            let Some((offer, mimes)) = &s.selection else { std::process::exit(1) };
+            let mime = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"]
+                .into_iter()
+                .find(|t| mimes.iter().any(|m| m == t))
+                .expect("no text on the clipboard");
+            let mut fds = [0; 2];
+            unsafe { libc::pipe(fds.as_mut_ptr()) };
+            let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            offer.receive(mime.into(), w.as_fd());
+            conn.flush().unwrap();
+            drop(w);
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::fs::File::from(r), &mut text).unwrap();
+            println!("{text}");
         }
         _ => panic!("?"),
     }

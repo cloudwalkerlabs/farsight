@@ -11,10 +11,12 @@
 //! (`session`). Commands on stdin drive experiments (see `control`).
 
 mod audio;
+mod clipboard;
 mod cursor;
 mod encode;
 mod gpu;
 mod host;
+mod ime;
 mod input;
 mod listen;
 mod net;
@@ -311,6 +313,15 @@ fn on_net(host: &mut Host, msg: ToHost) {
             renegotiate(host);
             let encodings = host.pipeline.encodings();
             let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(Welcome { encodings })));
+            if !hello.view_only {
+                // What a new controlling client needs to know of the
+                // session's text, after the welcome.
+                if let Some(offer) = host.clipboard.as_ref().map(|c| c.offer()) {
+                    let msg = ServerMessage::ClipboardOffer(offer);
+                    let _ = host.net.send(net::ToNet::Message(id, msg));
+                }
+                ime::text_input_changed(host);
+            }
             let resized = !hello.view_only && set_layout(host, hello.layout);
             cursor::client_connected(host);
             host.pipeline.set_watched(true);
@@ -350,7 +361,27 @@ fn on_net(host: &mut Host, msg: ToHost) {
                     renegotiate(host);
                     pipeline::refresh(host);
                 }
-                ClientMessage::SetLayout(_) | ClientMessage::SetMode(_) => {
+                ClientMessage::ClipboardOffer(offer) if controls => {
+                    tracing::debug!(mimes = ?offer.mimes, "the client's clipboard changed");
+                    if let Some(c) = host.clipboard.as_mut() {
+                        c.set_client_offer(&offer);
+                    }
+                }
+                ClientMessage::Text(text) if controls => {
+                    if !host.ime.as_mut().is_some_and(|i| i.commit(&text)) {
+                        tracing::debug!("text, but no text field in the session takes it");
+                    }
+                }
+                ClientMessage::Preedit { text, cursor } if controls => {
+                    if let Some(i) = host.ime.as_mut() {
+                        i.preedit(&text, cursor);
+                    }
+                }
+                ClientMessage::SetLayout(_)
+                | ClientMessage::SetMode(_)
+                | ClientMessage::ClipboardOffer(_)
+                | ClientMessage::Text(_)
+                | ClientMessage::Preedit { .. } => {
                     tracing::debug!(id, "ignored from a view-only client");
                 }
                 ClientMessage::Hello(_) => tracing::warn!(id, "second Hello ignored"),
@@ -358,6 +389,14 @@ fn on_net(host: &mut Host, msg: ToHost) {
             }
         }
         ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
+        ToHost::ClipboardRead(id, request, reply) => match host.clipboard.as_mut() {
+            Some(c) if host.client == Some(id) => c.read(request.serial, &request.mime, move |data| {
+                let _ = reply.send(data);
+            }),
+            _ => {
+                let _ = reply.send(None);
+            }
+        },
         ToHost::Disconnected(id) => {
             host.clients.retain(|(c, _)| *c != id);
             if host.client == Some(id) {
@@ -495,6 +534,11 @@ fn control(host: &mut Host, line: &str) {
             input::inject(host, InputEvent::Button { code, pressed: false });
         }
         ["keyframe"] => pipeline::refresh(host),
+        ["text", ..] => {
+            let text = line.trim_start().strip_prefix("text").unwrap_or("").trim_start();
+            let taken = host.ime.as_mut().is_some_and(|i| i.commit(text));
+            tracing::info!(text, taken, "control: text");
+        }
         ["quit"] => host.running = false,
         _ => usage(),
     }
@@ -503,6 +547,6 @@ fn control(host: &mut Host, line: &str) {
 
 fn usage() {
     tracing::warn!(
-        "commands: size W H [S] | scale S | key CODE... | keymap LAYOUT [VARIANT] | move X Y | click [BTN] | keyframe | quit"
+        "commands: size W H [S] | scale S | key CODE... | keymap LAYOUT [VARIANT] | move X Y | click [BTN] | keyframe | text TEXT | quit"
     );
 }

@@ -156,7 +156,7 @@ impl Outputs {
 }
 
 /// The listening Wayland socket of process `pid`.
-fn wayland_socket(pid: i32) -> anyhow::Result<PathBuf> {
+pub(crate) fn wayland_socket(pid: i32) -> anyhow::Result<PathBuf> {
     let mut inodes = Vec::new();
     for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))?.flatten() {
         if let Ok(target) = std::fs::read_link(fd.path())

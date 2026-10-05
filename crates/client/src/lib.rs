@@ -33,7 +33,8 @@ use farsight_proto::audio::{AudioCaps, AudioConfig};
 use farsight_proto::codec::{DecoderCaps, Format, Mode};
 use farsight_net::auth::{ClientKey, KnownHosts, Pin};
 use farsight_proto::control::{
-    ClientAuth, ClientMessage, CursorImage, CursorShape, Epoch, Hello, ServerMessage, Welcome, close,
+    ClientAuth, ClientMessage, ClipboardOffer, ClipboardRequest, CursorImage, CursorShape, Epoch, Hello,
+    MAX_CLIPBOARD, ServerMessage, Welcome, close,
 };
 use farsight_proto::datagram::{Datagram, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
@@ -108,6 +109,11 @@ pub enum Event {
     /// The session's audio starts, in this format: open the output and
     /// call [`Client::fill_audio`] from it.
     AudioConfig(AudioConfig),
+    /// The session's clipboard changed; fetch what is needed with
+    /// [`Client::fetch_clipboard`].
+    ClipboardOffer(ClipboardOffer),
+    /// A text field in the session gained (true) or lost focus.
+    TextInput(bool),
     /// The connection ended. `retry`: it was lost rather than ended, so
     /// connecting again resumes the session.
     Closed { reason: String, retry: bool },
@@ -161,7 +167,14 @@ struct Shared {
     stats: Mutex<Stats>,
     /// Set once the server announces its audio.
     audio: Mutex<Option<audio::Player>>,
+    /// The client's clipboard as offered to the server: its serial and
+    /// what gives the data for a MIME type.
+    clipboard: Mutex<Option<(u32, ClipboardProvider)>>,
 }
+
+/// Gives the client's clipboard data in a MIME type, when an app in the
+/// session pastes.
+pub type ClipboardProvider = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
 impl Shared {
     fn now_us(&self) -> u64 {
@@ -232,6 +245,7 @@ impl Client {
             want_keyframe: AtomicBool::new(true),
             stats: Mutex::default(),
             audio: Mutex::default(),
+            clipboard: Mutex::default(),
         });
         let (control, control_rx) = mpsc::unbounded_channel();
         on_event(Event::Connected { fingerprint, welcome });
@@ -314,6 +328,34 @@ impl Client {
         self.shared.audio.lock().unwrap().as_mut().map(|p| p.take_stats())
     }
 
+    /// The client's clipboard changed: offer its MIME types to the session.
+    /// `provider` gives the data when an app there pastes.
+    pub fn offer_clipboard(&self, mimes: Vec<String>, provider: ClipboardProvider) {
+        let mut slot = self.shared.clipboard.lock().unwrap();
+        let serial = slot.as_ref().map_or(1, |(s, _)| s.wrapping_add(1));
+        *slot = Some((serial, provider));
+        let _ = self.control.send(ClientMessage::ClipboardOffer(ClipboardOffer { serial, mimes }));
+    }
+
+    /// Fetches the session's clipboard, offer `serial`, as `mime`. Fails
+    /// if the selection has changed since.
+    pub async fn fetch_clipboard(&self, serial: u32, mime: &str) -> anyhow::Result<Vec<u8>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        stream::send(&mut send, &ClipboardRequest { serial, mime: mime.to_string() }).await?;
+        send.finish()?;
+        Ok(recv.read_to_end(MAX_CLIPBOARD).await?)
+    }
+
+    /// Commits text to the focused field in the session.
+    pub fn commit_text(&self, text: String) {
+        let _ = self.control.send(ClientMessage::Text(text));
+    }
+
+    /// Text being composed; empty clears it.
+    pub fn preedit(&self, text: String, cursor: Option<(u32, u32)>) {
+        let _ = self.control.send(ClientMessage::Preedit { text, cursor });
+    }
+
     /// Mutes or unmutes the session's audio at the server.
     pub fn set_audio(&self, play: bool) {
         let _ = self.control.send(ClientMessage::SetAudio { play });
@@ -359,6 +401,8 @@ async fn run(
                 ServerMessage::CursorImage(image) => on_event(Event::CursorImage(image)),
                 ServerMessage::Cursor(shape) => on_event(Event::Cursor(shape)),
                 ServerMessage::Welcome(_) => tracing::warn!("unexpected Welcome"),
+                ServerMessage::ClipboardOffer(offer) => on_event(Event::ClipboardOffer(offer)),
+                ServerMessage::TextInput(active) => on_event(Event::TextInput(active)),
                 ServerMessage::AudioConfig(config) => {
                     tracing::info!(?config, "audio");
                     match audio::Player::new(config) {
@@ -478,10 +522,39 @@ async fn run(
         };
         Err::<(), _>(anyhow::Error::from(err))
     };
+    // The server fetching the client's clipboard, a stream each time.
+    let streams = async {
+        loop {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let Ok(Some(request)) = stream::recv::<ClipboardRequest>(&mut recv).await else { return };
+                let provider = shared.clipboard.lock().unwrap().clone();
+                let data = match provider {
+                    Some((serial, provider)) if serial == request.serial => {
+                        tokio::task::spawn_blocking(move || provider(&request.mime)).await.ok().flatten()
+                    }
+                    _ => None,
+                };
+                match data {
+                    Some(data) => {
+                        let _ = send.write_all(&data).await;
+                        let _ = send.finish();
+                    }
+                    None => {
+                        let _ = send.reset(0u32.into());
+                    }
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
     let result = tokio::select! {
         r = writer => r,
         r = reader => r,
         r = datagrams => r,
+        r = streams => r,
         () = ticks => Ok(()),
     };
     let (reason, retry) = match conn.close_reason() {

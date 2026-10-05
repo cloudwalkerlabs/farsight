@@ -42,7 +42,39 @@ pub enum ClientMessage {
     /// Whether to send the session's audio: false mutes it at the server,
     /// which saves the bandwidth.
     SetAudio { play: bool },
+    /// The client's clipboard changed. The server fetches the data only
+    /// when an app in the session pastes (see [`ClipboardRequest`]).
+    ClipboardOffer(ClipboardOffer),
+    /// Text from the client's keyboard or IME, committed to the focused
+    /// text field in the session (`input-method-v2`, §7).
+    Text(String),
+    /// Text being composed, shown in the focused field but not committed
+    /// yet; empty to clear it. The cursor is a byte range in it.
+    Preedit { text: String, cursor: Option<(u32, u32)> },
 }
+
+/// A clipboard's contents, as MIME types; the data is fetched lazily.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardOffer {
+    /// Bumped on every change, so a late request for an old selection is
+    /// refused rather than answered with the new one.
+    pub serial: u32,
+    /// Empty: the clipboard was cleared.
+    pub mimes: Vec<String>,
+}
+
+/// The first message on a stream opened to fetch clipboard data, either
+/// way. The other side answers with the raw data, at most
+/// [`MAX_CLIPBOARD`] bytes, and finishes the stream; it resets the stream
+/// if the offer is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardRequest {
+    pub serial: u32,
+    pub mime: String,
+}
+
+/// The most clipboard data moved at once.
+pub const MAX_CLIPBOARD: usize = 64 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
@@ -78,6 +110,11 @@ pub enum ServerMessage {
     Cursor(CursorShape),
     /// The session's audio format, before its first datagram (§8).
     AudioConfig(AudioConfig),
+    /// The session's clipboard changed (to the controlling client only).
+    ClipboardOffer(ClipboardOffer),
+    /// Whether a text field in the session has focus and takes text: the
+    /// client may show its soft keyboard (§7).
+    TextInput(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -93,6 +93,9 @@ pub struct Host {
     /// The host's connection to the nested compositor, for its output
     /// scale (§5), once made.
     pub outputs: Option<crate::outputs::Outputs>,
+    /// The same, for the session's clipboard and text input.
+    pub clipboard: Option<crate::clipboard::Clipboard>,
+    pub ime: Option<crate::ime::Ime>,
     pub net: tokio::sync::mpsc::UnboundedSender<ToNet>,
     /// labwc drops the configure that arrives before its output is enabled;
     /// we repeat it once after the first frame (see `pipeline`).
@@ -168,6 +171,8 @@ impl Host {
             mode: Default::default(),
             cursor: Cursor::default(),
             outputs: None,
+            clipboard: None,
+            ime: None,
             net,
             initial_configure_repeated: false,
             _globals: globals,
@@ -340,6 +345,12 @@ impl XdgShellHandler for Host {
                 }
                 Err(err) => tracing::warn!("{err:#}; output scale goes through preferred_scale only"),
             }
+            if let Err(err) = crate::clipboard::Clipboard::connect(self, pid) {
+                tracing::warn!("{err:#}; no clipboard");
+            }
+            if let Err(err) = crate::ime::Ime::connect(self, pid) {
+                tracing::warn!("{err:#}; no text input");
+            }
         }
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         if let Some(kbd) = self.seat.get_keyboard() {
@@ -362,8 +373,10 @@ impl XdgShellHandler for Host {
         if self.toplevel.as_ref() == Some(&surface) {
             tracing::info!("nested window destroyed");
             self.toplevel = None;
-            // A restarted desktop gets a connection of its own.
+            // A restarted desktop gets connections of its own.
             self.outputs = None;
+            self.clipboard = None;
+            self.ime = None;
         }
     }
 

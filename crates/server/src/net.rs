@@ -18,7 +18,7 @@ use farsight_net::quinn::{self, Connection};
 use farsight_net::sched::{Priority, Scheduler};
 use farsight_net::{auth, endpoint, stream};
 use farsight_proto::audio::AudioConfig;
-use farsight_proto::control::{ClientMessage, Hello, ServerMessage, close};
+use farsight_proto::control::{ClientMessage, ClipboardRequest, Hello, MAX_CLIPBOARD, ServerMessage, close};
 use farsight_proto::datagram::{self, Datagram, Pong};
 use farsight_proto::tiles::TilesHeader;
 use farsight_proto::input::InputPacket;
@@ -36,6 +36,9 @@ pub enum ToHost {
     Connected(ConnId, Hello),
     Message(ConnId, ClientMessage),
     Input(ConnId, InputPacket),
+    /// The client wants the session's clipboard; the reply is `None` if
+    /// it changed.
+    ClipboardRead(ConnId, ClipboardRequest, tokio::sync::oneshot::Sender<Option<Vec<u8>>>),
     Disconnected(ConnId),
 }
 
@@ -51,6 +54,9 @@ pub enum ToNet {
     Broadcast(ServerMessage),
     /// An audio datagram, for whichever client listens.
     Audio(Bytes),
+    /// An app in the session pastes: fetch the client's clipboard into the
+    /// pipe.
+    FetchClipboard(ConnId, crate::clipboard::Send),
     /// The session is ending: close every connection with this reason.
     Shutdown(String),
 }
@@ -246,6 +252,10 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     c.sched.send(Priority::Audio, d.clone());
                 }
             }
+            ToNet::FetchClipboard(id, paste) => {
+                let Some(c) = conns.iter().find(|c| c.id == id) else { continue };
+                tokio::spawn(fetch_clipboard(c.conn.clone(), paste));
+            }
         }
     }
 }
@@ -350,9 +360,56 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Shared) -> anyhow
         };
         Err::<(), _>(anyhow::Error::from(err))
     };
+    // Each clipboard fetch from the client is a stream of its own.
+    let streams = async {
+        loop {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let host = host.clone();
+            tokio::spawn(async move {
+                let Ok(Some(request)) = stream::recv::<ClipboardRequest>(&mut recv).await else { return };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = host.send(ToHost::ClipboardRead(id, request, tx));
+                match rx.await {
+                    Ok(Some(data)) => {
+                        let _ = send.write_all(&data).await;
+                        let _ = send.finish();
+                    }
+                    _ => {
+                        let _ = send.reset(0u32.into());
+                    }
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    };
     tokio::select! {
         r = writer => r,
         r = reader => r,
         r = datagrams => r,
+        r = streams => r,
+    }
+}
+
+/// Fetches the client's clipboard for a paste in the session, and writes
+/// it into the paste's pipe.
+async fn fetch_clipboard(conn: Connection, paste: crate::clipboard::Send) {
+    let result = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        stream::send(&mut send, &ClipboardRequest { serial: paste.serial, mime: paste.mime.clone() }).await?;
+        send.finish()?;
+        anyhow::Ok(recv.read_to_end(MAX_CLIPBOARD).await?)
+    }
+    .await;
+    match result {
+        Ok(data) => {
+            // A pipe write may block until the app reads it.
+            let _ = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let _ = std::fs::File::from(paste.fd).write_all(&data);
+            })
+            .await;
+        }
+        Err(err) => tracing::debug!(mime = paste.mime, "fetching the client's clipboard: {err:#}"),
     }
 }
