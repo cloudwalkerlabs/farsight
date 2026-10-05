@@ -89,6 +89,9 @@ pub struct Host {
     pub decoders: Vec<farsight_proto::codec::DecoderCaps>,
     pub mode: farsight_proto::codec::Mode,
     pub cursor: Cursor,
+    /// The host's connection to the nested compositor, for its output
+    /// scale (§5), once made.
+    pub outputs: Option<crate::outputs::Outputs>,
     pub net: tokio::sync::mpsc::UnboundedSender<ToNet>,
     /// labwc drops the configure that arrives before its output is enabled;
     /// we repeat it once after the first frame (see `pipeline`).
@@ -163,6 +166,7 @@ impl Host {
             decoders: Vec::new(),
             mode: Default::default(),
             cursor: Cursor::default(),
+            outputs: None,
             net,
             initial_configure_repeated: false,
             _globals: globals,
@@ -172,8 +176,23 @@ impl Host {
     }
 
     /// Set the output mode and scale, and reconfigure the nested window.
+    /// Frames are held until the nested compositor shows the new layout.
     pub fn apply_output(&mut self, layout: Layout) {
         self.layout = layout;
+        // Until the nested window exists there is nothing to wait for.
+        if self.toplevel.is_some() {
+            self.pipeline.hold(layout);
+        }
+        let _ = self.loop_handle.insert_source(
+            smithay::reexports::calloop::timer::Timer::from_duration(crate::pipeline::HOLD_TIMEOUT),
+            |_, _, host| {
+                crate::pipeline::hold_timed_out(host);
+                smithay::reexports::calloop::timer::TimeoutAction::Drop
+            },
+        );
+        if let Some(outputs) = &mut self.outputs {
+            outputs.set_scale(layout.scale);
+        }
         let mode = Mode { size: (layout.width, layout.height).into(), refresh: layout.refresh_mhz as i32 };
         self.output.change_current_state(
             Some(mode),
@@ -305,6 +324,20 @@ impl XdgShellHandler for Host {
         with_states(surface.wl_surface(), |states| {
             compositor::send_surface_state(surface.wl_surface(), states, scale.ceil() as i32, Transform::Normal);
         });
+        // The nested compositor's socket is up by the time it shows a
+        // window; connect for its output scale.
+        if let Some(pid) = surface.wl_surface().client().and_then(|c| c.get_credentials(&self.display).ok()).map(|c| c.pid)
+        {
+            match crate::outputs::Outputs::connect(self, pid) {
+                Ok(()) => {
+                    let scale = self.layout.scale;
+                    if let Some(o) = self.outputs.as_mut() {
+                        o.set_scale(scale);
+                    }
+                }
+                Err(err) => tracing::warn!("{err:#}; output scale goes through preferred_scale only"),
+            }
+        }
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.wl_surface().clone()), serial);

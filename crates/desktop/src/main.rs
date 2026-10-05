@@ -6,7 +6,13 @@
 //! the newest decoded picture is drawn, and drawing doesn't wait for vsync.
 //! The remote cursor is the window's own cursor, so moving it has no
 //! latency (§4).
+//!
+//! The window is the source of truth for the remote output (§5): its size
+//! in physical pixels and its scale go to the server whenever they change,
+//! at most every 50 ms while the user drags. Until the server's picture
+//! matches, the last one is stretched to the window.
 
+mod cursor;
 mod decode;
 mod render;
 mod stats;
@@ -16,7 +22,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -139,7 +145,14 @@ struct App {
     stats: stats::Latency,
     decode_thread: Option<std::thread::JoinHandle<()>>,
     exit: Option<anyhow::Error>,
+    /// The layout last sent, and when.
+    layout_sent: Option<(Layout, Instant)>,
+    /// A layout waiting for the throttle.
+    layout_pending: Option<Layout>,
 }
+
+/// At most one `SetLayout` this often during a drag-resize (§5).
+const LAYOUT_INTERVAL: Duration = Duration::from_millis(50);
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -166,6 +179,8 @@ fn main() -> anyhow::Result<()> {
         stats: stats::Latency::default(),
         decode_thread: None,
         exit: None,
+        layout_sent: None,
+        layout_pending: None,
     };
     event_loop.run_app(&mut app)?;
     let App { client, runtime, decode_thread, exit, gfx, .. } = app;
@@ -227,14 +242,8 @@ impl App {
     }
 
     fn connect(&mut self) {
-        let gfx = self.gfx.as_ref().unwrap();
-        let size = gfx.window.inner_size();
-        let layout = Layout {
-            width_px: size.width,
-            height_px: size.height,
-            scale_120: (gfx.window.scale_factor() * SCALE_DENOMINATOR as f64).round() as u32,
-            refresh_mhz: gfx.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000),
-        };
+        let Some(layout) = self.window_layout() else { return };
+        self.layout_sent = Some((layout, Instant::now()));
         let (decode_tx, decode_rx) = mpsc::channel::<ToDecoder>();
         let mut decoders = decode::offered(!self.args.software);
         if !self.args.codec.is_empty() {
@@ -284,6 +293,50 @@ impl App {
         });
     }
 
+    /// The window's size and scale, as the server should apply them.
+    fn window_layout(&self) -> Option<Layout> {
+        let gfx = self.gfx.as_ref()?;
+        let size = gfx.window.inner_size();
+        Some(Layout {
+            width_px: size.width,
+            height_px: size.height,
+            scale_120: (gfx.window.scale_factor() * SCALE_DENOMINATOR as f64).round() as u32,
+            refresh_mhz: gfx.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000),
+        })
+    }
+
+    /// The window changed size or scale: tell the server, now or once the
+    /// throttle allows.
+    fn layout_changed(&mut self) {
+        let Some(layout) = self.window_layout() else { return };
+        if layout.width_px == 0 || layout.height_px == 0 {
+            return;
+        }
+        if self.layout_sent.is_some_and(|(l, _)| l == layout) {
+            self.layout_pending = None;
+            return;
+        }
+        self.layout_pending = Some(layout);
+        self.send_layout();
+    }
+
+    /// Sends the pending layout if the throttle allows; returns when it
+    /// will, otherwise.
+    fn send_layout(&mut self) -> Option<Instant> {
+        let layout = self.layout_pending?;
+        let client = self.client.as_ref()?;
+        if let Some((_, at)) = self.layout_sent
+            && at.elapsed() < LAYOUT_INTERVAL
+        {
+            return Some(at + LAYOUT_INTERVAL);
+        }
+        tracing::info!(?layout, "SetLayout");
+        client.set_layout(layout);
+        self.layout_sent = Some((layout, Instant::now()));
+        self.layout_pending = None;
+        None
+    }
+
     fn input(&self, event: InputEvent) {
         if let Some(c) = &self.client {
             c.input(event);
@@ -310,7 +363,14 @@ impl App {
     }
 
     fn add_cursor_image(&mut self, event_loop: &ActiveEventLoop, image: CursorImage) {
-        tracing::debug!(id = image.id, size = ?(image.width, image.height), hotspot = ?image.hotspot, "cursor image");
+        tracing::debug!(
+            id = image.id, size = ?(image.width, image.height), hotspot = ?image.hotspot, scale_120 = image.scale_120,
+            "cursor image"
+        );
+        // The remote output's pixels are the window's physical pixels, and
+        // winit takes cursors in physical pixels: draw the image at its
+        // size on the remote output.
+        let image = cursor::to_output_pixels(image);
         // winit wants straight alpha; the server sends premultiplied BGRA.
         let mut rgba = image.pixels;
         for px in rgba.as_chunks_mut::<4>().0 {
@@ -367,6 +427,13 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.send_layout() {
+            Some(at) => event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_some() {
             return;
@@ -379,7 +446,11 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Connected(client) => self.client = Some(client),
+            UserEvent::Connected(client) => {
+                self.client = Some(client);
+                // The window may have changed while connecting.
+                self.layout_changed();
+            }
             UserEvent::Failed(err) => self.fail(event_loop, anyhow::anyhow!(err)),
             UserEvent::Decoded(d) => {
                 if let Some(gfx) = &self.gfx {
@@ -410,7 +481,9 @@ impl ApplicationHandler<UserEvent> for App {
                     gfx.surface.resize(&gfx.context, w, h);
                     gfx.window.request_redraw();
                 }
+                self.layout_changed();
             }
+            WindowEvent::ScaleFactorChanged { .. } => self.layout_changed(),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(false) => {
                 if let Some(c) = &self.client {

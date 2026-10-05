@@ -16,6 +16,7 @@ mod gpu;
 mod host;
 mod input;
 mod net;
+mod outputs;
 mod pipeline;
 
 use std::io::BufRead;
@@ -226,7 +227,6 @@ fn on_net(host: &mut Host, msg: ToHost) {
             let encodings = host.pipeline.encodings();
             tracing::info!(id, mode = ?hello.mode, encodings = ?encodings.iter().map(|e| e.to_string()).collect::<Vec<_>>(), "negotiated");
             let _ = host.net.send(net::ToNet::Message(id, ServerMessage::Welcome(Welcome { encodings })));
-            // Resizing mid-session is M2; the first layout is applied as is.
             let resized = set_layout(host, hello.layout);
             cursor::client_connected(host);
             host.pipeline.set_client(Some(id));
@@ -241,7 +241,9 @@ fn on_net(host: &mut Host, msg: ToHost) {
                 tracing::debug!("keyframe requested");
                 pipeline::refresh(host);
             }
-            ClientMessage::SetLayout(layout) => tracing::info!(?layout, "SetLayout ignored until M2"),
+            ClientMessage::SetLayout(layout) => {
+                set_layout(host, layout);
+            }
             ClientMessage::RequestRefresh(rects) => {
                 tracing::debug!(?rects, "refresh requested");
                 pipeline::repaint(host, &rects);

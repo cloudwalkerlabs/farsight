@@ -42,6 +42,61 @@ use crate::encode::{self, Encoder, EncoderInfo, FrameKind, Frames, Input, Output
 use crate::host::Host;
 use crate::net::{self, ConnId, ToNet};
 
+/// A layout change in progress. M0 found the change is not one step: frames
+/// at the new size arrive with old content, and the scale may land before
+/// the size. So nothing is encoded until the nested compositor reports the
+/// new size and scale (through `wlr-output-management`) and commits a frame
+/// at that size after it, or until the timeout.
+struct Hold {
+    size: (i32, i32),
+    scale: f64,
+    since: Instant,
+    confirmed: bool,
+}
+
+/// The longest a layout change holds frames back.
+pub const HOLD_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// A hold's timer ran out: if the nested compositor hasn't drawn the new
+/// layout by now, send what it has.
+pub fn hold_timed_out(host: &mut Host) {
+    if host.pipeline.hold.as_ref().is_some_and(|h| h.since.elapsed() >= HOLD_TIMEOUT) {
+        tracing::warn!("the layout change timed out; sending frames again");
+        host.pipeline.hold = None;
+        refresh(host);
+    }
+}
+
+/// The nested compositor reported its outputs: does that confirm the
+/// layout being waited for?
+pub fn outputs_changed(host: &mut Host) {
+    let current = host.outputs.as_ref().and_then(|o| o.current());
+    if let (Some(hold), Some(cur)) = (host.pipeline.hold.as_mut(), current)
+        && cur.size == hold.size
+        && (cur.scale - hold.scale).abs() < 1e-3
+        && !hold.confirmed
+    {
+        tracing::debug!(after_ms = hold.since.elapsed().as_millis() as u64, "the nested compositor took the layout");
+        hold.confirmed = true;
+    }
+}
+
+/// Whether a frame of `size` may be encoded, ending the hold if it may.
+fn release_hold(host: &mut Host, size: (i32, i32)) -> bool {
+    let confirmable_without = host.outputs.is_none();
+    let Some(hold) = host.pipeline.hold.as_mut() else { return true };
+    let elapsed = hold.since.elapsed();
+    if elapsed >= HOLD_TIMEOUT {
+        tracing::warn!(?size, want = ?hold.size, scale = hold.scale, "the layout change timed out; sending frames again");
+    } else if size != hold.size || !(hold.confirmed || confirmable_without) {
+        return false;
+    } else {
+        tracing::info!(held_ms = elapsed.as_millis() as u64, ?size, scale = hold.scale, "layout applied");
+    }
+    host.pipeline.hold = None;
+    true
+}
+
 /// The largest screen sent as tiles.
 const TILES_MAX: u32 = 8192;
 
@@ -76,6 +131,8 @@ pub struct Pipeline {
     last_commit: Option<CommitCounter>,
     /// The client's mode: 4:4:4 JPEG in tiles for text.
     mode: Mode,
+    /// Frames are held across a layout change (§5).
+    hold: Option<Hold>,
     /// To the encode thread; `None` only while shutting down.
     jobs: Option<SyncSender<Job>>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
@@ -139,6 +196,7 @@ impl Pipeline {
             damage: Vec::new(),
             last_commit: None,
             mode: Mode::default(),
+            hold: None,
             jobs: Some(jobs),
             encode_thread: Some(thread),
             last_buffer: None,
@@ -151,6 +209,17 @@ impl Pipeline {
             clock: Clock::new(),
             presented: 0,
         })
+    }
+
+    /// The output is changing to `layout`: hold the last good frame until
+    /// the nested compositor has taken it on and drawn a frame at it.
+    pub fn hold(&mut self, layout: crate::host::Layout) {
+        self.hold = Some(Hold {
+            size: (layout.width, layout.height),
+            scale: layout.scale,
+            since: Instant::now(),
+            confirmed: false,
+        });
     }
 
     /// Frames go to `client` from now on, starting with a keyframe.
@@ -231,6 +300,7 @@ pub fn on_toplevel_commit(host: &mut Host, toplevel: &ToplevelSurface) {
     }
 
     if host.pipeline.encoding()
+        && release_hold(host, (size.w, size.h))
         && let Err(err) = convert_and_encode(host, &texture, t_commit)
     {
         tracing::error!("{err:#}");
@@ -272,6 +342,9 @@ pub fn repaint(host: &mut Host, rects: &[Rect]) {
 
 /// Encodes the nested window's current buffer.
 fn encode_current(host: &mut Host) {
+    if host.pipeline.hold.is_some() {
+        return; // the frame after the hold starts a new epoch anyway
+    }
     let Some(surface) = host.toplevel.as_ref().map(|t| t.wl_surface().clone()) else { return };
     let ctx = host.renderer.context_id();
     let Some(texture) = with_renderer_surface_state(&surface, |rs| rs.texture::<GlesTexture>(ctx).cloned()).flatten()

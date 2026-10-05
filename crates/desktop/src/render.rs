@@ -58,7 +58,24 @@ pub struct Placement {
     pub scale: f64,
 }
 
+/// A picture this close to the window's size is drawn 1:1, not scaled: the
+/// server keeps sizes even (§5), so an odd window is one pixel larger.
+const EXACT_SLACK: u32 = 2;
+
 impl Placement {
+    /// Where to draw `picture` in `window`: 1:1 and centred when it matches
+    /// the window (give or take [`EXACT_SLACK`]), else scaled to fit, as
+    /// while a resize is under way or when the server clamped the size.
+    pub fn place(window: (u32, u32), picture: (u32, u32)) -> Self {
+        let near = |w: u32, p: u32| p <= w && w - p <= EXACT_SLACK;
+        if near(window.0, picture.0) && near(window.1, picture.1) {
+            let x = ((window.0 - picture.0) / 2) as f64;
+            let y = ((window.1 - picture.1) / 2) as f64;
+            return Self { x, y, width: picture.0 as f64, height: picture.1 as f64, scale: 1.0 };
+        }
+        Self::fit(window, picture)
+    }
+
     pub fn fit(window: (u32, u32), picture: (u32, u32)) -> Self {
         let (ww, wh) = (window.0.max(1) as f64, window.1.max(1) as f64);
         let (pw, ph) = (picture.0.max(1) as f64, picture.1.max(1) as f64);
@@ -241,7 +258,7 @@ impl Renderer {
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
             let picture = self.picture?;
-            let p = Placement::fit(window, picture);
+            let p = Placement::place(window, picture);
             // GL's origin is bottom left.
             let y = window.1 as f64 - p.y - p.height;
             gl.viewport(p.x as i32, y as i32, p.width.round() as i32, p.height.round() as i32);
@@ -268,5 +285,14 @@ mod tests {
         assert_eq!(p.to_picture(750.0, 500.0), (250.0, 500.0));
         let p = Placement::fit((960, 540), (1920, 1080));
         assert_eq!(p.to_picture(480.0, 270.0), (960.0, 540.0));
+    }
+
+    #[test]
+    fn matching_pictures_are_drawn_one_to_one() {
+        let p = Placement::place((1601, 901), (1600, 900));
+        assert_eq!((p.x, p.y, p.width, p.height, p.scale), (0.0, 0.0, 1600.0, 900.0, 1.0));
+        // Mid-resize: stretched.
+        let p = Placement::place((1800, 1000), (1600, 900));
+        assert_ne!(p.scale, 1.0);
     }
 }

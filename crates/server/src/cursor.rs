@@ -105,7 +105,10 @@ fn send_shape(host: &mut Host, shape: CursorShape) {
 /// buffer pixels.
 fn read_image(host: &mut Host, surface: &WlSurface) -> Option<CursorImage> {
     let texture = crate::pipeline::nested_texture(host, surface)?;
-    let scale = with_renderer_surface_state(surface, |rs| rs.buffer_scale()).unwrap_or(1);
+    let (scale, logical_w) = with_renderer_surface_state(surface, |rs| {
+        (rs.buffer_scale(), rs.surface_size().map(|s| s.w).unwrap_or(0))
+    })
+    .unwrap_or((1, 0));
     let hotspot = with_states(surface, |states| {
         states.data_map.get::<CursorImageSurfaceData>().map(|d| d.lock().unwrap().hotspot).unwrap_or_default()
     });
@@ -117,10 +120,18 @@ fn read_image(host: &mut Host, surface: &WlSurface) -> Option<CursorImage> {
         }
     };
     let size = texture.size();
-    let (width, height, hotspot) = (size.w as u32, size.h as u32, (hotspot.x * scale, hotspot.y * scale));
+    let (width, height) = (size.w as u32, size.h as u32);
+    // The host's logical pixels are output pixels (§5): the image's
+    // density is its width over its logical width, which covers both
+    // buffer_scale and a viewport. The hotspot is logical.
+    let scale_120 = match logical_w {
+        w if w > 0 => width * farsight_proto::layout::SCALE_DENOMINATOR / w as u32,
+        _ => scale as u32 * farsight_proto::layout::SCALE_DENOMINATOR,
+    };
+    let to_image = |v: i32| v * scale_120 as i32 / farsight_proto::layout::SCALE_DENOMINATOR as i32;
+    let hotspot = (to_image(hotspot.x), to_image(hotspot.y));
     let mut hasher = DefaultHasher::new();
-    (width, height, hotspot, &pixels).hash(&mut hasher);
-    let scale_120 = scale as u32 * farsight_proto::layout::SCALE_DENOMINATOR;
+    (width, height, hotspot, scale_120, &pixels).hash(&mut hasher);
     Some(CursorImage { id: hasher.finish(), width, height, hotspot, scale_120, pixels })
 }
 
