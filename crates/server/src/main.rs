@@ -73,9 +73,9 @@ struct Args {
     /// JPEG quality for tiles, when there is no hardware encoder.
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     jpeg_quality: u8,
-    /// Hardware encoder backends to offer, best first: vaapi. Empty for
+    /// Hardware encoder backends to offer, best first: vaapi, nvenc. Empty for
     /// tiles only.
-    #[arg(long, value_delimiter = ',', default_values_t = ["vaapi".to_string()])]
+    #[arg(long, value_delimiter = ',', default_values_t = ["vaapi".to_string(), "nvenc".to_string()])]
     encoders: Vec<String>,
     /// Read the probe client's frame number from each frame (spike).
     #[arg(long)]

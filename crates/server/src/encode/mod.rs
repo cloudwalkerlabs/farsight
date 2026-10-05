@@ -8,10 +8,14 @@
 //!
 //! - **VA-API**: the conversion renders straight into the encoder's surfaces
 //!   (zero copy).
+//! - **NVENC**: the conversion is read back into memory and copied to the
+//!   encoder, since the host usually renders on another GPU.
 //! - **Tiles**, with no hardware encoder: the damage is read back and coded
 //!   on the CPU.
 
 pub mod ffmpeg;
+mod nvenc;
+mod readback;
 pub mod tiles;
 mod vaapi;
 
@@ -27,6 +31,7 @@ use smithay::backend::renderer::sync::SyncPoint;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Vaapi,
+    Nvenc,
 }
 
 impl FromStr for Backend {
@@ -34,7 +39,8 @@ impl FromStr for Backend {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "vaapi" => Ok(Backend::Vaapi),
-            _ => Err(format!("unknown encoder backend {s:?}: expected vaapi")),
+            "nvenc" => Ok(Backend::Nvenc),
+            _ => Err(format!("unknown encoder backend {s:?}: expected vaapi or nvenc")),
         }
     }
 }
@@ -72,6 +78,11 @@ pub fn probe(render_node: &Path, backends: &[Backend]) -> Vec<EncoderInfo> {
                     });
                 }
             }
+            Backend::Nvenc => {
+                for caps in nvenc::probe() {
+                    out.push(EncoderInfo { caps, backend, low_power: false });
+                }
+            }
         }
     }
     out
@@ -87,6 +98,33 @@ fn ffmpeg_has(name: &std::ffi::CStr) -> bool {
 pub struct Settings {
     /// Constant QP for ordinary frames (H.264's scale; AV1 scales it).
     pub qp: u32,
+}
+
+/// How a picture in memory is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaneLayout {
+    /// Y, then U and V interleaved at half size.
+    Nv12,
+    /// Y, U and V at full size.
+    Yuv444,
+}
+
+impl PlaneLayout {
+    /// Bytes per row and rows of plane `i`.
+    pub fn plane_size(self, i: usize, width: usize, height: usize) -> (usize, usize) {
+        match (self, i) {
+            (_, 0) | (PlaneLayout::Yuv444, _) => (width, height),
+            (PlaneLayout::Nv12, _) => (2 * width.div_ceil(2), height.div_ceil(2)),
+        }
+    }
+}
+
+/// A converted picture in memory.
+pub struct MemFrame {
+    pub layout: PlaneLayout,
+    pub planes: Vec<Vec<u8>>,
+    /// Bytes per row of each plane.
+    pub strides: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +175,8 @@ pub struct Shaders {
     /// NV12 into VA-API surfaces, one pass per plane.
     pub luma: GlesTexProgram,
     pub chroma: GlesTexProgram,
+    /// Any layout, packed for read back.
+    pub pack: GlesTexProgram,
 }
 
 impl Shaders {
@@ -144,6 +184,7 @@ impl Shaders {
         Ok(Self {
             luma: renderer.compile_custom_texture_shader(format!("{SHADER_HEAD}{LUMA_MAIN}"), &[])?,
             chroma: renderer.compile_custom_texture_shader(format!("{SHADER_HEAD}{CHROMA_MAIN}"), &[])?,
+            pack: readback::compile(renderer, SHADER_HEAD)?,
         })
     }
 }
@@ -151,18 +192,21 @@ impl Shaders {
 /// The main thread's half: converts into the encoder's input.
 pub enum Frames {
     Va(vaapi::Surfaces),
+    Mem(readback::Readback),
     Tiles(tiles::Screen),
 }
 
 /// One converted picture, on its way to the encode thread.
 pub enum Input {
     Va(vaapi::Surface),
+    Mem(MemFrame),
     Tiles(tiles::Damage),
 }
 
 /// The encode thread's half.
 pub enum Encoder {
     Ffmpeg(ffmpeg::FfEncoder),
+    Nvenc(Box<nvenc::Nvenc>),
     Tiles(tiles::TileEncoder),
 }
 
@@ -181,7 +225,7 @@ pub fn open_tiles(width: i32, height: i32) -> anyhow::Result<(Frames, Encoder)> 
 pub fn open(
     info: &EncoderInfo,
     render_node: &Path,
-    _renderer: &mut GlesRenderer,
+    renderer: &mut GlesRenderer,
     width: i32,
     height: i32,
     settings: &Settings,
@@ -191,6 +235,12 @@ pub fn open(
             let (surfaces, codec) = vaapi::open(info, render_node, width, height, settings)?;
             Ok((Frames::Va(surfaces), Encoder::Ffmpeg(codec)))
         }
+        Backend::Nvenc => {
+            let format = info.caps.format;
+            let codec = nvenc::Nvenc::open(format, width, height, settings)?;
+            let readback = readback::Readback::new(renderer, width, height, nvenc::plane_layout(format))?;
+            Ok((Frames::Mem(readback), Encoder::Nvenc(Box::new(codec))))
+        }
     }
 }
 
@@ -198,6 +248,7 @@ impl Frames {
     pub fn size(&self) -> (i32, i32) {
         match self {
             Frames::Va(s) => (s.width, s.height),
+            Frames::Mem(r) => (r.width, r.height),
             Frames::Tiles(s) => (s.width, s.height),
         }
     }
@@ -218,6 +269,7 @@ impl Frames {
                 let (surface, sync) = s.convert(renderer, shaders, texture)?;
                 Ok((Input::Va(surface), sync))
             }
+            Frames::Mem(r) => Ok((Input::Mem(r.convert(renderer, &shaders.pack, texture)?), SyncPoint::signaled())),
             Frames::Tiles(s) => {
                 Ok((Input::Tiles(s.read(renderer, texture, damage, tile_options)?), SyncPoint::signaled()))
             }
@@ -232,6 +284,11 @@ impl Encoder {
                 let mut data = Vec::new();
                 // SAFETY: the surface comes from this epoch's VA-API pool.
                 let keyframe = unsafe { c.encode(s.into_raw(), pts_us, kind, &mut data)? };
+                Ok(Output::Video { data, keyframe })
+            }
+            (Encoder::Nvenc(c), Input::Mem(f)) => {
+                let mut data = Vec::new();
+                let keyframe = c.encode(f, pts_us, kind, &mut data)?;
                 Ok(Output::Video { data, keyframe })
             }
             (Encoder::Tiles(t), Input::Tiles(d)) => Ok(Output::Tiles(t.encode(d)?)),
