@@ -37,7 +37,7 @@ crates/
   uniffi-bindgen/  Kotlin binding generator for the Android build
 android/           Android app (Gradle, Compose)
 dist/              example systemd unit
-packaging/         packages: .debs, apt repository, PKGBUILDs, Homebrew formula
+packaging/         packages: .debs, apt repository, AUR PKGBUILDs, Homebrew formula
 ```
 
 ## Downloads
@@ -67,9 +67,14 @@ pipewire-pulse) and `farsight-server@.service`:
   The repository is signed with the Cloudwalker Labs release key,
   `28FB E823 E55F 0E1B 03C8  4298 37F0 8092 1B1E 4AF7`
   ([`packaging/release-key.asc`](packaging/release-key.asc)).
-- **Arch Linux:** `farsight-server-bin.PKGBUILD` and
-  `farsight-desktop-bin.PKGBUILD` on each release, which repackage the
-  .debs; save one as `PKGBUILD` in an empty directory and run `makepkg -si`.
+- **Arch Linux:** `farsight-server-bin` and `farsight-desktop-bin` on the
+  AUR, which repackage the .debs:
+  ```sh
+  git clone https://aur.archlinux.org/farsight-server-bin.git   # or farsight-desktop-bin
+  cd farsight-server-bin && makepkg -si
+  ```
+  or with an AUR helper, `yay -S farsight-server-bin`. Each release also has
+  the PKGBUILDs, pre-releases included.
 - **macOS:** `brew install cloudwalkerlabs/tap/farsight-desktop`.
 
 ## Building
