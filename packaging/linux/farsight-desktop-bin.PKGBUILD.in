@@ -1,9 +1,9 @@
 # Maintainer: fanchao <dev at fanchao dot dev>
 #
 # Repackages the release's .deb for Arch Linux. The build workflow fills in
-# the @...@ fields (packaging/linux/pkgbuild.sh) and attaches the result to
-# the release as farsight-desktop-bin.PKGBUILD; save it as PKGBUILD and run
-# makepkg -si.
+# the @...@ fields (packaging/linux/pkgbuild.sh), attaches the result to the
+# release as farsight-desktop-bin.PKGBUILD and, for a full release, pushes it to
+# the AUR as farsight-desktop-bin.
 
 pkgname=farsight-desktop-bin
 pkgver=@PKGVER@

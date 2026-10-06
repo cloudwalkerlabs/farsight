@@ -2,8 +2,9 @@
 # packages: .debs (amd64 and arm64), PKGBUILDs that repackage those for Arch
 # Linux, and a Homebrew formula for the macOS client. A published release
 # gets them all attached; a full release (not a pre-release) also publishes
-# the signed apt repository to GitHub Pages and the formula to
-# cloudwalkerlabs/homebrew-tap. The scripts it runs are in packaging/.
+# the signed apt repository to GitHub Pages, the PKGBUILDs to the AUR and
+# the formula to cloudwalkerlabs/homebrew-tap. The scripts it runs are in
+# packaging/.
 #
 # Secrets, the cloudwalkerlabs organization's unless this repository sets its
 # own of the same name (without them, everything but publishing still runs):
@@ -11,6 +12,9 @@
 #       subkey (packaging/release_key.sh) and its passphrase
 #   TAP_DEPLOY_KEY  a deploy key of cloudwalkerlabs/homebrew-tap, with write
 #       access
+#   AUR_SSH_KEY  an SSH key of the AUR account that maintains
+#       farsight-server-bin and farsight-desktop-bin (the first push
+#       creates them)
 # GitHub Pages must be on, with Settings → Pages → Source: GitHub Actions.
 name: build
 
@@ -209,7 +213,11 @@ jobs:
             cp "pkg/$package-bin.PKGBUILD" "$build/PKGBUILD"
             cp "debs/${package}_${DEB}_amd64.deb" "$build/"
             chown -R builder "$build"
-            su builder -c "cd $build && makepkg --nodeps --noconfirm && makepkg --printsrcinfo"
+            su builder -c "cd $build && makepkg --nodeps --noconfirm && makepkg --printsrcinfo > .SRCINFO"
+            # The AUR repository's files.
+            mkdir -p "aur/$package-bin"
+            cp "$build/PKGBUILD" "$build/.SRCINFO" "aur/$package-bin/"
+            cat "aur/$package-bin/.SRCINFO"
             pacman -U --noconfirm "$build/$package"-bin-*.pkg.tar.zst
             packaging/linux/check_installed.sh "$package"
             pacman -R --noconfirm "$package-bin"
@@ -218,6 +226,12 @@ jobs:
         with:
           name: arch
           path: pkg/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur
+          path: aur
+          include-hidden-files: true
           if-no-files-found: error
 
   macos:
@@ -389,7 +403,10 @@ jobs:
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/* --clobber -R "${{ github.repository }}"
+        run: |
+          # The AUR's copies of the PKGBUILDs, which are attached as they are.
+          rm -r artifacts/*-bin
+          gh release upload "${{ github.event.release.tag_name }}" artifacts/* --clobber -R "${{ github.repository }}"
 
   # Publishes the apt repository (packaging/linux/apt_repo.sh), holding this
   # release's .debs, to GitHub Pages at /apt, once they are attached. A
@@ -485,3 +502,45 @@ jobs:
           git -c user.name=fanchao -c user.email=dev@fanchao.dev \
             commit -m "farsight-desktop $VERSION"
           git push origin HEAD
+
+  # Pushes the release's PKGBUILDs, with their .SRCINFO, to the AUR
+  # (farsight-server-bin, farsight-desktop-bin), once the .debs they download
+  # are attached. The arch job checked that they build and install.
+  aur:
+    name: Publish to the AUR
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: aur
+          path: aur
+      - env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ssh=$RUNNER_TEMP/ssh
+          install -d -m 700 "$ssh"
+          printf '%s\n' "$AUR_SSH_KEY" >"$ssh/key"
+          chmod 600 "$ssh/key"
+          # The AUR's, SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4 as
+          # https://aur.archlinux.org lists it.
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' >"$ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh/known_hosts -o StrictHostKeyChecking=yes"
+          for pkgname in farsight-server-bin farsight-desktop-bin; do
+            repo=$RUNNER_TEMP/$pkgname
+            # A package that isn't on the AUR yet clones as an empty
+            # repository.
+            git clone "ssh://aur@aur.archlinux.org/$pkgname.git" "$repo"
+            cp "aur/$pkgname/PKGBUILD" "aur/$pkgname/.SRCINFO" "$repo/"
+            git -C "$repo" add PKGBUILD .SRCINFO
+            if git -C "$repo" diff --cached --quiet; then
+              echo "$pkgname is already at $VERSION"
+              continue
+            fi
+            git -C "$repo" -c user.name=fanchao -c user.email=dev@fanchao.dev \
+              commit -m "$VERSION"
+            # The AUR takes only master.
+            git -C "$repo" push origin HEAD:master
+          done
