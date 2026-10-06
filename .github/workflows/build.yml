@@ -1,3 +1,17 @@
+# Builds the server, the desktop clients and the Android app, and their
+# packages: .debs (amd64 and arm64), PKGBUILDs that repackage those for Arch
+# Linux, and a Homebrew formula for the macOS client. A published release
+# gets them all attached; a full release (not a pre-release) also publishes
+# the signed apt repository to GitHub Pages and the formula to
+# cloudwalkerlabs/homebrew-tap. The scripts it runs are in packaging/.
+#
+# Secrets, the cloudwalkerlabs organization's unless this repository sets its
+# own of the same name (without them, everything but publishing still runs):
+#   RELEASE_GPG_KEY, RELEASE_GPG_PASSPHRASE  the release key's signing
+#       subkey (packaging/release_key.sh) and its passphrase
+#   TAP_DEPLOY_KEY  a deploy key of cloudwalkerlabs/homebrew-tap, with write
+#       access
+# GitHub Pages must be on, with Settings → Pages → Source: GitHub Actions.
 name: build
 
 on:
@@ -12,9 +26,66 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
-  linux:
-    name: Linux x86_64 (server and desktop client)
+  # Package versions come from the release's tag, MAJOR.MINOR.PATCH with an
+  # optional leading "v"; other builds are 0.0.0 and the commit, which sorts
+  # before any release.
+  version:
+    name: Version
     runs-on: ubuntu-latest
+    outputs:
+      # Homebrew's.
+      version: ${{ steps.version.outputs.version }}
+      deb: ${{ steps.version.outputs.deb }}
+      # Empty without a release.
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$TAG" ]; then
+            version=${TAG#v}
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag '$TAG' isn't MAJOR.MINOR.PATCH (optionally prefixed with v)"
+              exit 1
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "deb=$version" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev+${SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deb=0.0.0~dev+${SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The website job signs with the release key, but runs only for a
+  # release: check here, on every run, that the secrets can sign.
+  release-key:
+    name: Release key
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$RELEASE_GPG_KEY" ]; then
+            echo "::warning::No RELEASE_GPG_KEY secret: a release can't publish the apt repository"
+            exit 0
+          fi
+          packaging/release_key.sh "$RUNNER_TEMP/gnupg"
+
+  linux:
+    name: Linux ${{ matrix.arch }} (server and desktop client)
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     # Debian 12's glibc (2.36): the binaries run on distributions as old.
     container: debian:12
     steps:
@@ -35,14 +106,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ffmpeg-prefix
-          key: ffmpeg-linux-debian12-${{ hashFiles('tools/ffmpeg/build.sh') }}
+          key: ffmpeg-linux-${{ matrix.arch }}-debian12-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: tools/ffmpeg/build.sh ffmpeg-prefix
       # ffmpeg-sys-next's rlib bundles FFmpeg's static libraries, so a
       # new FFmpeg needs a fresh one.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: debian12-ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
+          key: ${{ matrix.arch }}-debian12-ffmpeg-${{ hashFiles('tools/ffmpeg/build.sh') }}
       - run: cargo build --release --locked -p farsight-server -p farsight-desktop
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/ffmpeg-prefix/lib/pkgconfig
@@ -53,7 +124,7 @@ jobs:
           readelf -d farsight-server farsight-desktop | grep -E '^File|NEEDED'
           # (`! cmd` alone wouldn't fail the step: -e ignores it.)
           if readelf -d farsight-server farsight-desktop | grep NEEDED |
-            grep -vE '\[(lib(c|m|gcc_s|pipewire-0\.3|gbm|asound)\.so\.[0-9]+|ld-linux-x86-64\.so\.2)\]'; then exit 1; fi
+            grep -vE '\[(lib(c|m|gcc_s|pipewire-0\.3|gbm|asound)\.so\.[0-9]+|ld-linux-(x86-64|aarch64)\.so\.[0-9]+)\]'; then exit 1; fi
           echo "glibc: $(objdump -T farsight-server farsight-desktop | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n 1)"
           ./farsight-server --help > /dev/null
           ./farsight-desktop --help > /dev/null
@@ -62,14 +133,96 @@ jobs:
           mkdir -p out/farsight
           cp target/release/farsight-server target/release/farsight-desktop README.md dist/farsight-server@.service out/farsight/
           cp ffmpeg-prefix/notice/* out/farsight/
-          tar -C out -czf farsight-linux-x86_64.tar.gz farsight
+          mkdir pkg
+          tar -C out -czf "pkg/farsight-linux-$(uname -m).tar.gz" farsight
+          for package in farsight-server farsight-desktop; do
+            packaging/linux/build_deb.sh "$package" "target/release/$package" \
+              ffmpeg-prefix/notice "${{ needs.version.outputs.deb }}" pkg
+          done
+          for deb in pkg/*.deb; do
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
-          path: farsight-linux-x86_64.tar.gz
+          name: linux-${{ matrix.arch }}
+          path: pkg/*
+          if-no-files-found: error
+
+  # Installs each .deb on clean systems, with its Depends alone, and checks
+  # that what it runs and loads is there.
+  linux-check:
+    name: ${{ matrix.package }} (${{ matrix.arch }}) installs on ${{ matrix.image }}
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64]
+        image: ["debian:12", "debian:13", "ubuntu:24.04"]
+        package: [farsight-server, farsight-desktop]
+        include:
+          - { arch: arm64, image: "debian:12", package: farsight-server }
+          - { arch: arm64, image: "debian:12", package: farsight-desktop }
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: linux-${{ matrix.arch }}
+          path: pkg
+      - run: packaging/linux/check_deb.sh pkg/${{ matrix.package }}_*.deb
+
+  # PKGBUILDs that repackage the release's .debs for Arch Linux. Each builds
+  # and installs here as a user would, from the .deb here rather than the
+  # release (makepkg takes a source that is already there).
+  arch:
+    name: Arch Linux PKGBUILDs
+    needs: [version, linux]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: linux-*
+          path: debs
+          merge-multiple: true
+      - env:
+          TAG: ${{ needs.version.outputs.tag || 'untagged' }}
+          DEB: ${{ needs.version.outputs.deb }}
+        run: |
+          # The container image leaves out /usr/share/doc, which a full
+          # system has.
+          sed -i '/^NoExtract/d' /etc/pacman.conf
+          pacman -Syu --noconfirm
+          # makepkg refuses to run as root.
+          useradd -m builder
+          mkdir pkg
+          for package in farsight-server farsight-desktop; do
+            packaging/linux/pkgbuild.sh "$package" "$TAG" \
+              "debs/${package}_${DEB}_amd64.deb" "debs/${package}_${DEB}_arm64.deb" \
+              > "pkg/$package-bin.PKGBUILD"
+            cat "pkg/$package-bin.PKGBUILD"
+            build=/home/builder/$package
+            mkdir "$build"
+            cp "pkg/$package-bin.PKGBUILD" "$build/PKGBUILD"
+            cp "debs/${package}_${DEB}_amd64.deb" "$build/"
+            chown -R builder "$build"
+            su builder -c "cd $build && makepkg --nodeps --noconfirm && makepkg --printsrcinfo"
+            pacman -U --noconfirm "$build/$package"-bin-*.pkg.tar.zst
+            packaging/linux/check_installed.sh "$package"
+            pacman -R --noconfirm "$package-bin"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: pkg/*
+          if-no-files-found: error
 
   macos:
     name: macOS arm64 (desktop client)
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -100,11 +253,42 @@ jobs:
           mkdir -p out/farsight
           cp target/release/farsight-desktop README.md out/farsight/
           cp ffmpeg-prefix/notice/* out/farsight/
-          tar -C out -czf farsight-desktop-macos-arm64.tar.gz farsight
+          mkdir pkg
+          tar -C out -czf pkg/farsight-desktop-macos-arm64.tar.gz farsight
+      # Installs the tarball through the formula, from a local tap and the
+      # file here.
+      - name: Check the Homebrew formula
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tarball=pkg/farsight-desktop-macos-arm64.tar.gz
+          brew tap-new --no-git farsight/local
+          formula=$(brew --repository farsight/local)/Formula/farsight-desktop.rb
+          packaging/macos/formula.sh "$VERSION" "file://$PWD/$tarball" "$tarball" >"$formula"
+          cat "$formula"
+          brew style "$formula" || echo "::warning::brew style has comments on the formula"
+          brew install farsight/local/farsight-desktop
+          brew test farsight/local/farsight-desktop
+          farsight-desktop --help > /dev/null
+          brew uninstall farsight/local/farsight-desktop
+          brew untap farsight/local
+      # The release's, downloading the tarball from it.
+      - if: needs.version.outputs.tag != ''
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tarball=pkg/farsight-desktop-macos-arm64.tar.gz
+          packaging/macos/formula.sh "$VERSION" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(basename "$tarball")" \
+            "$tarball" > pkg/farsight-desktop.rb
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: farsight-desktop-macos-arm64.tar.gz
+          path: pkg/*
+          if-no-files-found: error
 
   windows:
     name: Windows x86_64 (desktop client)
@@ -194,7 +378,7 @@ jobs:
   release:
     name: Upload to the release
     if: github.event_name == 'release'
-    needs: [linux, macos, windows, android]
+    needs: [linux, linux-check, arch, macos, windows, android, release-key]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -206,3 +390,98 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" artifacts/* --clobber -R "${{ github.repository }}"
+
+  # Publishes the apt repository (packaging/linux/apt_repo.sh), holding this
+  # release's .debs, to GitHub Pages at /apt, once they are attached. A
+  # pre-release leaves it on the last full release.
+  website:
+    name: apt repository on GitHub Pages
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: linux-*
+          path: debs
+          merge-multiple: true
+      - name: Build
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+          packaging/release_key.sh "$RUNNER_TEMP/gnupg"
+          GNUPGHOME=$RUNNER_TEMP/gnupg packaging/linux/apt_repo.sh _site/apt debs/*.deb
+          # The site is only the repository; its root sends people to the
+          # instructions.
+          cat > _site/index.html <<HTML
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>farsight</title>
+          <meta http-equiv="refresh" content="0; url=https://github.com/$GITHUB_REPOSITORY#downloads">
+          <a href="https://github.com/$GITHUB_REPOSITORY#downloads">farsight's downloads</a>
+          HTML
+      # Installs from the repository on clean systems, as README.md says.
+      # Debian 13 checks signatures with sqv, Debian 12 with gpgv.
+      - name: Check the apt repository
+        run: |
+          for image in debian:12 debian:13 ubuntu:24.04; do
+            docker run --rm -v "$PWD:/w" -w /w "$image" \
+              packaging/linux/check_apt_repo.sh _site/apt
+          done
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Pushes the release's formula to the tap
+  # (brew install cloudwalkerlabs/tap/farsight-desktop), once the tarball it
+  # downloads is attached. The macOS job checked that it installs.
+  homebrew:
+    name: Publish to the Homebrew tap
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: macos
+          path: pkg
+      - env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ssh=$RUNNER_TEMP/ssh
+          install -d -m 700 "$ssh"
+          printf '%s\n' "$TAP_DEPLOY_KEY" >"$ssh/key"
+          chmod 600 "$ssh/key"
+          # GitHub's, as https://api.github.com/meta lists it.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git clone git@github.com:cloudwalkerlabs/homebrew-tap.git "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          cp pkg/farsight-desktop.rb "$RUNNER_TEMP/tap/Formula/"
+          cd "$RUNNER_TEMP/tap"
+          git add Formula/farsight-desktop.rb
+          if git diff --cached --quiet; then
+            echo "The formula is already at $VERSION"
+            exit 0
+          fi
+          git -c user.name=fanchao -c user.email=dev@fanchao.dev \
+            commit -m "farsight-desktop $VERSION"
+          git push origin HEAD

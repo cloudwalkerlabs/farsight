@@ -1,0 +1,40 @@
+# Maintainer: fanchao <dev at fanchao dot dev>
+#
+# Repackages the release's .deb for Arch Linux. The build workflow fills in
+# the @...@ fields (packaging/linux/pkgbuild.sh) and attaches the result to
+# the release as farsight-desktop-bin.PKGBUILD; save it as PKGBUILD and run
+# makepkg -si.
+
+pkgname=farsight-desktop-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Low-latency remote desktop client for farsight servers'
+arch=(x86_64 aarch64)
+url='https://github.com/cloudwalkerlabs/farsight'
+license=('MIT OR Apache-2.0')
+# The .deb's Depends under Arch's names: glibc, gcc-libs, libpipewire and
+# alsa-lib from the ELF file, and the EGL and Wayland libraries winit and
+# glutin load at runtime.
+depends=(
+  glibc gcc-libs libpipewire alsa-lib
+  libglvnd mesa wayland libxkbcommon
+)
+optdepends=(
+  'libva: VA-API decoding'
+  'libva-driver: VA-API decoding'
+)
+provides=(farsight-desktop)
+conflicts=(farsight-desktop)
+# Ship the binary exactly as it is in the .deb.
+options=(!strip !debug)
+_release=$url/releases/download/@TAG@
+source_x86_64=("$_release/farsight-desktop_@DEBVER@_amd64.deb")
+source_aarch64=("$_release/farsight-desktop_@DEBVER@_arm64.deb")
+sha256sums_x86_64=('@SHA256_AMD64@')
+sha256sums_aarch64=('@SHA256_ARM64@')
+
+package() {
+  bsdtar -xf data.tar.* -C "$pkgdir"
+  install -Dm644 "$pkgdir/usr/share/doc/farsight-desktop/copyright" \
+    "$pkgdir/usr/share/licenses/$pkgname/copyright"
+}
