@@ -119,6 +119,10 @@ pub struct EncoderCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub hardware: bool,
+    /// Takes the server's frames without a copy through memory. An encoder
+    /// that needs one costs several times the CPU (measured: ~40% against
+    /// ~8% at 3456×2178, NVENC read back from the Intel GPU against VA-API).
+    pub zero_copy: bool,
 }
 
 /// A format both ends support, and the limits both share.
@@ -131,6 +135,8 @@ pub struct Choice {
     pub encoder: usize,
     /// How many ends do it in hardware: 0, 1 or 2.
     pub hardware: u8,
+    /// The encoder takes frames without a copy.
+    pub zero_copy: bool,
 }
 
 impl Choice {
@@ -142,8 +148,10 @@ impl Choice {
 /// Every format both ends support, best first:
 ///
 /// 1. hardware on both ends, then on one;
-/// 2. the mode: 4:4:4 first for text, 4:2:0 first for motion;
-/// 3. codec efficiency: AV1 > HEVC > H.264.
+/// 2. a zero-copy encoder: ahead of the mode, since a copy costs more CPU
+///    than 4:4:4 gains;
+/// 3. the mode: 4:4:4 first for text, 4:2:0 first for motion;
+/// 4. codec efficiency: AV1 > HEVC > H.264.
 ///
 /// Encoders earlier in `encoders` win ties, so the server lists its
 /// preferred backend first. When one format has several encoders or
@@ -158,9 +166,10 @@ pub fn rank(encoders: &[EncoderCaps], decoders: &[DecoderCaps], mode: Mode) -> V
                 max_height: e.max_height.min(d.max_height),
                 encoder: i,
                 hardware: e.hardware as u8 + d.hardware as u8,
+                zero_copy: e.zero_copy,
             };
             match choices.iter_mut().find(|x| x.format == c.format) {
-                Some(x) if c.hardware > x.hardware => *x = c,
+                Some(x) if (c.hardware, c.zero_copy) > (x.hardware, x.zero_copy) => *x = c,
                 Some(_) => {}
                 None => choices.push(c),
             }
@@ -171,6 +180,7 @@ pub fn rank(encoders: &[EncoderCaps], decoders: &[DecoderCaps], mode: Mode) -> V
     choices.sort_by_key(|c| {
         (
             std::cmp::Reverse(c.hardware),
+            !c.zero_copy,
             (c.format.chroma == Chroma::Yuv444) != wants_444,
             std::cmp::Reverse(c.format.codec.efficiency()),
         )
@@ -224,7 +234,10 @@ mod tests {
     const AV1: Format = fmt(Codec::Av1, Chroma::Yuv420);
 
     fn enc(format: Format, hardware: bool) -> EncoderCaps {
-        EncoderCaps { format, max_width: 4096, max_height: 4096, hardware }
+        EncoderCaps { format, max_width: 4096, max_height: 4096, hardware, zero_copy: false }
+    }
+    fn zero_copy(format: Format) -> EncoderCaps {
+        EncoderCaps { zero_copy: true, ..enc(format, true) }
     }
     fn dec(format: Format, hardware: bool) -> DecoderCaps {
         DecoderCaps { format, max_width: 8192, max_height: 8192, hardware, partial_decode: false }
@@ -246,6 +259,27 @@ mod tests {
         let d = [dec(H264, false), dec(HEVC, false), dec(AV1, false), dec(H264_444, false)];
         assert_eq!(formats(&rank(&e, &d, Mode::Text)), [H264_444, AV1, HEVC, H264]);
         assert_eq!(formats(&rank(&e, &d, Mode::Motion)), [AV1, HEVC, H264, H264_444]);
+    }
+
+    #[test]
+    fn zero_copy_before_mode() {
+        // VA-API without 4:4:4, NVENC with it; a client that reports no
+        // hardware decoders (as on macOS).
+        let e = [zero_copy(H264), zero_copy(HEVC), enc(H264, true), enc(H264_444, true)];
+        let d = [dec(H264, false), dec(HEVC, false), dec(H264_444, false)];
+        let c = rank(&e, &d, Mode::Text);
+        assert_eq!(formats(&c), [HEVC, H264, H264_444]);
+        assert!(c[0].zero_copy && c[1].zero_copy);
+        // Hardware on both ends still comes first.
+        let d = [dec(H264, false), dec(HEVC, false), dec(H264_444, true)];
+        assert_eq!(formats(&rank(&e, &d, Mode::Text)), [H264_444, HEVC, H264]);
+    }
+
+    #[test]
+    fn zero_copy_encoder_wins_a_format() {
+        let e = [enc(H264, true), zero_copy(H264)];
+        let c = rank(&e, &[dec(H264, true)], Mode::Motion);
+        assert_eq!((c.len(), c[0].encoder), (1, 1));
     }
 
     #[test]

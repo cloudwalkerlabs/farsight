@@ -269,6 +269,8 @@ pub fn probe() -> Vec<EncoderCaps> {
                 max_width,
                 max_height,
                 hardware: true,
+                // Read back from the rendering GPU (`readback`).
+                zero_copy: false,
             });
         }
     }

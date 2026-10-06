@@ -406,10 +406,13 @@ compositor reports exact damage, so only what changed is sent:
   1. Hardware on both ends. (Measured in M2: HEVC wins on an HD 530 but
      costs 4 ms more to encode than H.264; a measured encode time should
      come into the ranking.)
-  2. The mode the user asked for: "text" mode prefers 4:4:4, "motion" mode
+  2. A zero-copy encoder (VA-API) over one that reads frames back through
+     memory (NVENC from another GPU), ahead of the mode: at 3456×2178 the
+     read back cost ~40% CPU against ~8%.
+  3. The mode the user asked for: "text" mode prefers 4:4:4, "motion" mode
      prefers efficiency.
-  3. Codec efficiency: AV1 > HEVC > H.264.
-  4. Latency.
+  4. Codec efficiency: AV1 > HEVC > H.264.
+  5. Latency.
 - The server returns its choice together with the fallback order.
   **Negotiation can run again mid-session**: when a resize exceeds the codec
   level, the user switches mode, or a decoder fails.
