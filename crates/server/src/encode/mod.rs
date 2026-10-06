@@ -73,6 +73,7 @@ pub fn probe(render_node: &Path, backends: &[Backend]) -> Vec<EncoderInfo> {
                             max_width: s.max_width,
                             max_height: s.max_height,
                             hardware: true,
+                            zero_copy: true,
                         },
                         backend,
                         low_power: s.low_power,

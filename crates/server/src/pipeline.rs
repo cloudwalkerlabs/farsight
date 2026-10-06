@@ -566,7 +566,14 @@ pub fn negotiate(encoders: &[EncoderInfo], decoders: &[farsight_proto::codec::De
 /// Encoder `i` as a choice of its own, for when there is no client.
 fn choice(encoders: &[EncoderInfo], i: usize) -> Choice {
     let c = &encoders[i].caps;
-    Choice { format: c.format, max_width: c.max_width, max_height: c.max_height, encoder: i, hardware: c.hardware as u8 }
+    Choice {
+        format: c.format,
+        max_width: c.max_width,
+        max_height: c.max_height,
+        encoder: i,
+        hardware: c.hardware as u8,
+        zero_copy: c.zero_copy,
+    }
 }
 
 /// Starts a new epoch at `w`×`h`: opens the first format that fits and
