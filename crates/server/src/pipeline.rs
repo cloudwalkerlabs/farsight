@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,12 +66,22 @@ struct Idle {
     refined: bool,
     /// The idle timer is armed.
     timer: bool,
+    /// Refinements asked for since the change.
+    sent: u32,
 }
+
+/// No refinement encoded yet, in [`Shared::refine_offset`].
+const NO_REFINEMENT: u32 = u32::MAX;
+
+/// The most refinements after one change. Past the first, each costs
+/// little: it refines what the last one left.
+const MAX_REFINEMENTS: u32 = 12;
 
 /// Notes that a new picture went out, and arms the idle timer.
 fn changed(host: &mut Host) {
     let p = &mut host.pipeline;
     p.idle.last_change = Instant::now();
+    p.idle.sent = 0;
     p.idle.refined = p.opts.refine_qp >= p.opts.qp && !matches!(p.frames, Some((_, Encoding::Tiles)));
     if !p.idle.timer && !p.idle.refined {
         p.idle.timer = true;
@@ -92,11 +102,24 @@ fn idle_tick(host: &mut Host) -> TimeoutAction {
     if p.shared.in_flight.load(Ordering::Acquire) > 0 {
         return TimeoutAction::ToDuration(Duration::from_millis(10));
     }
-    p.idle.timer = false;
-    p.idle.refined = true;
-    tracing::debug!("idle: refining");
+    // A refinement that went out above the base QP, under the rate
+    // control's offset, is refined again while the offset comes down, so
+    // the picture doesn't stay coarse for want of another change. One not
+    // encoded yet (skipped for the backlog) is asked for again. Before the
+    // first, the offset is an earlier picture's.
+    let offset = p.shared.refine_offset.swap(NO_REFINEMENT, Ordering::AcqRel);
+    let video = matches!(p.frames, Some((_, Encoding::Video(_))));
+    // Tiles go lossless at once.
+    let again = p.idle.sent == 0 || (video && offset != 0);
+    if !again || p.idle.sent >= MAX_REFINEMENTS {
+        p.idle.timer = false;
+        p.idle.refined = true;
+        return TimeoutAction::Drop;
+    }
+    p.idle.sent += 1;
+    tracing::debug!(n = p.idle.sent, "idle: refining");
     encode_current(host, true);
-    TimeoutAction::Drop
+    TimeoutAction::ToDuration(IDLE)
 }
 
 /// The longest a layout change holds frames back.
@@ -235,6 +258,9 @@ struct Shared {
     answered: AtomicU64,
     /// The bitrate to keep video within.
     video_target: Arc<AtomicU64>,
+    /// The QP offset the latest refinement went out at, from the encode
+    /// thread; [`NO_REFINEMENT`] until one has since the idle timer looked.
+    refine_offset: AtomicU32,
 }
 
 enum Job {
@@ -278,6 +304,7 @@ impl Pipeline {
             in_flight: AtomicUsize::new(0),
             answered: AtomicU64::new(NONE),
             video_target: opts.video_target.clone(),
+            refine_offset: AtomicU32::new(NO_REFINEMENT),
         });
         let thread_shared = shared.clone();
         let qp = encode::rate::QpControl::new(51u32.saturating_sub(opts.qp));
@@ -294,7 +321,7 @@ impl Pipeline {
             last_commit: None,
             mode: Mode::default(),
             hold: None,
-            idle: Idle { last_change: Instant::now(), refined: true, timer: false },
+            idle: Idle { last_change: Instant::now(), refined: true, timer: false, sent: 0 },
             shared,
             jobs: Some(jobs),
             encode_thread: Some(thread),
@@ -859,6 +886,9 @@ fn encode_thread(
             true => qp.next(Instant::now(), shared.video_target.load(Ordering::Relaxed)),
             false => 0,
         };
+        if kind == FrameKind::Refine {
+            shared.refine_offset.store(qp_offset, Ordering::Release);
+        }
         let output = match codec.encode(job.input, job.t_commit as i64, number, kind, qp_offset) {
             Ok(o) => o,
             Err(err) => {

@@ -218,7 +218,9 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
     trips measure the path rather than the peer's ack timer;
   - the rate paces video (below) and, at 85% less FEC and audio, is the
     encoder's target: encoders run at a constant QP, and a QP offset rises
-    with the overspend (six per doubling) and falls a step at a time.
+    with the overspend (six per doubling), up to 12; past that a desktop
+    is better at fewer frames than in blocks that take seconds to clean
+    up. It falls as far as the spending allows as soon as it drops.
     While the slowest connection still has over 20 ms of video queued,
     the pipeline skips encoding (a frame skipped costs nothing; one
     dropped after encoding breaks the stream);
@@ -334,7 +336,9 @@ off.
    - LTR/RFI for loss recovery. Intra-refresh is the fallback and a full
      IDR the last resort.
 6. **Idle refinement:** when damage stops, send one or two frames at a much
-   lower QP so static text becomes sharp.
+   lower QP so static text becomes sharp. One that went out above it,
+   under the rate control's offset, is sent again every 250 ms while the
+   offset comes down.
 7. **Text clarity, in order of preference:** HEVC RExt 4:4:4 where both
    ends support it; then an AVC444-style dual stream; then 4:2:0 with idle
    refinement.

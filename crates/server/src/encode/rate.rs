@@ -7,7 +7,11 @@
 //! whole picture.
 //!
 //! Six more QP roughly halves the bits, so a stream at twice its target
-//! gets six more at once, and one under it loses one at a time.
+//! gets six more at once. The offset stops at [`MAX_OFFSET`]: past that
+//! the picture turns to blocks that later frames take seconds to clean
+//! up, and a desktop is better at a lower frame rate. Beyond it the
+//! pipeline skips frames while the network's queue drains. Once spending
+//! drops, the offset falls as far as the spending allows at once.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -27,11 +31,15 @@ const MAX_DEBT: Duration = Duration::from_secs(1);
 const RISE_EVERY: Duration = Duration::from_millis(200);
 const FALL_EVERY: Duration = Duration::from_millis(250);
 
+/// The most the offset rises above the base QP, on H.264's scale: 24
+/// becomes 36, still readable.
+pub const MAX_OFFSET: u32 = 12;
+
 /// One QP less costs about this much more.
 const STEP_COST: f64 = 1.12;
 
-/// The offset falls when a step down would still spend under this share
-/// of the target.
+/// The offset falls by as many steps as would still spend under this
+/// share of the target.
 const FALL_BELOW: f64 = 0.95;
 
 #[derive(Debug)]
@@ -47,8 +55,10 @@ pub struct QpControl {
 }
 
 impl QpControl {
-    /// `max_offset`: how far above the base QP the codec's range goes.
+    /// `max_offset`: how far above the base QP the codec's range goes;
+    /// the offset stays within [`MAX_OFFSET`] too.
     pub fn new(max_offset: u32) -> Self {
+        let max_offset = max_offset.min(MAX_OFFSET);
         Self { budget: 0.0, last: None, spent: VecDeque::new(), offset: 0, max_offset, changed: None }
     }
 
@@ -68,8 +78,11 @@ impl QpControl {
             let steps = (6.0 * (spending / target).log2()).round().clamp(1.0, 6.0) as u32;
             self.offset = (self.offset + steps).min(self.max_offset);
             self.changed = Some(now);
-        } else if self.offset > 0 && self.budget >= 0.0 && spending * STEP_COST < target * FALL_BELOW && since >= FALL_EVERY {
-            self.offset -= 1;
+        } else if self.offset > 0 && spending * STEP_COST < target * FALL_BELOW && since >= FALL_EVERY {
+            // Debt doesn't hold it up: the network's queue, which the
+            // pipeline skips frames for, is what an overspend costs.
+            let room = if spending > 0.0 { (target * FALL_BELOW / spending).ln() / STEP_COST.ln() } else { f64::MAX };
+            self.offset -= (room as u32).clamp(1, self.offset);
             self.changed = Some(now);
         }
         self.offset
@@ -129,6 +142,27 @@ mod tests {
         qp.spent(t, 300_000);
         t += Duration::from_millis(16);
         assert_eq!(qp.next(t, 10_000_000), 0);
+    }
+
+    #[test]
+    fn stops_at_the_cap() {
+        let mut qp = QpControl::new(27);
+        let mut t = Instant::now();
+        // 64 times the target would take 36.
+        run(&mut qp, &mut t, 300, 40_000.0, 300_000);
+        assert_eq!(qp.offset, MAX_OFFSET);
+    }
+
+    #[test]
+    fn falls_at_once_when_the_burst_ends() {
+        let mut qp = QpControl::new(27);
+        let mut t = Instant::now();
+        run(&mut qp, &mut t, 120, 200_000.0, 20_000_000);
+        assert_eq!(qp.offset, MAX_OFFSET);
+        // A cursor blinking: small frames, deep in debt still. Down within
+        // the window and one fall, not a step every 250 ms.
+        run(&mut qp, &mut t, 36, 2_000.0, 20_000_000);
+        assert_eq!(qp.offset, 0);
     }
 
     #[test]
