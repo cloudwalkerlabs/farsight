@@ -25,6 +25,8 @@ use farsight_proto::control::{ClientMessage, ClipboardRequest, Hello, MAX_CLIPBO
 use farsight_proto::datagram::{self, Datagram, Nack, Pong};
 use farsight_proto::tiles::TilesHeader;
 use farsight_proto::input::InputPacket;
+
+use crate::window::Window;
 use smithay::reexports::calloop::channel::Sender as HostSender;
 use tokio::sync::mpsc;
 
@@ -43,6 +45,9 @@ pub enum ToHost {
     /// it changed.
     ClipboardRead(ConnId, ClipboardRequest, tokio::sync::oneshot::Sender<Option<Vec<u8>>>),
     Disconnected(ConnId),
+    /// The clients' decoders caught up after the pipeline skipped a frame
+    /// for them: encode the current picture.
+    CaughtUp,
 }
 
 /// From the host (or the encode thread) to the network.
@@ -148,6 +153,8 @@ pub struct Options {
     /// When the video queued for the slowest connection will have gone, in
     /// the host's µs: the pipeline encodes nothing new until about then.
     pub video_drain_at: Arc<AtomicU64>,
+    /// How far the clients' decoders are behind.
+    pub decoding: Arc<crate::window::Decoding>,
     /// The host's clock, which pongs and frame timestamps are in.
     pub start: Instant,
     pub audio: Arc<Audio>,
@@ -167,6 +174,8 @@ struct Conn {
     /// The client controls the session and has a microphone.
     mic: bool,
     view_only: bool,
+    /// Frames sent that the client hasn't decoded yet.
+    window: Window,
 }
 
 /// Starts the network thread and returns where to send it frames and
@@ -225,6 +234,37 @@ impl Shared {
             // A frame the client has none of: its data shards.
             true => datagrams[..*data as usize].to_vec(),
             false => nack.shards.iter().filter_map(|&i| datagrams.get(i as usize).cloned()).collect(),
+        }
+    }
+
+    /// The frame or update captured at `capture_us` was queued for every
+    /// connection. Counted from when its answer would be back if decoding
+    /// took no time, it is at the decoder as long as it really is there.
+    fn sent(&self, conns: &mut [Conn], capture_us: u64) {
+        let now = self.opts.start.elapsed();
+        for c in conns.iter_mut() {
+            let arrives = now + c.sched.backlog() + c.conn.rtt();
+            c.window.sent(capture_us, arrives.as_micros() as u64);
+        }
+        self.update_decoding(conns);
+    }
+
+    /// Client `id` decoded everything captured up to `capture_us`.
+    fn decoded(&self, id: ConnId, capture_us: u64) {
+        let mut conns = self.conns.lock().unwrap();
+        if let Some(c) = conns.iter_mut().find(|c| c.id == id) {
+            c.window.decoded(capture_us);
+        }
+        self.update_decoding(&mut conns);
+    }
+
+    /// Notes when frames are at the clients' decoders, and wakes a
+    /// pipeline waiting for them if they have room now.
+    fn update_decoding(&self, conns: &mut [Conn]) {
+        let now = self.opts.start.elapsed().as_micros() as u64;
+        let arrivals = conns.iter_mut().filter_map(|c| c.window.arrivals(now));
+        if self.opts.decoding.set(arrivals, now) {
+            let _ = self.host.send(ToHost::CaughtUp);
         }
     }
 
@@ -287,6 +327,7 @@ async fn run(endpoint: quinn::Endpoint, opts: Options, host: HostSender<ToHost>,
             let mut conns = shared.conns.lock().unwrap();
             conns.retain(|c| c.id != id);
             shared.update_listening(&conns);
+            shared.update_decoding(&mut conns);
             let _ = shared.host.send(ToHost::Disconnected(id));
         });
     }
@@ -322,7 +363,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
             );
             (video, logged) = (VideoSent::default(), Instant::now());
         }
-        let conns = shared.conns.lock().unwrap();
+        let mut conns = shared.conns.lock().unwrap();
         match msg {
             ToNet::Shutdown(reason) => {
                 for c in conns.iter() {
@@ -353,6 +394,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     c.sched.send_frame(datagrams.clone(), f.keyframe);
                 }
                 shared.note_backlog(&conns);
+                shared.sent(&mut conns, f.capture_us);
                 let data = match Datagram::decode(&datagrams[0]) {
                     Some(Datagram::Video(h, _)) => h.data,
                     _ => 0,
@@ -396,6 +438,7 @@ async fn dispatch(mut rx: mpsc::UnboundedReceiver<ToNet>, shared: Arc<Shared>) {
                     c.sched.send_frame(datagrams.clone(), false);
                 }
                 shared.note_backlog(&conns);
+                shared.sent(&mut conns, t.capture_us);
             }
             ToNet::Message(id, m) => {
                 if let Some(c) = conns.iter().find(|c| c.id == id) {
@@ -487,6 +530,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
         plays,
         mic,
         view_only,
+        window: Window::default(),
     };
     {
         let mut conns = shared.conns.lock().unwrap();
@@ -547,6 +591,7 @@ async fn serve(id: ConnId, incoming: quinn::Incoming, shared: &Arc<Shared>) -> a
                     let _ = host.send(ToHost::Input(id, p));
                 }
                 Some(Datagram::Mic(p)) if mic => audio.mic.push(&p, start.elapsed().as_micros() as u64),
+                Some(Datagram::Decoded(d)) => shared.decoded(id, d.capture_us),
                 Some(Datagram::Ping(p)) => {
                     let pong = Pong { client_us: p.client_us, server_us: start.elapsed().as_micros() as u64 };
                     sched.send(Priority::Input, Bytes::from(Datagram::Pong(pong).to_vec()));

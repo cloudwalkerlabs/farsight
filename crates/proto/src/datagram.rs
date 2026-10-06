@@ -16,6 +16,7 @@ const TAG_TILES: u8 = 5;
 const TAG_AUDIO: u8 = 6;
 const TAG_NACK: u8 = 7;
 const TAG_MIC: u8 = 8;
+const TAG_DECODED: u8 = 9;
 
 /// Bytes in front of a video fragment's payload.
 pub const VIDEO_OVERHEAD: usize = 1 + FragmentHeader::LEN;
@@ -46,6 +47,15 @@ pub struct Nack {
     pub shards: Vec<u16>,
 }
 
+/// The client decoded the frame or tiles update captured at `capture_us`
+/// (the server's clock, from its header), and everything before it. The
+/// server waits for these before encoding more than the client keeps up
+/// with (§1); a server that doesn't know them drops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decoded {
+    pub capture_us: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datagram<'a> {
     Video(FragmentHeader, &'a [u8]),
@@ -57,6 +67,7 @@ pub enum Datagram<'a> {
     Ping(Ping),
     Pong(Pong),
     Nack(Nack),
+    Decoded(Decoded),
 }
 
 impl<'a> Datagram<'a> {
@@ -79,6 +90,7 @@ impl<'a> Datagram<'a> {
             TAG_PING => Datagram::Ping(postcard::from_bytes(body).ok()?),
             TAG_PONG => Datagram::Pong(postcard::from_bytes(body).ok()?),
             TAG_NACK => Datagram::Nack(postcard::from_bytes(body).ok()?),
+            TAG_DECODED => Datagram::Decoded(postcard::from_bytes(body).ok()?),
             _ => return None,
         })
     }
@@ -99,6 +111,7 @@ impl<'a> Datagram<'a> {
             Datagram::Ping(p) => tagged(TAG_PING, p, out),
             Datagram::Pong(p) => tagged(TAG_PONG, p, out),
             Datagram::Nack(n) => tagged(TAG_NACK, n, out),
+            Datagram::Decoded(d) => tagged(TAG_DECODED, d, out),
         }
     }
 
@@ -173,6 +186,7 @@ mod tests {
             Datagram::Ping(Ping { client_us: 5 }),
             Datagram::Pong(Pong { client_us: 5, server_us: 6 }),
             Datagram::Nack(Nack { frame: 7, shards: vec![1, 4] }),
+            Datagram::Decoded(Decoded { capture_us: 8 }),
         ] {
             assert_eq!(Datagram::decode(&d.to_vec()), Some(d));
         }

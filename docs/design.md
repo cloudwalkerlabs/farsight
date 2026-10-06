@@ -221,7 +221,17 @@ a Smithay headless compositor can drive a zero-copy dmabuf → VA-API pipeline.
     with the overspend (six per doubling) and falls a step at a time.
     While the slowest connection still has over 20 ms of video queued,
     the pipeline skips encoding (a frame skipped costs nothing; one
-    dropped after encoding breaks the stream).
+    dropped after encoding breaks the stream);
+  - so it does while a client's decoder is full. A decoder slower than the
+    frame rate would otherwise queue frames in front of itself, unseen by
+    the network, and the delay would grow for as long as the session ran.
+    Clients send a `Decoded` datagram for each frame they decode; a frame
+    not answered for a round trip after its last byte left is at the
+    decoder. With two there, or on their way from the encoder, the decoder
+    has the next frame ready and nothing more is encoded until it takes it.
+    Frames still crossing the network don't count, so a long path stays
+    full, and one at the decoder for 250 ms is taken as lost. Clients that
+    don't answer aren't waited for (`farsight-server`'s `window`).
 - **The MTU stays at QUIC's minimum, 1200**, as media stacks do. Path MTU
   discovery's black-hole detection takes random loss for a black hole, and
   quinn then drops every queued datagram that no longer fits: a frame.

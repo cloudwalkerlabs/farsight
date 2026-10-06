@@ -26,6 +26,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::{import_surface, with_renderer_surface_state};
 use smithay::backend::renderer::{ExportMem, Renderer, Texture};
+use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -162,6 +163,8 @@ pub struct Options {
     pub video_target: Arc<AtomicU64>,
     /// When the network's video queue drains, in host µs.
     pub video_drain_at: Arc<AtomicU64>,
+    /// How far the clients' decoders are behind.
+    pub decoding: Arc<crate::window::Decoding>,
 }
 
 /// No RFI answered yet, in [`Shared::answered`].
@@ -211,9 +214,11 @@ pub struct Pipeline {
     /// When frame callbacks last went out, in host µs.
     last_callback_us: u64,
     callback_timer: bool,
-    /// A frame was skipped for the network (and whether it was a
-    /// refinement); it is encoded once the queue drains.
+    /// A frame was skipped for the network or a client's decoder (and
+    /// whether it was a refinement); it is encoded once they catch up.
     skipped: Option<bool>,
+    /// Runs [`resume_skipped`] when they should have, at the latest.
+    resume_timer: Option<RegistrationToken>,
     clock: Clock<Monotonic>,
     presented: u64,
 }
@@ -302,6 +307,7 @@ impl Pipeline {
             last_callback_us: 0,
             callback_timer: false,
             skipped: None,
+            resume_timer: None,
             clock: Clock::new(),
             presented: 0,
         })
@@ -615,7 +621,7 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
         new_epoch(host, w, h)?;
     }
 
-    if skip_for_network(host, refine) {
+    if skip_for_backlog(host, refine) {
         return Ok(());
     }
 
@@ -694,32 +700,53 @@ fn convert_and_encode(host: &mut Host, texture: &GlesTexture, t_commit: u64, ref
     Ok(())
 }
 
-/// Whether to leave this frame out because the network is behind; if so,
-/// the current picture is encoded once the queue drains.
-fn skip_for_network(host: &mut Host, refine: bool) -> bool {
+/// Whether to leave this frame out because the network, or a client's
+/// decoder, is behind; if so, the current picture is encoded once both
+/// have caught up.
+fn skip_for_backlog(host: &mut Host, refine: bool) -> bool {
     let p = &mut host.pipeline;
-    let now = host.start.elapsed().as_micros() as u64;
-    let drain_at = p.opts.video_drain_at.load(Ordering::Relaxed);
     // A keyframe replaces whatever is queued, and a client waiting to
     // recover can't use what is.
-    if p.force_keyframe || p.rfi.is_some() || now + MAX_QUEUED_US >= drain_at {
+    if p.force_keyframe || p.rfi.is_some() {
         p.skipped = None;
         return false;
     }
-    if p.skipped.is_none() {
-        let wait = Duration::from_micros(drain_at - MAX_QUEUED_US - now);
-        let _ = host.loop_handle.insert_source(Timer::from_duration(wait), |_, _, host| {
-            if let Some(refine) = host.pipeline.skipped.take() {
-                encode_current(host, refine);
-            }
-            TimeoutAction::Drop
-        });
+    let now = host.start.elapsed().as_micros() as u64;
+    let drain_at = p.opts.video_drain_at.load(Ordering::Relaxed);
+    let network = (now + MAX_QUEUED_US < drain_at).then(|| drain_at - MAX_QUEUED_US);
+    // A decoder that has room sooner says so (`resume_skipped`).
+    let decoder = p.opts.decoding.behind(now, p.shared.in_flight.load(Ordering::Acquire));
+    let Some(resume_at) = network.max(decoder) else {
+        p.skipped = None;
+        return false;
+    };
+    if let Some(timer) = p.resume_timer.take() {
+        host.loop_handle.remove(timer);
     }
+    let wait = Duration::from_micros(resume_at.saturating_sub(now));
+    let timer = host.loop_handle.insert_source(Timer::from_duration(wait), |_, _, host| {
+        host.pipeline.resume_timer = None;
+        resume_skipped(host);
+        TimeoutAction::Drop
+    });
+    p.resume_timer = timer.ok();
     // The latest wins: a new picture makes a refinement owed moot, and
     // sending it arms the next one.
     p.skipped = Some(refine);
-    tracing::debug!(behind_ms = (drain_at - now) / 1000, "network behind; frame skipped");
+    tracing::debug!(
+        network_ms = network.map(|t| (t - now) / 1000),
+        decoder = decoder.is_some(),
+        "behind; frame skipped"
+    );
     true
+}
+
+/// Encodes the picture a skip left out, if any, now that what it was
+/// skipped for may have caught up.
+pub fn resume_skipped(host: &mut Host) {
+    if let Some(refine) = host.pipeline.skipped.take() {
+        encode_current(host, refine);
+    }
 }
 
 /// Tells the nested compositor its frame is done: presentation feedback

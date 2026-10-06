@@ -47,6 +47,8 @@ pub enum Msg {
 #[derive(Debug, Clone, Copy)]
 struct Timing {
     pts_us: u64,
+    /// The server's capture, on its clock, as the frame's header gives it.
+    server_capture_us: u64,
     /// The server's capture, converted.
     capture_us: Option<u64>,
     complete_us: u64,
@@ -327,7 +329,13 @@ impl State {
         if v.timings.len() == MAX_TIMED {
             v.timings.pop_front();
         }
-        v.timings.push_back(Timing { pts_us, capture_us, complete_us: f.complete_us, decoded_us: None });
+        v.timings.push_back(Timing {
+            pts_us,
+            server_capture_us: f.header.capture_us,
+            capture_us,
+            complete_us: f.complete_us,
+            decoded_us: None,
+        });
         if keyframe && format.codec != CodecId::Av1 {
             let (config, picture) = split_parameter_sets(format.codec, &f.data);
             if !config.is_empty() {
@@ -371,6 +379,9 @@ impl State {
                 self.failures = 0;
                 if let Some(t) = v.timings.iter_mut().find(|t| t.pts_us as i64 == pts_us) {
                     t.decoded_us = now_us;
+                    if let Some(c) = &self.client {
+                        c.decoded(t.server_capture_us);
+                    }
                 }
             }
             CodecEvent::Rendered { pts_us, system_ns } => {
@@ -419,13 +430,15 @@ impl State {
         // An update's last datagram counts, as for the desktop.
         if t.header.index + 1 == t.header.count
             && let Some(c) = &self.client
-            && let Some(capture_us) = c.server_to_local(t.header.capture_us)
         {
-            let mut s = self.samples.lock().unwrap();
-            s.shown += 1;
-            s.network_us.push(t.received_us.saturating_sub(capture_us));
-            s.decode_us.push(c.now_us().saturating_sub(t.received_us));
-            s.total_us.push(c.now_us().saturating_sub(capture_us));
+            c.decoded(t.header.capture_us);
+            if let Some(capture_us) = c.server_to_local(t.header.capture_us) {
+                let mut s = self.samples.lock().unwrap();
+                s.shown += 1;
+                s.network_us.push(t.received_us.saturating_sub(capture_us));
+                s.decode_us.push(c.now_us().saturating_sub(t.received_us));
+                s.total_us.push(c.now_us().saturating_sub(capture_us));
+            }
         }
     }
 

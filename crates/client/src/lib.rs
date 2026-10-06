@@ -41,7 +41,7 @@ use farsight_proto::control::{
     ClientAuth, ClientMessage, ClipboardOffer, ClipboardRequest, CursorImage, CursorShape, Epoch, Hello,
     MAX_CLIPBOARD, ServerMessage, Welcome, close,
 };
-use farsight_proto::datagram::{Datagram, Ping};
+use farsight_proto::datagram::{Datagram, Decoded, Ping};
 use farsight_proto::input::{InputEvent, InputPacket, InputSender};
 use farsight_proto::layout::Layout;
 use farsight_proto::tiles::{self, Rect, TilesHeader};
@@ -412,6 +412,14 @@ impl Client {
         let capture_us = (capture_us as i64 + offset).max(0) as u64;
         let Some(d) = self.shared.mic.lock().unwrap().as_mut().and_then(|m| m.encode(pcm, capture_us)) else { return };
         let _ = self.conn.send_datagram(Bytes::from(d));
+    }
+
+    /// The decoder is done with the frame or tiles update captured at
+    /// `capture_us`, as its header gives it (the server's clock). The
+    /// server encodes no further ahead of this than the path takes (§1),
+    /// so call it as soon as each one is decoded.
+    pub fn decoded(&self, capture_us: u64) {
+        let _ = self.conn.send_datagram(Bytes::from(Datagram::Decoded(Decoded { capture_us }).to_vec()));
     }
 
     /// Mutes or unmutes the session's audio at the server.
