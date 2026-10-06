@@ -25,6 +25,7 @@ mod net;
 mod outputs;
 mod pipeline;
 mod session;
+mod window;
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -167,6 +168,7 @@ fn main() -> anyhow::Result<()> {
     let audio = Arc::new(net::Audio::default());
     let video_target = Arc::new(std::sync::atomic::AtomicU64::new(farsight_net::cc::START_RATE));
     let video_drain_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let decoding = Arc::new(window::Decoding::default());
     let net = net::spawn(
         net::Options {
             listen: args.listen,
@@ -177,6 +179,7 @@ fn main() -> anyhow::Result<()> {
             rate_bps: args.rate * 1_000_000,
             video_target: video_target.clone(),
             video_drain_at: video_drain_at.clone(),
+            decoding: decoding.clone(),
             start,
             audio: audio.clone(),
         },
@@ -208,6 +211,7 @@ fn main() -> anyhow::Result<()> {
             probe: args.probe,
             video_target,
             video_drain_at,
+            decoding,
         },
         encoders,
         start,
@@ -408,6 +412,7 @@ fn on_net(host: &mut Host, msg: ToHost) {
             }
         }
         ToHost::Input(id, packet) if host.client == Some(id) => input::receive(host, &packet),
+        ToHost::CaughtUp => pipeline::resume_skipped(host),
         ToHost::ClipboardRead(id, request, reply) => match host.clipboard.as_mut() {
             Some(c) if host.client == Some(id) => c.read(request.serial, &request.mime, move |data| {
                 let _ = reply.send(data);

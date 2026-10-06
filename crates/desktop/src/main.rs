@@ -2,8 +2,10 @@
 //!
 //! Three threads: the window and GL on the main thread (winit), the
 //! connection on a tokio runtime (`farsight-client`), and the decoder on its
-//! own thread. Frames go straight from the connection to the decoder; only
-//! the newest decoded picture is drawn, and drawing doesn't wait for vsync.
+//! own thread. Frames go straight from the connection to the decoder, which
+//! tells the server what it has decoded so the server sends no faster than
+//! it keeps up (§1); only the newest decoded picture is drawn, and drawing
+//! doesn't wait for vsync.
 //! The remote cursor is the window's own cursor, so moving it has no
 //! latency (§4).
 //!
@@ -846,6 +848,11 @@ fn decode_thread(
                     tracing::warn!(update = t.header.update, "{err:#}");
                 }
                 let decoded_us = client.get().map_or(0, |c| c.now_us());
+                if t.header.index + 1 == t.header.count
+                    && let Some(c) = client.get()
+                {
+                    c.decoded(t.header.capture_us);
+                }
                 let d = Decoded {
                     content: Content::Tiles { size: screen, tiles: out },
                     capture_us: t.header.capture_us,
@@ -888,7 +895,10 @@ fn decode_thread(
                     use std::io::Write;
                     let _ = writeln!(f, "{} {}", frame.header.frame, picture.md5());
                 }
-                let decoded_us = client.get().map_or(0, |c| c.now_us());
+                let decoded_us = client.get().map_or(0, |c| {
+                    c.decoded(frame.header.capture_us);
+                    c.now_us()
+                });
                 let d = Decoded {
                     content: Content::Picture(picture),
                     capture_us: frame.header.capture_us,
