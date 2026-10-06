@@ -510,8 +510,14 @@ impl App {
         );
         // The remote output's pixels are the window's physical pixels, and
         // winit takes cursors in physical pixels: draw the image at its
-        // size on the remote output.
-        let image = cursor::to_output_pixels(image);
+        // size on the remote output. On macOS it takes them in points
+        // (an NSImage the size of the bitmap), so a physical-size image
+        // would be drawn `scale_factor` times too big.
+        let density = match &self.gfx {
+            Some(gfx) if cfg!(target_os = "macos") => 1.0 / gfx.window.scale_factor(),
+            _ => 1.0,
+        };
+        let image = cursor::at_density(image, density);
         // winit wants straight alpha; the server sends premultiplied BGRA.
         let mut rgba = image.pixels;
         for px in rgba.as_chunks_mut::<4>().0 {
